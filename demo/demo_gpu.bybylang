@@ -1,0 +1,34 @@
+mode is 3
+
+gpu backend is "metal"
+gpu array A = [1, 2, 3, 4, 5, 6, 7, 8]
+gpu array B = [10, 20, 30, 40, 50, 60, 70, 80]
+
+gpu add A, B -> C size 8
+gpu mul A, B -> D size 8
+
+print "GPU add result:"
+print C
+print "GPU mul result:"
+print D
+x = 5
+if x > 0:
+    print "x duong"
+    if x > 3:
+        print "x lon hon 3"
+        if x == 5:
+            print "x dung bang 5 - if long 3 cap hoat dong!"
+        else:
+            print "x khac 5"
+    else:
+        print "x tu 1 den 3"
+elif x == 0:
+    print "x bang 0"
+else:
+    print "x am"
+
+for i in range(1, 4):
+    if i == 2:
+        print "gap so 2 trong vong lap"
+    else:
+        print "khong phai so 2"
