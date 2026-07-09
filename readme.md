@@ -60,7 +60,7 @@ nim c -d:release -o:bybylang bybylang.nim
 make test
 ```
 ```bash
-./bybylang (DEMO_SRC) --aot=(DEMO_OUT)
+./bybylang (your bybylang code) --aot=(name the execute export and if you are using windows you need to add .exe)
 ```
 ### 4. Project directory structure
 
