@@ -53,11 +53,14 @@ make build
 nim c -d:release -o:bybylang bybylang.nim
 ```
 
-### 3. Run tests
+### 3. Run tests and build your bybylang code
 
 ```bash
 # Run the full test suite
 make test
+```
+```bash
+./bybylang (DEMO_SRC) --aot=(DEMO_OUT)
 ```
 ### 4. Project directory structure
 
