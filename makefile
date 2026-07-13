@@ -1,7 +1,7 @@
 # Makefile - BybyLang (tự detect OS: Linux / macOS / Windows)
 ifeq ($(OS),Windows_NT)
     DETECTED_OS := Windows
-    EXE := .exe
+    EXE := 
 else
     DETECTED_OS := $(shell uname -s)
     EXE :=

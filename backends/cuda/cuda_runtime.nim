@@ -11,6 +11,11 @@
 # Không phụ thuộc lúc build (dynlib): máy không có libcudart.so/libcublas.so
 # thì cudaRuntimeAvailable() trả về false, gpubackend.nim tự fallback CPU.
 import std/dynlib
+import std/tables
+import cuda_driver
+
+# Export CudaTensor từ cuda_driver để các module khác dùng được
+export cuda_driver.CudaTensor
 
 type
   cudaError_t = int32
@@ -24,7 +29,7 @@ const
   cudaMemcpyDeviceToHost: int32 = 2
   CUBLAS_OP_N: cublasOperation_t = 0
   CUBLAS_DEFAULT_MATH: cublasMath_t = 0
-  CUBLAS_TENSOR_OP_MATH: cublasMath_t = 1   # bật Tensor Core cho cuBLAS gemm
+  CUBLAS_TENSOR_OP_MATH: cublasMath_t = 1
 
 type
   CudartLib = object
@@ -41,6 +46,7 @@ type
     cublasCreate_v2: proc(handle: ptr cublasHandle_t): cublasStatus_t {.cdecl.}
     cublasDestroy_v2: proc(handle: cublasHandle_t): cublasStatus_t {.cdecl.}
     cublasSetMathMode: proc(handle: cublasHandle_t, mode: cublasMath_t): cublasStatus_t {.cdecl.}
+    cublasSetStream_v2: proc(handle: cublasHandle_t, streamId: pointer): cublasStatus_t {.cdecl.}
     cublasSgemm_v2: proc(handle: cublasHandle_t, transa, transb: cublasOperation_t,
                           m, n, k: int32, alpha: ptr float32,
                           A: pointer, lda: int32, B: pointer, ldb: int32,
@@ -51,9 +57,32 @@ var cublas: CublasLib
 var cudartLoaded = false
 var cublasLoaded = false
 
+var gHandle: cublasHandle_t
+var gHandleInitialized = false
+var gDevicePool = initTable[csize_t, seq[pointer]]()
+
 proc gpuCheck(cond: bool, msg: string) =
   if not cond:
     raise newException(CatchableError, msg)
+
+proc ensureHandle(): cublasHandle_t =
+  if gHandleInitialized: return gHandle
+  gpuCheck(cublas.cublasCreate_v2(addr gHandle) == 0, "cublasCreate failed")
+  discard cublas.cublasSetMathMode(gHandle, CUBLAS_TENSOR_OP_MATH)
+  if cublas.cublasSetStream_v2 != nil:
+    discard cublas.cublasSetStream_v2(gHandle, getStream())
+  gHandleInitialized = true
+  result = gHandle
+
+proc getDeviceBuf(bytes: csize_t): pointer =
+  if gDevicePool.hasKey(bytes) and gDevicePool[bytes].len > 0:
+    return gDevicePool[bytes].pop()
+  var p: pointer
+  gpuCheck(cudart.cudaMalloc(addr p, bytes) == 0, "cudaMalloc failed")
+  result = p
+
+proc putDeviceBuf(bytes: csize_t, p: pointer) =
+  gDevicePool.mgetOrPut(bytes, @[]).add(p)
 
 proc tryLoadCudart(): bool =
   if cudartLoaded: return cudart.handle != nil
@@ -80,43 +109,33 @@ proc tryLoadCublas(): bool =
   cublas.cublasCreate_v2 = cast[typeof(cublas.cublasCreate_v2)](cublas.handle.symAddr("cublasCreate_v2"))
   cublas.cublasDestroy_v2 = cast[typeof(cublas.cublasDestroy_v2)](cublas.handle.symAddr("cublasDestroy_v2"))
   cublas.cublasSetMathMode = cast[typeof(cublas.cublasSetMathMode)](cublas.handle.symAddr("cublasSetMathMode"))
+  cublas.cublasSetStream_v2 = cast[typeof(cublas.cublasSetStream_v2)](cublas.handle.symAddr("cublasSetStream_v2"))
   cublas.cublasSgemm_v2 = cast[typeof(cublas.cublasSgemm_v2)](cublas.handle.symAddr("cublasSgemm_v2"))
   result = cublas.cublasCreate_v2 != nil and cublas.cublasSgemm_v2 != nil
 
 proc cudaRuntimeAvailable*(): bool =
-  ## Dò libcudart + ít nhất 1 GPU. Dùng riêng cho đường matmul (cudaAvailable()
-  ## trong cuda_driver.nim vẫn là cổng chính cho vecop qua Driver API).
   if not tryLoadCudart(): return false
   var count: int32 = 0
   if cudart.cudaGetDeviceCount(addr count) != 0: return false
   result = count > 0
 
 proc cudaMatmulF32*(a, b: seq[float32], m, k, n: int): seq[float32] =
-  ## C(m x n) = A(m x k) * B(k x n), toàn bộ row-major (giống layout Nim seq bình thường).
-  ## Chạy qua cudart (cudaMalloc/cudaMemcpy) + cublasSgemm với Tensor Core math
-  ## mode bật sẵn. cuBLAS là column-major nên dùng thủ thuật chuẩn: tính
-  ## C^T = B^T * A^T bằng cách hoán đổi thứ tự & kích thước tham số -> kết quả
-  ## ra đúng C row-major mà không cần transpose thủ công trên host.
   gpuCheck(tryLoadCudart(), "libcudart not found")
   gpuCheck(tryLoadCublas(), "libcublas not found")
   result = newSeq[float32](m * n)
 
-  var handle: cublasHandle_t
-  gpuCheck(cublas.cublasCreate_v2(addr handle) == 0, "cublasCreate failed")
-  defer: discard cublas.cublasDestroy_v2(handle)
-  discard cublas.cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH)
+  let handle = ensureHandle()
 
   let bytesA = csize_t(m * k * sizeof(float32))
   let bytesB = csize_t(k * n * sizeof(float32))
   let bytesC = csize_t(m * n * sizeof(float32))
-  var dA, dB, dC: pointer
-  gpuCheck(cudart.cudaMalloc(addr dA, bytesA) == 0, "cudaMalloc A failed")
-  gpuCheck(cudart.cudaMalloc(addr dB, bytesB) == 0, "cudaMalloc B failed")
-  gpuCheck(cudart.cudaMalloc(addr dC, bytesC) == 0, "cudaMalloc C failed")
+  let dA = getDeviceBuf(bytesA)
+  let dB = getDeviceBuf(bytesB)
+  let dC = getDeviceBuf(bytesC)
   defer:
-    discard cudart.cudaFree(dA)
-    discard cudart.cudaFree(dB)
-    discard cudart.cudaFree(dC)
+    putDeviceBuf(bytesA, dA)
+    putDeviceBuf(bytesB, dB)
+    putDeviceBuf(bytesC, dC)
 
   var aVar = a
   var bVar = b
@@ -131,3 +150,31 @@ proc cudaMatmulF32*(a, b: seq[float32], m, k, n: int): seq[float32] =
                                   addr beta, dC, int32(n)) == 0, "cublasSgemm failed")
   discard cudart.cudaDeviceSynchronize()
   gpuCheck(cudart.cudaMemcpy(addr result[0], dC, bytesC, cudaMemcpyDeviceToHost) == 0, "D2H C failed")
+
+proc debugLog(msg: string) =
+  when defined(nimformerCudaDebug):
+    stderr.writeLine("[cuda_runtime][DEBUG] " & msg)
+
+proc cudaMatmulF32R*(a, b: CudaTensor, m, k, n: int): CudaTensor =
+  gpuCheck(tryLoadCudart(), "cudaMatmulF32R: libcudart not found")
+  gpuCheck(tryLoadCublas(), "cudaMatmulF32R: libcublas not found")
+  gpuCheck(a.dptr != 0 and b.dptr != 0, "cudaMatmulF32R: input tensor rỗng/đã free")
+  gpuCheck(a.numel == m * k, "cudaMatmulF32R: a.numel=" & $a.numel & " != m*k=" & $(m*k))
+  gpuCheck(b.numel == k * n, "cudaMatmulF32R: b.numel=" & $b.numel & " != k*n=" & $(k*n))
+
+  let handle = ensureHandle()
+  let bytesC = csize_t(m * n * sizeof(float32))
+  let dC = cuda_driver.getDeviceBuf(bytesC)
+
+  let pA = cast[pointer](a.dptr)
+  let pB = cast[pointer](b.dptr)
+  let pC = cast[pointer](dC)
+
+  var alpha: float32 = 1.0'f32
+  var beta: float32 = 0.0'f32
+  gpuCheck(cublas.cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                                  int32(n), int32(m), int32(k),
+                                  addr alpha, pB, int32(n), pA, int32(k),
+                                  addr beta, pC, int32(n)) == 0, "cudaMatmulF32R: cublasSgemm failed")
+  debugLog("cudaMatmulF32R m=" & $m & " k=" & $k & " n=" & $n)
+  result = CudaTensor(dptr: cast[cuda_driver.CUdeviceptr](dC), bytes: bytesC, numel: m * n)
