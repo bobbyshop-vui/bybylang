@@ -1,0 +1,20 @@
+#version 450
+// So sánh element-wise thật trên GPU -> bitmask uint (0/1). op: 0=gt 1=lt
+// 2=eq 3=ge 4=le. Xem compare_kernel.cu (CUDA) cho cùng công thức/opcode.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, binding = 2) writeonly buffer BufMask { uint mask[]; };
+layout(push_constant) uniform PC { int op; int n; } pc;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pc.n)) return;
+    float av = a[id], bv = b[id];
+    uint r = 0u;
+    if (pc.op == 0) r = (av >  bv) ? 1u : 0u;
+    else if (pc.op == 1) r = (av <  bv) ? 1u : 0u;
+    else if (pc.op == 2) r = (av == bv) ? 1u : 0u;
+    else if (pc.op == 3) r = (av >= bv) ? 1u : 0u;
+    else if (pc.op == 4) r = (av <= bv) ? 1u : 0u;
+    mask[id] = r;
+}

@@ -1,0 +1,8 @@
+backends/.DS_Store
+bybylang
+.DS_Store
+*.bak
+*.bak2
+demo/demo_gpu_out
+demo/demo_gpu_out.nim
+*.nimq

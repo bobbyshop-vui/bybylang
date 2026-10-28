@@ -1,0 +1,26 @@
+#version 450
+// Giống permute_strided (CUDA) - mỗi invocation tự giải mã chỉ số nguồn từ
+// strides (mảng nhỏ O(ndim) truyền qua push constants), không có mảng chỉ
+// số O(n) build trên CPU.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufSrc { float src[]; };
+layout(std430, binding = 1) writeonly buffer BufDst { float dst[]; };
+layout(push_constant) uniform PC {
+    int newStrides[8];
+    int oldStrides[8];
+    int dimsMap[8];
+    int ndim;
+    int n;
+} pc;
+void main() {
+    uint linear = gl_GlobalInvocationID.x;
+    if (linear >= uint(pc.n)) return;
+    int rem = int(linear);
+    int oldLinear = 0;
+    for (int i = 0; i < pc.ndim; i++) {
+        int idxI = rem / pc.newStrides[i];
+        rem = rem % pc.newStrides[i];
+        oldLinear += idxI * pc.oldStrides[pc.dimsMap[i]];
+    }
+    dst[linear] = src[oldLinear];
+}

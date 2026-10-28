@@ -1,0 +1,15 @@
+#version 450
+// Mirror vecop_kernel (vecop_matmul.metal) - c[id] = a[id] OP b[id]
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float c[]; };
+layout(push_constant) uniform PC { int op; int n; } pc;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pc.n)) return;
+    if (pc.op == 0) c[id] = a[id] + b[id];
+    else if (pc.op == 1) c[id] = a[id] - b[id];
+    else if (pc.op == 2) c[id] = a[id] * b[id];
+    else if (pc.op == 3) c[id] = a[id] / b[id];
+}

@@ -1,0 +1,100 @@
+#version 450
+// Mirror 1:1 cua attention_fused_backward_kernel (backends/metal/kernels/
+// vecop_matmul.metal) - GIU NGUYEN tung buoc/tung cong thuc/tung thu tu
+// vong lap voi ban Metal, chi khac phan atomic-add float: Metal dung
+// atomic_uint + as_type<float>/as_type<uint> (bitcast qua lai), GLSL/Vulkan
+// core khong co atomic float built-in (khong dung extension
+// GL_EXT_shader_atomic_float de tuong thich rong tren nhieu driver) nen
+// dung CHINH XAC cung 1 thuat toan CAS-loop nhung qua atomicCompSwap tren
+// buffer uint + floatBitsToUint/uintBitsToFloat.
+//
+// Dispatch: 1 thread / (bh, ti), local_size=(1,1,1), groupCount=(B*H,S,1)
+// - GIONG HET Metal [encoder dispatchThreads:gridSize=(B*H,S,1)
+// threadsPerThreadgroup:(1,1,1)] (khong dung threadgroup/shared memory nao,
+// dung y het ban Metal).
+//
+// GIOI HAN: S <= 256 (mang local softmaxW[256]/dSoftmax[256] - mirror dung
+// gioi han cung ly do voi metal_attention_fused_backward: S>256 se doc/ghi
+// tran mang local. Caller (vulkanAttentionFusedBackward) PHAI tu kiem tra
+// S<=256 truoc khi goi, giong het metal_shim.m da lam).
+layout(local_size_x = 1, local_size_y = 1) in;
+layout(std430, binding = 0) readonly buffer BufQ  { float q[]; };
+layout(std430, binding = 1) readonly buffer BufK  { float k[]; };
+layout(std430, binding = 2) readonly buffer BufV  { float v[]; };
+layout(std430, binding = 3) readonly buffer BufS  { float s_matrix[]; };
+layout(std430, binding = 4) readonly buffer BufDy { float dy[]; };
+layout(std430, binding = 5) buffer BufDq { float dq[]; };  // moi thread chi ghi rieng hang ti cua no -> khong dung atomic
+layout(std430, binding = 6) buffer BufDk { uint  dk[]; };  // atomic CAS float qua bitcast (xem atomicAddDk)
+layout(std430, binding = 7) buffer BufDv { uint  dv[]; };  // atomic CAS float qua bitcast (xem atomicAddDv)
+layout(push_constant) uniform PC { int B; int H; int S; int D; float scale; } pc;
+
+// Mirror atomicAddFloatDevice (Metal) cho buffer dk[] - CAS-loop: doc gia
+// tri hien tai (dang la bit-pattern cua float), cong val, ghi lai bang
+// atomicCompSwap; neu trong luc do co thread khac ghi truoc (prev !=
+// expected) thi lay gia tri MOI do lam expected roi thu lai - dung y het
+// vong while cua ban Metal.
+void atomicAddDk(uint idx, float val) {
+    uint expected = dk[idx];
+    while (true) {
+        float expectedF = uintBitsToFloat(expected);
+        uint desired = floatBitsToUint(expectedF + val);
+        uint prev = atomicCompSwap(dk[idx], expected, desired);
+        if (prev == expected) break;
+        expected = prev;
+    }
+}
+
+void atomicAddDv(uint idx, float val) {
+    uint expected = dv[idx];
+    while (true) {
+        float expectedF = uintBitsToFloat(expected);
+        uint desired = floatBitsToUint(expectedF + val);
+        uint prev = atomicCompSwap(dv[idx], expected, desired);
+        if (prev == expected) break;
+        expected = prev;
+    }
+}
+
+void main() {
+    uint bh = gl_GlobalInvocationID.x;
+    uint ti = gl_GlobalInvocationID.y;
+    if (bh >= uint(pc.B * pc.H) || ti >= uint(pc.S)) return;
+
+    uint base_idx = bh * uint(pc.S) * uint(pc.D);
+    uint base_s   = bh * uint(pc.S) * uint(pc.S);
+
+    // softmaxW[tj] = s_matrix[bh, ti, tj] cho tj=0..ti (mirror dong 1284-1287 Metal)
+    float softmaxW[256];
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        softmaxW[tj] = s_matrix[base_s + ti * uint(pc.S) + tj];
+    }
+
+    // dv[tj,d] += softmaxW[tj] * dy[ti,d] (atomic, nhieu ti cung ghi 1 tj) va
+    // dSoftmax[tj] = sum_d dy[ti,d] * v[tj,d] (mirror dong 1289-1298 Metal)
+    float dSoftmax[256];
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        float dotVal = 0.0;
+        for (int d = 0; d < pc.D; ++d) {
+            float dyVal = dy[base_idx + ti * uint(pc.D) + uint(d)];
+            atomicAddDv(base_idx + tj * uint(pc.D) + uint(d), softmaxW[tj] * dyVal);
+            dotVal += dyVal * v[base_idx + tj * uint(pc.D) + uint(d)];
+        }
+        dSoftmax[tj] = dotVal;
+    }
+
+    // dotSum = sum_tj softmaxW[tj] * dSoftmax[tj] (Jacobian softmax, mirror dong 1300-1303 Metal)
+    float dotSum = 0.0;
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        dotSum += softmaxW[tj] * dSoftmax[tj];
+    }
+
+    // dScore = softmaxW[tj] * (dSoftmax[tj] - dotSum) * scale; roi lan dq (khong atomic,
+    // rieng hang ti nay) va dk (atomic, nhieu ti cung ghi 1 tj) - mirror dong 1305-1311 Metal
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        float dScore = softmaxW[tj] * (dSoftmax[tj] - dotSum) * pc.scale;
+        for (int d = 0; d < pc.D; ++d) {
+            dq[base_idx + ti * uint(pc.D) + uint(d)] += dScore * k[base_idx + tj * uint(pc.D) + uint(d)];
+            atomicAddDk(base_idx + tj * uint(pc.D) + uint(d), dScore * q[base_idx + ti * uint(pc.D) + uint(d)]);
+        }
+    }
+}

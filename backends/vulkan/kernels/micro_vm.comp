@@ -1,0 +1,295 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// micro_vm.comp — full opcode interpreter for Vulkan (mirror of micro_vm.metal / CUDA)
+// binding 0: code (uint)
+// binding 1: memF32 (float)
+// binding 2: memU8 (uint8 via uint)
+// binding 3: lut (float)
+// push constants: nWords, tgFloats
+
+layout(local_size_x_id = 0) in;  // specialized to the requested Metal-like tg size
+
+layout(set = 0, binding = 0) readonly buffer CodeBuf { uint code[]; };
+layout(set = 0, binding = 1) buffer MemF32Buf { float memF32[]; };
+layout(set = 0, binding = 2) readonly buffer MemU8Buf { uint memU8[]; }; // packed bytes
+layout(set = 0, binding = 3) readonly buffer LutBuf { float lut[]; };
+layout(set = 0, binding = 4) readonly buffer ConstBuf { float constF32[]; };
+layout(set = 0, binding = 5) readonly buffer InputBuf { float inF32[]; };
+layout(set = 0, binding = 6) buffer MemU32Buf { uint memU32[]; };
+
+layout(push_constant) uniform Push {
+  uint nWords;
+  uint tgFloats;
+} pc;
+
+shared float tgF32[1024]; // max tg size assumption
+
+#define OP_NOP           0x00u
+#define OP_HALT          0x01u
+#define OP_LOAD_F32      0x10u
+#define OP_STORE_F32     0x11u
+#define OP_LOAD_U8       0x12u
+#define OP_LOAD_CONST    0x13u
+#define OP_LOAD_F32_IDX  0x14u
+#define OP_STORE_F32_IDX 0x15u
+#define OP_ADD           0x20u
+#define OP_MUL           0x21u
+#define OP_FMA           0x22u
+#define OP_SUB           0x23u
+#define OP_EXP           0x24u
+#define OP_NEG           0x25u
+#define OP_SIGMOID       0x26u
+#define OP_DIV           0x27u
+#define OP_SOFTPLUS      0x28u
+#define OP_RSQRT         0x29u
+#define OP_ADD_CONST     0x2Au
+#define OP_MUL_CONST     0x2Bu
+#define OP_LUT_U8        0x30u
+#define OP_FOR_BEGIN     0x40u
+#define OP_FOR_END       0x41u
+#define OP_BARRIER_TG    0x50u
+#define OP_TG_LOAD_F32   0x60u
+#define OP_TG_STORE_F32  0x61u
+#define OP_CMP_LT        0x70u
+#define OP_IF_BEGIN      0x72u
+#define OP_IF_END        0x73u
+
+uint opCode(uint w) { return w & 0xFFu; }
+uint opA(uint w)    { return (w >> 8)  & 0xFu; }
+uint opB(uint w)    { return (w >> 12) & 0xFu; }
+uint opC(uint w)    { return (w >> 16) & 0xFu; }
+
+struct LoopFrame {
+  uint backPC;
+  int  remain;
+};
+
+void skipBlock(inout uint p, uint nWords) {
+  int depth = 1;
+  while (p < nWords && depth > 0) {
+    uint w2 = code[p++];
+    uint o2 = opCode(w2);
+    if (o2 == OP_FOR_BEGIN || o2 == OP_IF_BEGIN) ++depth;
+    else if (o2 == OP_FOR_END || o2 == OP_IF_END) --depth;
+    else if (o2 == OP_LOAD_F32 || o2 == OP_STORE_F32 || o2 == OP_LOAD_U8 ||
+             o2 == OP_LOAD_CONST || o2 == OP_FMA ||
+             o2 == OP_ADD_CONST || o2 == OP_MUL_CONST ||
+             (o2 >= 0x82u && o2 <= 0x8Du) || o2 == 0x8Eu ||
+             o2 == 0x91u || o2 == 0x92u ||
+             o2 == OP_TG_LOAD_F32 || o2 == OP_TG_STORE_F32) {
+      if (p < nWords) ++p;
+    }
+  }
+}
+
+void main() {
+  uint tid = gl_GlobalInvocationID.x;
+  uint lid = gl_LocalInvocationID.x;
+
+  float R[16];
+  uint U[16];
+  for (int i = 0; i < 16; ++i) R[i] = 0.0;
+  for (int i = 0; i < 16; ++i) U[i] = 0u;
+  R[0] = float(tid);
+
+  LoopFrame stack[8];
+  int sp = 0;
+  uint p = 0u;
+
+  const uint kMaxSteps = 1u << 22;
+  uint steps = 0u;
+  uint nWords = pc.nWords;
+  uint tgFloats = pc.tgFloats;
+
+  while (p < nWords && steps < kMaxSteps) {
+    ++steps;
+    uint w = code[p++];
+    uint op = opCode(w);
+
+    if (op == OP_NOP) continue;
+    if (op == OP_HALT) return;
+
+    if (op == OP_LOAD_F32) {
+      uint rd = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      uint off = code[p++];
+      R[rd] = memF32[uint(R[rb]) + off];
+      continue;
+    }
+    if (op == OP_STORE_F32) {
+      uint rs = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      uint off = code[p++];
+      memF32[uint(R[rb]) + off] = R[rs];
+      continue;
+    }
+    if (op == OP_LOAD_U8) {
+      uint rd = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      uint off = code[p++];
+      uint idx = uint(R[rb]) + off;
+      // memU8 stored as packed uints; extract byte
+      uint word = memU8[idx >> 2];
+      R[rd] = float((word >> ((idx & 3u) * 8u)) & 0xFFu);
+      continue;
+    }
+    if (op == OP_LOAD_CONST) {
+      uint rd = opA(w);
+      if (p >= nWords) return;
+      uint bits = code[p++];
+      R[rd] = uintBitsToFloat(bits);
+      continue;
+    }
+    if (op == OP_LOAD_F32_IDX) {
+      R[opA(w)] = memF32[uint(R[opB(w)])];
+      continue;
+    }
+    if (op == OP_STORE_F32_IDX) {
+      memF32[uint(R[opB(w)])] = R[opA(w)];
+      continue;
+    }
+    if (op == 0x16u) { R[opA(w)] = float(lid); continue; }
+    if (op == 0x17u) { R[opA(w)] = float(gl_WorkGroupID.x); continue; }
+
+    if (op == OP_ADD) { R[opA(w)] = R[opB(w)] + R[opC(w)]; continue; }
+    if (op == OP_MUL) { R[opA(w)] = R[opB(w)] * R[opC(w)]; continue; }
+    if (op == OP_SUB) { R[opA(w)] = R[opB(w)] - R[opC(w)]; continue; }
+    if (op == OP_DIV) { R[opA(w)] = R[opB(w)] / R[opC(w)]; continue; }
+    if (op == OP_FMA) {
+      uint rd = opA(w), ra = opB(w), rb = opC(w);
+      if (p >= nWords) return;
+      uint rc = code[p++] & 0xFu;
+      R[rd] = fma(R[ra], R[rb], R[rc]);
+      continue;
+    }
+    if (op == OP_EXP)      { R[opA(w)] = exp(R[opB(w)]); continue; }
+    if (op == OP_NEG)      { R[opA(w)] = -R[opB(w)]; continue; }
+    if (op == OP_SIGMOID)  { R[opA(w)] = 1.0 / (1.0 + exp(-R[opB(w)])); continue; }
+    if (op == OP_SOFTPLUS) { R[opA(w)] = log(1.0 + exp(R[opB(w)])); continue; }
+    if (op == OP_RSQRT)    { R[opA(w)] = inversesqrt(R[opB(w)]); continue; }
+
+    if (op == OP_ADD_CONST) {
+      uint rd = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      float c = uintBitsToFloat(code[p++]);
+      R[rd] = R[rb] + c;
+      continue;
+    }
+    if (op == OP_MUL_CONST) {
+      uint rd = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      float c = uintBitsToFloat(code[p++]);
+      R[rd] = R[rb] * c;
+      continue;
+    }
+
+    if (op == OP_LUT_U8) {
+      uint rd = opA(w), ri = opB(w);
+      R[rd] = lut[uint(R[ri]) & 255u];
+      continue;
+    }
+
+    if (op == OP_FOR_BEGIN) {
+      uint countReg = opA(w);
+      int remain = int(R[countReg]);
+      if (remain <= 0) {
+        skipBlock(p, nWords);
+        continue;
+      }
+      if (sp >= 8) return;
+      stack[sp].backPC = p;
+      stack[sp].remain = remain - 1;
+      ++sp;
+      continue;
+    }
+    if (op == OP_FOR_END) {
+      if (sp <= 0) return;
+      LoopFrame f = stack[sp - 1];
+      if (f.remain > 0) {
+        stack[sp - 1].remain = f.remain - 1;
+        p = f.backPC;
+      } else {
+        --sp;
+      }
+      continue;
+    }
+
+    if (op == OP_IF_BEGIN) {
+      if (R[opA(w)] == 0.0) {
+        skipBlock(p, nWords);
+      }
+      continue;
+    }
+    if (op == OP_IF_END) continue;
+
+    if (op == OP_BARRIER_TG) {
+      memoryBarrierShared();
+      barrier();
+      continue;
+    }
+    if (op == OP_TG_LOAD_F32) {
+      uint rd = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      uint off = code[p++];
+      uint idx = uint(R[rb]) + off;
+      if (idx < tgFloats) R[rd] = tgF32[idx];
+      continue;
+    }
+    if (op == OP_TG_STORE_F32) {
+      uint rs = opA(w), rb = opB(w);
+      if (p >= nWords) return;
+      uint off = code[p++];
+      uint idx = uint(R[rb]) + off;
+      if (idx < tgFloats) tgF32[idx] = R[rs];
+      continue;
+    }
+
+    if (op == OP_CMP_LT) {
+      R[opA(w)] = (R[opB(w)] < R[opC(w)]) ? 1.0 : 0.0;
+      continue;
+    }
+
+    // Unsigned address/register instructions mirror the Metal JIT bytecode
+    // ABI. Keeping indices in U[] avoids float32 precision loss on large
+    // packed weights and scratch buffers.
+    if (op == 0x80u) { U[opA(w)] = gl_WorkGroupID.x; continue; }
+    if (op == 0x81u) { U[opA(w)] = lid; continue; }
+    if (op == 0x82u) { if (p >= nWords) return; U[opA(w)] = code[p++]; continue; }
+    if (op == 0x83u) { U[opA(w)] = U[opB(w)] + U[opC(w)]; continue; }
+    if (op == 0x84u) { U[opA(w)] = U[opB(w)] * U[opC(w)]; continue; }
+    if (op == 0x85u) { if (p >= nWords) return; U[opA(w)] = U[opB(w)] + code[p++]; continue; }
+    if (op == 0x86u) { if (p >= nWords) return; U[opA(w)] = U[opB(w)] * code[p++]; continue; }
+    if (op == 0x87u) { if (p >= nWords) return; U[opA(w)] = U[opB(w)] & code[p++]; continue; }
+    if (op == 0x88u) { if (p >= nWords) return; U[opA(w)] = U[opB(w)] >> code[p++]; continue; }
+    if (op == 0x89u) { if (p >= nWords) return; U[opA(w)] = U[opB(w)] << code[p++]; continue; }
+    if (op == 0x8Au) { U[opA(w)] = U[opB(w)] >> U[opC(w)]; continue; }
+    if (op == 0x8Bu) {
+      if (p >= nWords) return;
+      uint idx = U[opB(w)] + code[p++];
+      U[opA(w)] = (memU8[idx >> 2u] >> ((idx & 3u) * 8u)) & 0xFFu;
+      continue;
+    }
+    if (op == 0x8Cu) { if (p >= nWords) return; R[opA(w)] = constF32[U[opB(w)] + code[p++]]; continue; }
+    if (op == 0x8Du) { if (p >= nWords) return; R[opA(w)] = inF32[U[opB(w)] + code[p++]]; continue; }
+    if (op == 0x8Eu) { if (p >= nWords) return; memF32[U[opB(w)] + code[p++]] = R[opA(w)]; continue; }
+    if (op == 0x8Fu) { R[opA(w)] = float(U[opB(w)]); continue; }
+    if (op == 0x90u) { U[opA(w)] = uint(max(R[opB(w)], 0.0)); continue; }
+    if (op == 0x91u) { if (p >= nWords) return; R[opA(w)] = memF32[U[opB(w)] + code[p++]]; continue; }
+    if (op == 0x92u) {
+      if (p >= nWords) return;
+      uint idx = U[opB(w)] + code[p++];
+      uint oldBits = memU32[idx];
+      for (int spin = 0; spin < 1024; ++spin) {
+        uint newBits = floatBitsToUint(uintBitsToFloat(oldBits) + R[opA(w)]);
+        uint observed = atomicCompSwap(memU32[idx], oldBits, newBits);
+        if (observed == oldBits) break;
+        oldBits = observed;
+      }
+      continue;
+    }
+
+    // unknown → halt
+    return;
+  }
+}

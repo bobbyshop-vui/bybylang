@@ -1,0 +1,49 @@
+#version 450
+// layernorm.comp - MIRROR CHINH XAC layernorm_kernel (vecop_matmul.metal).
+// Cung co che reduction voi rmsnorm.comp (da proven chay that), chi khac:
+// co tinh mean + var (thay vi chi meanSq), co beta (bias) o buoc cuoi.
+#define BB_WG 256
+layout(local_size_x = BB_WG) in;
+layout(std430, binding = 0) readonly buffer BufX     { float x[]; };
+layout(std430, binding = 1) readonly buffer BufGamma { float gamma[]; };
+layout(std430, binding = 2) readonly buffer BufBeta  { float beta[]; };
+layout(std430, binding = 3) writeonly buffer BufY    { float y[]; };
+layout(push_constant) uniform PC { int cols; float eps; } pc;
+
+shared float red[BB_WG];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint off = row * uint(pc.cols);
+
+    float sum = 0.0, sumSq = 0.0;
+    for (int c = int(tid); c < pc.cols; c += BB_WG) {
+        float v = x[off + c];
+        sum += v;
+        sumSq += v * v;
+    }
+    red[tid] = sum;
+    barrier();
+    for (uint s = BB_WG / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float mean = red[0] / float(pc.cols);
+    barrier();
+
+    red[tid] = sumSq;
+    barrier();
+    for (uint s = BB_WG / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float meanSq = red[0] / float(pc.cols);
+    float variance = meanSq - mean * mean;
+    float invStd = 1.0 / sqrt(variance + pc.eps);
+    barrier();
+
+    for (int c = int(tid); c < pc.cols; c += BB_WG) {
+        y[off + c] = (x[off + c] - mean) * invStd * gamma[c] + beta[c];
+    }
+}

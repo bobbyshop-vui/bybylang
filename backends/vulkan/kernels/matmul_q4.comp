@@ -1,0 +1,135 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// matmul_q4.comp - MIRROR 100% ky thuat da DO THAT tren Metal
+// (matmul_q4_kernel_ndst2_paired trong vecop_matmul.metal, xem giai thich
+// day du o do): NDST 8 -> 2 (giam ap luc thanh ghi/shared memory tren GPU
+// yeu Intel Gen9 - da do that tren Iris Plus 640: decode 0.86->1.01 tok/s,
+// prefill 1.6->2.15 tok/s) + doc nibble THEO CAP (k2,k2+1) bang 1 lan doc
+// uint8_t + bitmask thuan, KHONG con nhanh runtime (k&1)==0 nao ca.
+//
+// CHUA CHAY THU TREN GPU VULKAN THAT (khong co may Vulkan de test khi
+// viet ban nay) - BAT BUOC tu do lai truoc khi dung cho sinh token that.
+// Neu sai/cham hon, ban cu (NDST=8, khong pairing) van con trong lich su
+// git - quay lai duoc ngay.
+//
+// SUA BUG THAT PHAT HIEN THEM (co san TU TRUOC, KHONG lien quan gi toi
+// thay doi NDST/pairing lan nay): local_size_x=128 nhung vong lap k cu
+// hardcode "k += 32" - nghia la lane 32 bat dau tai k=32 buoc 32, TRUNG
+// hoan toan voi lane 0 o vong lap THU 2 cua no (k=32) - k=32 bi CONG 2
+// LAN (mot lan vao sdata[rr][0], mot lan vao sdata[rr][32]) roi tree-
+// reduction cong ca 2 slot do lai -> KET QUA SAI (bi dem thua), khong
+// phai crash nen rat de bi bo sot khi test bang mat (chi sai so hoc, van
+// sinh ra text "co ve hop ly" nhung logits sai). FIX: doi "k += 32" thanh
+// "k += WG_SIZE" (128, dung bang local_size_x that su) - moi lane trong
+// workgroup gio phu dung 1 tap k RIENG BIET, khong con chong lan.
+//
+// Bien dich: glslangValidator -V matmul_q4.comp -o matmul_q4.spv
+//        hoac: glslc matmul_q4.comp -o matmul_q4.spv
+
+#define MMQ4_NDST 2
+// SUA: 8 -> 2 (mirror N_R0_Q4_K=2 cua ggml + ket qua do that ben Metal -
+// xem giai thich day du o vecop_matmul.metal). PHAI dong bo voi
+// const MMQ4_NDST trong vulkan_driver.nim (2 noi phai khop nhau, khong
+// thi rowBlocks dispatch sai).
+
+#define WG_SIZE 128
+layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer BufA     { float a[]; };        // [M,K]
+layout(std430, binding = 1) readonly buffer BufWq    { uint8_t wq[]; };     // packed nibble [N, ceil(K/2)]
+layout(std430, binding = 2) readonly buffer BufScale { float scales[]; };   // [N * nGroupsPerRow]
+layout(std430, binding = 3) readonly buffer BufZero  { float zeros[]; };    // [N * nGroupsPerRow]
+layout(std430, binding = 4) writeonly buffer BufC    { float c[]; };        // [M,N]
+
+layout(push_constant) uniform PushConsts {
+    int M;
+    int K;
+    int N;
+    int groupSize;
+    int nGroupsPerRow;
+} pc;
+
+// shared memory cho tree reduction - NDST nho (2) -> mang nay gio RAT nho
+// (2*128*4 byte = 1KB, so voi 8*128*4=4KB ban cu) - dung y "giam ap luc
+// bo nho on-chip" giong thay doi ben Metal (o do la thanh ghi, o day la
+// shared memory, nhung cung 1 nguyen ly: NDST nho -> it tai nguyen
+// on-chip/workgroup hon -> occupancy tot hon tren GPU yeu).
+shared float sdata[MMQ4_NDST][WG_SIZE];
+
+void main() {
+    // gl_WorkGroupID.x = rowBlock, gl_WorkGroupID.y = m (mirror tgpig.x/tgpig.y ben Metal)
+    int m = int(gl_WorkGroupID.y);
+    if (m >= pc.M) return;
+    int rowBlock = int(gl_WorkGroupID.x);
+    uint lid = gl_LocalInvocationID.x;   // 0..WG_SIZE-1, duy nhat trong toan bo workgroup
+
+    int bytesPerRow = (pc.K + 1) / 2;
+    int n0 = rowBlock * MMQ4_NDST;
+    int rowByteOff[MMQ4_NDST];
+    int rowGroupOff[MMQ4_NDST];
+    float partial[MMQ4_NDST];
+    for (int rr = 0; rr < MMQ4_NDST; ++rr) {
+        int n = n0 + rr;
+        rowByteOff[rr] = n * bytesPerRow;
+        rowGroupOff[rr] = n * pc.nGroupsPerRow;
+        partial[rr] = 0.0;
+    }
+
+    int curGroup[MMQ4_NDST];
+    float scCache[MMQ4_NDST];
+    float zpCache[MMQ4_NDST];
+    for (int rr = 0; rr < MMQ4_NDST; ++rr) curGroup[rr] = -1;
+
+    // groupSize duoc gia dinh CHAN (dung voi 32/64/128/256 pho bien) de k2
+    // va k2+1 luon cung 1 group - xem giai thich chi tiet o ban Metal.
+    for (int k2 = int(lid) * 2; k2 < pc.K; k2 += WG_SIZE * 2) {
+        float aVal0 = a[m * pc.K + k2];
+        bool hasK1 = (k2 + 1) < pc.K;
+        float aVal1 = hasK1 ? a[m * pc.K + k2 + 1] : 0.0;
+        int g = pc.groupSize > 0 ? (k2 / pc.groupSize) : 0;
+        int byteIdx = k2 >> 1;
+
+        for (int rr = 0; rr < MMQ4_NDST; ++rr) {
+            int n = n0 + rr;
+            if (n >= pc.N) continue;
+            if (g != curGroup[rr]) {
+                curGroup[rr] = g;
+                scCache[rr] = scales[rowGroupOff[rr] + g];
+                zpCache[rr] = zeros[rowGroupOff[rr] + g];
+            }
+            uint8_t byteVal = wq[rowByteOff[rr] + byteIdx];
+            uint nib0 = uint(byteVal) & 0x0Fu;          // k2 (chan)  -> nibble thap
+            uint nib1 = (uint(byteVal) >> 4) & 0x0Fu;   // k2+1 (le)  -> nibble cao
+            partial[rr] += aVal0 * ((float(nib0) - zpCache[rr]) * scCache[rr]);
+            if (hasK1) partial[rr] += aVal1 * ((float(nib1) - zpCache[rr]) * scCache[rr]);
+        }
+    }
+
+    for (int rr = 0; rr < MMQ4_NDST; ++rr) {
+        sdata[rr][lid] = partial[rr];
+    }
+    barrier();
+    // Tree reduction chuan tren toan bo WG_SIZE thread cua WORKGROUP -
+    // dung voi MOI kich thuoc subgroup phan cung (khong dua vao
+    // subgroupAdd/gl_SubgroupInvocationID - xem giai thich o dau file).
+    for (uint stride = uint(WG_SIZE) / 2u; stride > 0u; stride >>= 1) {
+        if (lid < stride) {
+            for (int rr = 0; rr < MMQ4_NDST; ++rr) {
+                sdata[rr][lid] += sdata[rr][lid + stride];
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        for (int rr = 0; rr < MMQ4_NDST; ++rr) {
+            int n = n0 + rr;
+            if (n < pc.N) {
+                c[m * pc.N + n] = sdata[rr][0];
+            }
+        }
+    }
+}

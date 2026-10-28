@@ -1,13 +1,16 @@
 # BybyLang
 
-A Nim-based DSL, AOT-compiled to Nim source then built into a native binary. Its core is a set of `gpu ...` commands for running tensor ops on CUDA / Metal / OpenCL / TSIC-IR / CPU, plus generic control flow and a set of low-level hardware-simulation commands.
+A Nim-based DSL, AOT-compiled to Nim source then built into a native binary. Its `gpu ...` commands generate tensor operations; `session:` batches supported operations; and `micro kernel` defines a native BybyLang VM kernel that is lowered to Metal or Vulkan GPU code. Generic control flow and hardware-simulation commands are also available.
 
 ## Build & run
 
 ```bash
-make build #build library don't run that test code
+make -C vendor/bybylang build
+make -C vendor/bybylang test
+# Or, from vendor/bybylang itself:
+make build
 make test
-# equivalent to:
+# equivalent to the build and AOT run:
 nim c -d:release -o:bybylang bybylang.nim
 ./bybylang demo/demo_gpu.bybylang --aot=demo/demo_gpu_out
 ./demo/demo_gpu_out
@@ -23,7 +26,7 @@ nim c -d:release -o:bybylang bybylang.nim
 - `#` at the start of a line is a comment.
 - `import name` or `import "path/name.bybylang"` — recursive import, `.bybylang` extension auto-appended, cycle-protected via absolute path.
 - `print <expr>` → generates `echo <expr>`.
-- `function NAME` ... a line containing only `NAME` closes the definition; call it with `call NAME`.
+- `function NAME` opens a definition; the body is whatever's indented deeper than the `function` line (same dedent rule as `if/while/for`), no closing marker needed. Invoke it with `call NAME` or just a line containing only `NAME`.
 - `if cond:` / `elif cond:` / `else:` / `while cond:` / `for x in range(a, b):` — translated directly to the equivalent Nim construct, arbitrarily nestable.
 - `mode is N` (N = 1..4) → prints "Mode 1: Low-level" / "Mode 2: Mid-level" / "Mode 3: High-level" / "Mode 4: Web-level" (any other N → "Unknown mode").
 
@@ -32,11 +35,12 @@ nim c -d:release -o:bybylang bybylang.nim
 ### Select backend
 
 ```
-gpu backend is "auto"      # auto | cpu | cuda | metal | opencl | tsic
+gpu backend is "auto"      # auto | cpu | cuda (Vulkan alias) | metal | vulkan
 ```
 
-`auto` probes in order: CUDA (NVIDIA) → Metal (macOS) → OpenCL → plain CPU.
-By default, **silent CPU fallback is forbidden** (`gForbidCpuFallback = true`): if a specific GPU backend is requested and it's unavailable or fails, the program raises instead of silently falling back to CPU (so you never accidentally train on CPU without noticing).
+`auto` probes Metal on macOS, then Vulkan, then CPU. `cuda` is a legacy backend name that maps to Vulkan; CUDA/cuBLAS is not implemented in this version. `opencl` is not a current `GpuBackend` option.
+
+`gForbidCpuFallback` defaults to `false`. Call `setForbidCpuFallback(true)` when you need GPU-only execution to fail fast instead of allowing operation-level CPU fallback. Backend availability and operation coverage vary; check boolean results from session encoders and surface errors from `sessionEnd`.
 
 ### Declare an array
 
@@ -64,10 +68,7 @@ gpu matmul A, B -> C m M k K n N
 ```
 A: [M×K], B: [K×N] → C: [M×N].
 
-```
-gpu matmul2 A1, B1, A2, B2 -> C1, C2 m1 M k1 K n1 N m2 M k2 K n2 N
-```
-Two independent matmuls fused into a single call.
+`gpuMatmul2` (two independent matmuls in one backend call) is available to Nim callers, but has no `.bybylang` syntax. Call `gpuMatmul2(...)` directly from Nim.
 
 ### Activations
 
@@ -75,15 +76,10 @@ Two independent matmuls fused into a single call.
 gpu relu X -> Y
 gpu sigmoid X -> Y
 gpu tanh X -> Y
-gpu apflu X -> Y alpha A beta B      # defaults: alpha=0.1, beta=1.0 if omitted
-gpu apflu_backward X, DY -> DX alpha A beta B   # alpha/beta optional, same defaults
+gpu apflu X -> Y alpha A beta B      # alpha/beta optional; defaults to alpha=0.1, beta=1.0 if omitted
 ```
 
-### Fused add + activation
-
-```
-gpu fused_add_act A, B -> C act "relu"    # "relu" | "sigmoid" | "tanh" | "none"
-```
+Both `apflu_backward` and `fused_add_act` have `.bybylang` syntax and Nim APIs (`gpuApfluBackward`, `gpuFusedAddAct`).
 
 ### Softmax / LayerNorm
 
@@ -108,6 +104,17 @@ gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE
 ```
 B=batch, H=heads, S=seq_len, D=head_dim.
 
+### RoPE
+
+```
+gpu rope X, COS, SIN -> Y seqlen T heads H dim D
+```
+Rotates `X` in place using `COS`/`SIN` tables. Use this inside `session:`; there is no immediate `gpu rope` implementation. If the backend cannot begin a session, generated code warns and returns the original input unchanged, so do not treat that fallback as a RoPE result.
+
+### Other DSL operations
+
+The parser also supports `sqrt`, `exp`, `log`, `pow`, `gather`, `compare`, `fused_add_act`, `apflu_backward`, `permute`, `split_slice`, `concat`, `argmax_index`, and `dropout_mask`. Their exact operand and shape syntax is demonstrated in [`demo/demo_gpu.bybylang`](demo/demo_gpu.bybylang). `compare` returns a boolean mask; gather and embedding indices are cast to `int32`.
+
 ### Generic op (fallback)
 
 ```
@@ -117,25 +124,113 @@ Generates `gpuOp("<other_op>", backend, A, B)` — requires a matching branch in
 
 ---
 
-## 3. GPU Resident Tensor API (CUDA) — called directly from Nim
+## 3. `session:` blocks — batching multiple `gpu ...` calls
 
-Defined at the end of `gpubackend.nim`. **Not** exposed through `.bybylang` syntax — call it from plain Nim code to avoid a CPU↔GPU round trip on every op:
-
-```nim
-let ta = cuUpload(dataA)          # upload seq[float32] to the GPU once
-let tb = cuUpload(dataB)
-let tc = cuAddR(ta, tb)           # result STAYS on the GPU
-let out = cuDownload(tc)          # only download when you actually need the result
-cuFree(ta); cuFree(tb); cuFree(tc)
+```
+session:
+  gpu add A, B -> C size 4
+  gpu mul C, A -> D size 4
+  gpu relu D -> E
+  gpu rope Q, COS, SIN -> Q2 seqlen 4 heads 1 dim 4
 ```
 
-Available: `cuUpload`, `cuUploadIndices`, `cuDownload`, `cuFree`, `cuMatmulR`, `cuAddR`, `cuSubR`, `cuMulR`, `cuDivR`, `cuReluR`, `cuSigmoidR`, `cuTanhR`, `cuSoftmaxR`, `cuLayernormR`, `cuEmbeddingLookupR`.
+Wraps the enclosed `gpu ...` lines with the Session API (`sessionBegin` / `sessionUpload` / `session<Op>` / `sessionEnd` / `sessionRead` / `sessionFree` in `gpubackend.nim`) so intermediate results stay on the GPU across ops instead of round-tripping through `seq[float32]` after every single call.
 
-> ⚠️ **Note:** these resident-tensor calls exist but the forward pass generated from `.bybylang` (`genGpuLine`) does not call them — every `gpu ...` DSL command still uploads/downloads through `seq[float32]` on each call (per-op round trip), not the resident chain.
+- Ops with a session-encoded path include `add`/`sub`/`mul`/`div`, activations, `softmax`, `matmul`, `layernorm`, `rope`, `fused_add_act`, `apflu`/`apflu_backward`, `gather`, `compare`, `dropout_mask`, and `split_slice`. Other operations such as `embedding`, `attention`, `attention_backward`, `layernorm_backward`, `permute`, `concat`, and `argmax_index` run through their immediate APIs when placed in the block; those calls do not become resident session ops.
+- Unlike outside a session, a trailing `size N` **does** affect codegen here — it's used as the element-count argument passed to the session op, not just descriptive.
+- If `sessionBegin()` fails, the generated block falls back to immediate calls for supported fallback operations. `gpu rope` has no immediate equivalent; fallback warns and leaves its output equal to its input (RoPE is skipped).
+- Non-`gpu` lines inside a `session:` block (assignments, `print`, etc.) run normally, outside the session's GPU batching.
 
 ---
 
-## 4. Low-level hardware-simulation commands
+## 4. Nim GPU and Session APIs
+
+Import the backend directly from a Nim application. With the project root as the working directory:
+
+```nim
+import vendor/bybylang/gpubackend
+
+let backend = parseBackend("vulkan") # also "metal", "auto", "cpu"
+let a = @[1'f32, 2, 3, 4]
+let b = @[10'f32, 20, 30, 40]
+let c = gpuOp("add", backend, a, b)
+echo c
+```
+
+For the DSL compiler facade and VM helpers, import `vendor/bybylang/bybylang`; it re-exports `gpubackend`, `micro_kernel`, and the Metal/Vulkan modules. For backend-only code, `vendor/bybylang/gpubackend` keeps the import surface smaller.
+
+The immediate `gpu*` API accepts/returns CPU `seq`s, so each call may transfer data. Available families include `gpuMatmul`, `gpuMatmul2`, `gpuMatmulQ4`, vector ops (`gpuRelu`, `gpuSigmoid`, `gpuTanh`, `gpuFusedAddAct`), `gpuSoftmax`, `gpuLayernorm` and backward, fused attention and backward, embedding lookup, RoPE-related session operations, and utility ops (`gpuGather`, `gpuCompare`, `gpuPermute`, `gpuSplitSlice`, `gpuConcat`, `gpuArgmaxIndex`, `gpuDropoutMask`). See the exported signatures in `gpubackend.nim` for exact dimensions and argument order.
+
+For a chain of GPU operations, use `SessionHandle` so intermediate tensors stay on the device. Always check encoder return values and end the session before reading results:
+
+```nim
+import vendor/bybylang/gpubackend
+
+let backend = parseBackend("vulkan")
+if not sessionBegin(backend):
+  raise newException(IOError, "GPU sessions are unavailable")
+var a = sessionUpload(backend, @[1'f32, 2, 3, 4])
+var b = sessionUpload(backend, @[10'f32, 20, 30, 40])
+var c: SessionHandle
+if not sessionVecOp(backend, "add", a, b, c, 4):
+  raise newException(IOError, "add encode failed")
+if not sessionEnd(backend):
+  raise newException(IOError, sessionGetLastError(backend))
+echo sessionRead(backend, c, 4)
+sessionFree(backend, a)
+sessionFree(backend, b)
+sessionFree(backend, c)
+```
+
+Core lifecycle calls: `sessionBegin`, `sessionUpload`/`sessionUploadBorrowed`/`sessionUploadPrivate`, `sessionAllocScratch`, `sessionEnd`, `sessionRead`, and `sessionFree`. Encode APIs cover vector/activation ops, matmul and Q4 matmul, softmax, layernorm/RMSNorm, RoPE, attention, copy/scale, gather/compare, dropout, slicing, and embedding where implemented by the chosen backend. `sessionCommitContinue` can commit queued work and continue encoding without an explicit CPU readback; `sessionRecoverQueue` is for recovery after a failed session. `sessionAllocHeap` is currently a Metal-only heap optimization and returns `nil` on unsupported backends; check it before suballocating.
+
+For quantized Q4 weights, upload once and reuse the returned resident handle across sessions:
+
+```nim
+var q4 = residentUploadQ4(backend, packedWeights, scales, zeros,
+                          k = 4096, n = 4096, groupSize = 32,
+                          nGroupsPerRow = 128)
+discard residentPrepareQ4(q4, M = 1) # optional autotune; false means no tuned plan
+if not sessionBegin(backend): raise newException(IOError, "session unavailable")
+var x = sessionUpload(backend, activations)
+var y: SessionHandle
+if not sessionMatmulQ4(backend, x, q4, y, M = 1):
+  raise newException(IOError, "Q4 matmul encode failed")
+if not sessionEnd(backend): raise newException(IOError, sessionGetLastError(backend))
+let result = sessionRead(backend, y, 4096)
+sessionFree(backend, x)
+sessionFree(backend, y)
+residentFreeQ4(q4) # call only when unloading the weights
+```
+
+The old `cu*` resident-tensor names are compatibility stubs in this revision; they do not provide CUDA/cuBLAS execution. Use the common Session API above. The legacy backend string `cuda` resolves to Vulkan.
+
+## 5. Native BybyLang micro-kernels
+
+Write a `micro kernel` block directly in `.bybylang`; no Nim helper module or external micro-kernel import is required. The compiler builds a `VmProgram`, lowers it to Metal or Vulkan code, dispatches it in a GPU session, and reads back the output:
+
+```text
+gpu backend is "vulkan"
+gpu array INPUT = [1, 2, 3, 4, 5, 6, 7, 8]
+
+micro kernel scale INPUT -> OUTPUT threads 8 tg 4 out 8:
+  emitULid 0
+  emitULoadIn 1 0 0
+  emitLoadConstF32 2 2.0'f32
+  emitMul 1 1 2
+  emitUStoreF32 1 0 0
+  emitHalt
+
+print OUTPUT
+```
+
+The VM instruction API is exported by `vendor/bybylang/micro_kernel` and re-exported by `vendor/bybylang/bybylang`: create a `VmProgram` and append instructions with `emit*` procedures. Instructions include float/integer loads and stores, arithmetic, FMA, loops and conditionals, thread/threadgroup IDs, threadgroup memory and barriers, atomics, and virtual-threadgroup helpers. Integer registers are 32-bit; float registers are `float32`. Each instruction takes register indices and offsets as documented at its declaration in `micro_kernel/session_vm.nim`.
+
+The DSL header is `micro kernel NAME INPUT -> OUTPUT threads N tg N out N:` and its indented body accepts `emit...` instruction calls. `threads` is the dispatch thread count, `tg` the threadgroup size, and `out` the output element count. Choose counts and guard memory accesses so every dispatched thread stays in bounds. This path currently requires Metal or Vulkan; it raises for CPU/unsupported backends. For more complex kernels, import `vendor/bybylang/bybylang`, create the `VmProgram` in Nim, and call `executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)` directly.
+
+---
+
+## 6. Low-level hardware-simulation commands
 
 These **do** have real DSL syntax, parsed in `genBlock` (`bybylang.nim` ~line 668–714) and lowered to calls that operate on a simulated RAM (1024 ints) / BUS (seq[string]) / 32 Pins:
 
@@ -162,20 +257,20 @@ Parser quirks worth knowing:
 
 ---
 
-## 5. Backends
+## 7. Backends
 
 | Backend | File | Notes |
 |---|---|---|
-| CUDA | `backends/cuda/cuda_driver.nim`, `cuda_runtime.nim` | Direct Driver API + cuBLAS, PTX JIT via `cuModuleLoadDataEx`, persistent context/module cache |
-| Metal | `backends/metal/metal_backend.nim` (+ `.metal` kernels) | macOS GPU, buffer/pipeline cache |
-| OpenCL | `backends/opencl/opencl_api.nim` | any other GPU/CPU |
-| TSIC-IR | `tsic_ir.nim` | intermediate IR, lowerable to PTX / MSL / OpenCL C / GLSL |
-| CPU | inside `gpubackend.nim` (`cpuRelu`, `cpuMatmul`, ...) | pure-Nim fallback, always correct but slow |
+| Metal | `backends/metal/metal_backend.nim`, `backends/metal/kernels/` | macOS GPU; native buffer, pipeline, and session support |
+| Vulkan | `backends/vulkan/vulkan_driver.nim`, `backends/vulkan/kernels/` | Vulkan GPU backend for NVIDIA, AMD, and Intel devices where drivers/features support the operation |
+| CPU | reference operations in `gpubackend.nim` | fallback or explicit CPU implementation where implemented; can be forbidden with `setForbidCpuFallback(true)` |
 
-## 6. Minimal example
+`cuda` is accepted as a compatibility spelling and normalized to Vulkan. It does not load CUDA Runtime or cuBLAS. OpenCL is not implemented as a current selectable backend.
+
+## 8. Minimal example
 
 ```
-gpu backend is "tsic"
+gpu backend is "vulkan"
 gpu array A = [1, 2, 3, 4]
 gpu array B = [5, 6, 7, 8]
 gpu add A, B -> C

@@ -1,0 +1,19 @@
+#version 450
+// Giống split_slice (CUDA) - lát cắt liên tục theo dim, mỗi invocation tự
+// tính chỉ số nguồn từ linear id, không cần bảng chỉ số dựng sẵn.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufSrc { float src[]; };
+layout(std430, binding = 1) writeonly buffer BufDst { float dst[]; };
+layout(push_constant) uniform PC {
+    int dimTotal; int thisSize; int offset; int inner; int n;
+} pc;
+void main() {
+    uint linear = gl_GlobalInvocationID.x;
+    if (linear >= uint(pc.n)) return;
+    int i = int(linear) % pc.inner;
+    int rem = int(linear) / pc.inner;
+    int d = rem % pc.thisSize;
+    int o = rem / pc.thisSize;
+    int srcLinear = (o * pc.dimTotal + pc.offset + d) * pc.inner + i;
+    dst[linear] = src[srcLinear];
+}

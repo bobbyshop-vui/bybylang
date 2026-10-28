@@ -1,0 +1,110 @@
+#version 450
+// attention_decode_all_heads.comp - ban Vulkan cua attention_decode_all_heads.metal
+// 1 DISPATCH cho TOAN BO H query head (1 workgroup / query head), thay cho vong
+// lap CPU "HKV x (copyInto + matmulNT + softmax + matmul + copyInto)".
+//
+// Toan hoc y het duong cu: scores=dot(Q,K[s]); probs=softmax; out=sum probs*V.
+// Q DA nhan san attn.scale (nim_inference lam tren GPU truoc) -> KHONG nhan scale o day.
+//
+// Khac ban Metal 1 diem: KHONG can bo nho scratch/threadgroup theo S.
+// Dung softmax "online" theo tung khoi CH key -> chay duoc moi do dai S,
+// khong can cap phat buffer scores moi token.
+//
+// Bo cuc: q[H*D]; kAll/vAll[HKV*maxSeqLen*D] (lien tuc theo head, offset head =
+// hkv*maxSeqLen*D); o[H*D]. Head h dung KV head (h / nRep), nRep = H / HKV.
+// Gioi han: D <= 256 (driver tra false neu lon hon -> caller roi ve duong cu).
+
+#define TG 128
+#define CH 256
+
+layout(local_size_x = TG) in;
+
+layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
+layout(std430, binding = 1) readonly buffer BufK { float kk[]; };
+layout(std430, binding = 2) readonly buffer BufV { float vv[]; };
+layout(std430, binding = 3) writeonly buffer BufO { float o[]; };
+
+layout(push_constant) uniform PC {
+    int H;
+    int HKV;
+    int D;
+    int S;
+    int maxSeqLen;
+} pc;
+
+shared float sc[CH];
+shared float red[TG];
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int tid = int(gl_LocalInvocationID.x);
+    if (h >= pc.H) return;   // dong deu ca workgroup -> an toan voi barrier()
+
+    int nRep = max(1, pc.H / max(1, pc.HKV));
+    int hkv = min(h / nRep, pc.HKV - 1);
+    int D = pc.D;
+    int qBase = h * D;
+    int kvBase = hkv * pc.maxSeqLen * D;
+
+    float m = -1e30;     // max chay
+    float l = 0.0;       // tong exp chay
+    float acc0 = 0.0;    // out[tid]
+    float acc1 = 0.0;    // out[tid+TG] (khi D > 128)
+
+    for (int base = 0; base < pc.S; base += CH) {
+        int n = min(CH, pc.S - base);
+
+        // 1) scores cua khoi + max cuc bo
+        float lmax = -1e30;
+        for (int j = tid; j < n; j += TG) {
+            int kb = kvBase + (base + j) * D;
+            float dotv = 0.0;
+            for (int d = 0; d < D; ++d) dotv += q[qBase + d] * kk[kb + d];
+            sc[j] = dotv;
+            lmax = max(lmax, dotv);
+        }
+        red[tid] = lmax;
+        barrier();
+        for (int st = TG / 2; st > 0; st >>= 1) {
+            if (tid < st) red[tid] = max(red[tid], red[tid + st]);
+            barrier();
+        }
+        float cm = red[0];
+        barrier();
+
+        // 2) rescale theo max moi, exp + tong
+        float newM = max(m, cm);
+        float corr = exp(m - newM);
+        float lsum = 0.0;
+        for (int j = tid; j < n; j += TG) {
+            float e = exp(sc[j] - newM);
+            sc[j] = e;
+            lsum += e;
+        }
+        red[tid] = lsum;
+        barrier();
+        for (int st = TG / 2; st > 0; st >>= 1) {
+            if (tid < st) red[tid] += red[tid + st];
+            barrier();
+        }
+        float cs = red[0];
+        barrier();
+        l = l * corr + cs;
+        m = newM;
+        acc0 *= corr;
+        acc1 *= corr;
+
+        // 3) cong don probs * V (moi thread phu trach 1-2 cot d)
+        for (int s = 0; s < n; ++s) {
+            float p = sc[s];
+            int vb = kvBase + (base + s) * D;
+            if (tid < D)      acc0 += p * vv[vb + tid];
+            if (tid + TG < D) acc1 += p * vv[vb + tid + TG];
+        }
+        barrier();   // xong doc sc[] truoc khi khoi ke tiep ghi de
+    }
+
+    float inv = 1.0 / max(l, 1e-20);
+    if (tid < D)      o[qBase + tid]      = acc0 * inv;
+    if (tid + TG < D) o[qBase + tid + TG] = acc1 * inv;
+}

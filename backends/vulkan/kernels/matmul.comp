@@ -1,0 +1,40 @@
+#version 450
+// Matmul FP32 thường (không lượng tử) - dùng tile 16x16 chuẩn qua shared
+// memory, thuật toán tiled-matmul kinh điển (KHÔNG mirror byte-for-byte
+// Metal vì bản Metal có nhiều biến thể tile 8/16/32 chọn runtime theo
+// maxTotalThreadsPerThreadgroup - ở đây chỉ viết 1 biến thể tile=16 cố
+// định, đơn giản/an toàn hơn, đủ dùng cho phần weight resident FP32 không
+// lượng tử, không phải đường nóng chính (đường nóng là Q4).
+#define TILE 16
+layout(local_size_x = TILE, local_size_y = TILE) in;
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };  // [M,K]
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };  // [K,N]
+layout(std430, binding = 2) writeonly buffer BufC { float c[]; }; // [M,N]
+layout(push_constant) uniform PC { int M; int K; int N; } pc;
+
+shared float tileA[TILE][TILE];
+shared float tileB[TILE][TILE];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint tx = gl_LocalInvocationID.x;
+    uint ty = gl_LocalInvocationID.y;
+
+    float acc = 0.0;
+    int numTiles = (pc.K + TILE - 1) / TILE;
+    for (int t = 0; t < numTiles; ++t) {
+        int aCol = t * TILE + int(tx);
+        int bRow = t * TILE + int(ty);
+        tileA[ty][tx] = (row < uint(pc.M) && aCol < pc.K) ? a[row * uint(pc.K) + uint(aCol)] : 0.0;
+        tileB[ty][tx] = (bRow < pc.K && col < uint(pc.N)) ? b[uint(bRow) * uint(pc.N) + col] : 0.0;
+        barrier();
+        for (int kk = 0; kk < TILE; ++kk) {
+            acc += tileA[ty][kk] * tileB[kk][tx];
+        }
+        barrier();
+    }
+    if (row < uint(pc.M) && col < uint(pc.N)) {
+        c[row * uint(pc.N) + col] = acc;
+    }
+}

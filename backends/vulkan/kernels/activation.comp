@@ -1,0 +1,19 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufX { float x[]; };
+layout(std430, binding = 1) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { int op; int n; float p; } pc;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pc.n)) return;
+    float v = x[id];
+    if (pc.op == 0) y[id] = max(v, 0.0);
+    else if (pc.op == 1) y[id] = 1.0 / (1.0 + exp(-v));
+    else if (pc.op == 2) y[id] = tanh(v);
+    else if (pc.op == 4) y[id] = exp(v);
+    else if (pc.op == 5) y[id] = log(v);
+    else if (pc.op == 6) y[id] = sqrt(v);
+    else if (pc.op == 7) y[id] = pow(v, pc.p);
+    else if (pc.op == 8) y[id] = v * pc.p; // scale: dung cho sessionScale (x *= scalar)
+    else y[id] = max(v, 0.0);
+}

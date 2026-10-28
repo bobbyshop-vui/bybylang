@@ -1,0 +1,31 @@
+#version 450
+// Giống concat_gather (CUDA) nhưng SPIR-V không có mảng con trỏ device
+// tiện dụng như CUDA -> dùng 1 buffer nguồn ĐÃ NỐI PHẲNG (flatSrc, do host
+// ghép các tensor lại - chỉ là memcpy nối tiếp, KHÔNG phải tính chỉ số)
+// + 1 bảng nhỏ O(numTensors): base offset trong flatSrc, dimSize, dimOffset
+// (lũy kế) từng nguồn. Mỗi invocation tự quét bảng nhỏ này để chọn đúng
+// nguồn - không có mảng chỉ số O(n) build trên CPU.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufSrc   { float flatSrc[]; };
+layout(std430, binding = 1) readonly buffer BufBase  { int srcBase[]; };       // [numTensors]
+layout(std430, binding = 2) readonly buffer BufSize  { int srcDimSize[]; };    // [numTensors]
+layout(std430, binding = 3) readonly buffer BufOff   { int srcDimOffset[]; };  // [numTensors]
+layout(std430, binding = 4) writeonly buffer BufDst  { float dst[]; };
+layout(push_constant) uniform PC { int numTensors; int totalDim; int inner; int n; } pc;
+
+void main() {
+    uint linear = gl_GlobalInvocationID.x;
+    if (linear >= uint(pc.n)) return;
+    int i = int(linear) % pc.inner;
+    int rem = int(linear) / pc.inner;
+    int dGlobal = rem % pc.totalDim;
+    int o = rem / pc.totalDim;
+
+    int ti = 0;
+    for (int k = 0; k < pc.numTensors; k++) {
+        if (dGlobal < srcDimOffset[k] + srcDimSize[k]) { ti = k; break; }
+    }
+    int dLocal = dGlobal - srcDimOffset[ti];
+    int srcLinear = srcBase[ti] + (o * srcDimSize[ti] + dLocal) * pc.inner + i;
+    dst[linear] = flatSrc[srcLinear];
+}

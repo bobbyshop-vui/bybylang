@@ -1,0 +1,53 @@
+#version 450
+// Mirror attention_fused_kernel (vecop_matmul.metal) - self-attention causal
+// đầy đủ (prefill-style, Q/K/V cùng S dòng). 1 thread = 1 (bh,ti) row,
+// KHÔNG dùng shared/subgroup gì - giống hệt bản Metal gốc "1 thread/row".
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
+layout(std430, binding = 1) readonly buffer BufK { float k[]; };
+layout(std430, binding = 2) readonly buffer BufV { float v[]; };
+layout(std430, binding = 3) writeonly buffer BufO { float o[]; };
+layout(std430, binding = 4) buffer BufS { float s_matrix[]; };
+layout(push_constant) uniform PC { int B; int H; int S; int D; float scale; } pc;
+
+void main() {
+    uint bh = gl_GlobalInvocationID.x;
+    uint ti = gl_GlobalInvocationID.y;
+    if (bh >= uint(pc.B * pc.H) || ti >= uint(pc.S)) return;
+
+    uint base_idx = bh * uint(pc.S) * uint(pc.D);
+    uint base_s = bh * uint(pc.S) * uint(pc.S);
+    uint row = base_s + ti * uint(pc.S);
+
+    float mx = -1e30;
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        float dot = 0.0;
+        for (int d = 0; d < pc.D; ++d) {
+            dot += q[base_idx + ti * uint(pc.D) + uint(d)] * k[base_idx + tj * uint(pc.D) + uint(d)];
+        }
+        float sc = dot * pc.scale;
+        s_matrix[row + tj] = sc;
+        if (sc > mx) mx = sc;
+    }
+
+    float sum_exp = 0.0;
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        float e = exp(s_matrix[row + tj] - mx);
+        s_matrix[row + tj] = e;
+        sum_exp += e;
+    }
+    for (uint tj = 0u; tj <= ti; ++tj) {
+        s_matrix[row + tj] /= sum_exp;
+    }
+    for (uint tj = ti + 1u; tj < uint(pc.S); ++tj) {
+        s_matrix[row + tj] = 0.0;
+    }
+
+    for (int d = 0; d < pc.D; ++d) {
+        float acc = 0.0;
+        for (uint tj = 0u; tj <= ti; ++tj) {
+            acc += s_matrix[row + tj] * v[base_idx + tj * uint(pc.D) + uint(d)];
+        }
+        o[base_idx + ti * uint(pc.D) + uint(d)] = acc;
+    }
+}

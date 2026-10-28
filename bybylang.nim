@@ -1,6 +1,39 @@
 # bybylang.nim - BybyLang AOT executable + Nim code generation + auto compile release
 # Hỗ trợ cơ chế function: define function bằng "function NAME" ... kết thúc bằng một dòng chỉ chứa NAME
+#
+# --------------------------
+# Cú pháp "session:" (MỚI) - dùng Session API của gpubackend.nim
+# --------------------------
+# gpubackend.nim đã có sẵn bộ Session API (sessionBegin/sessionUpload/
+# sessionMatmul/sessionVecOp/sessionActivation/sessionSoftmax/
+# sessionLayernormEnc/sessionRope/sessionEnd/sessionRead/sessionFree) để gộp
+# nhiều lệnh GPU vào 1 session (giảm số lần commit+wait GPU so với gọi từng
+# lệnh "gpu ..." rời rạc). Cú pháp:
+#
+#   session:
+#     gpu add A, B -> C size 4
+#     gpu mul C, D -> E size 4
+#     gpu relu E -> F
+#     gpu fused_add_act A, B -> G act "relu"
+#     gpu rope Q, COS, SIN -> Q2 seqlen 4 heads 1 dim 4
+#
+# Các op được hỗ trợ ENCODE-TRONG-SESSION: add/sub/mul/div, relu/sigmoid/tanh,
+# fused_add_act (ghép TRỰC TIẾP sessionVecOp("add") + sessionActivation(act)
+# vào CÙNG session bao ngoài, không mở session con riêng), softmax, matmul,
+# layernorm, rope. Nếu sessionBegin() thất bại (backend không hỗ trợ
+# session), toàn bộ khối tự động rơi về gọi "gpu ..." như bình thường
+# (immediate - vẫn là hàm gpuXxx() gọi GPU thật, KHÔNG bao giờ rơi về CPU),
+# đảm bảo luôn ra kết quả đúng. Các op GPU khác
+# (embedding, attention, attention_backward, layernorm_backward, apflu...)
+# CHƯA có bản session tương ứng trong gpubackend.nim nên vẫn được sinh ra
+# dưới dạng lệnh immediate như cũ, không cần đặt trong "session:" (đặt trong
+# đó vẫn chạy đúng, chỉ là không được gộp session).
 import strutils, os, osproc, tables, sequtils, times
+import ./gpubackend
+import ./micro_kernel
+import ./backends/metal/metal_backend
+import ./backends/vulkan/vulkan_driver
+export gpubackend, micro_kernel, metal_backend, vulkan_driver
 
 # --------------------------
 # Traceback system - LUÔN BẬT, IN RA TERMINAL
@@ -51,6 +84,16 @@ proc parseIntSafe(s: string): int =
   except:
     return 0
 
+# THEM MOI: lay gia tri tham so theo TEN (khong phu thuoc vi tri co dinh
+# nhu cac nhanh cu trong genGpuLine) - dung cho cac op moi patch them.
+# vd rhsParts = ["Y", "n", "10", "p", "0.5", "seed", "42"],
+# findNamedParam(rhsParts, "p", "0.0") -> "0.5"
+proc findNamedParam*(parts: seq[string], key: string, default: string): string =
+  for i in 0..<parts.len:
+    if parts[i] == key and i+1 < parts.len:
+      return parts[i+1]
+  return default
+
 # --------------------------
 # Types
 # --------------------------
@@ -87,9 +130,18 @@ proc tokenizeLine(line: string): Token =
   elif clean.startsWith("#"):
     tok.sym = "comment"
     tok.text = clean
+  elif clean.startsWith("micro kernel "):
+    tok.sym = "microkernel"
+    tok.text = clean["micro kernel ".len..^1]
   elif clean.startsWith("function "):
     tok.sym = "function"
     tok.text = clean.replace("function ", "")
+  elif clean.startsWith("import nim "):
+    # THEM MOI: "import nim \"strutils\"" -> import thu vien Nim THAT (khong
+    # phai file .bybylang) - PHAI kiem tra TRUOC nhanh "import " thuong,
+    # neu khong se bi nhanh do bat nham thanh ten file .bybylang.
+    tok.sym = "nimimport"
+    tok.text = stripQuotes(clean["import nim ".len..^1].strip())
   elif clean.startsWith("import "):
     tok.sym = "import"
     tok.text = clean["import ".len..^1].strip()
@@ -141,6 +193,54 @@ proc tokenizeFile(filename: string): seq[Token] =
   let result = resolveImports(filename, visited)
   traceInfo("Total tokens: " & $result.len)
   return result
+
+proc executeMicroKernel*(backend: GpuBackend; kernelName: string;
+    program: VmProgram; inputValues: seq[float32]; outputElems, nThreads,
+    tgSize: int): seq[float32] =
+  ## Compile and run a BybyLang bytecode program inside one backend session.
+  let selected = case backend
+    of gbAuto: detectBackend()
+    of gbCuda: gbVulkan
+    else: backend
+  let isVulkan = selected == gbVulkan
+  if selected notin {gbMetal, gbVulkan}:
+    raise newException(ValueError, "micro kernel requires a Metal or Vulkan backend")
+  if outputElems <= 0 or nThreads <= 0 or tgSize <= 0 or tgSize > nThreads:
+    raise newException(ValueError, "micro kernel needs positive output, threads and group sizes")
+  if inputValues.len == 0:
+    raise newException(ValueError, "micro kernel input cannot be empty")
+
+  if not isVulkan:
+    doAssert ensureGpuInit(selected), "micro-kernel: backend initialization failed"
+  let source = if isVulkan: lowerBytecodeToGlsl(program, kernelName)
+               else: lowerBytecodeToMetal(program, kernelName)
+  if not isVulkan:
+    doAssert tryMetalJitCompile(source, kernelName),
+      "micro-kernel: Metal JIT compilation failed"
+
+  doAssert sessionBegin(selected), "micro-kernel: sessionBegin failed"
+  var input = sessionUpload(selected, inputValues)
+  var output = sessionAllocScratch(selected, outputElems)
+  doAssert sessionEncPipeline(isVulkan, kernelName, source),
+    "micro-kernel: pipeline setup failed"
+
+  template bindBuffer(vkSlot, metalSlot: int; h: SessionHandle) =
+    doAssert sessionEncBindVkOrMetal(isVulkan,
+      (if isVulkan: vkSlot else: metalSlot), h.metalHandle, h.vulkanHandle),
+      "micro-kernel: buffer bind failed"
+  bindBuffer(0, 1, output) # output / memF32
+  bindBuffer(1, 2, output) # byte view
+  bindBuffer(2, 3, output) # LUT view
+  bindBuffer(3, 4, input)  # input / inF32
+  if isVulkan: bindBuffer(4, 5, output) # uint view
+
+  doAssert sessionEncDispatch(isVulkan, nThreads, tgSize),
+    "micro-kernel: dispatch failed"
+  doAssert sessionEnd(selected), "micro-kernel: sessionEnd failed: " &
+    sessionGetLastError(selected)
+  result = sessionRead(selected, output, outputElems)
+  sessionFree(selected, input)
+  sessionFree(selected, output)
 
 # --------------------------
 # Hardware-level functions
@@ -224,7 +324,7 @@ proc tranPulse(pin: int, width: string) =
 # Sinh code cho lệnh "gpu ..."
 # --------------------------
 # Cú pháp hỗ trợ:
-#   gpu backend is "auto"          # "auto" | "cuda" | "metal" | "opencl" | "cpu" | "tsic"
+#   gpu backend is "auto"          # "auto" | "cuda" (Vulkan alias) | "metal" | "cpu" | "vulkan"
 #   gpu array X = [1, 2, 3, 4]
 #   gpu add A, B -> C size 4       # "size N" tuỳ chọn, chỉ mang tính mô tả
 #   gpu sub A, B -> C
@@ -241,14 +341,17 @@ proc tranPulse(pin: int, width: string) =
 #   gpu embedding TABLE, INDICES -> Y vocab V dim D
 #   gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE
 #   gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE
-proc genGpuLine(line: string): seq[string] =
+proc genGpuLine*(line: string): seq[string] =
   traceDebug("Parsing GPU line: " & line)
   result = @[]
   let rest = line[3..^1].strip()
 
   if rest.startsWith("backend is"):
     let raw = rest["backend is".len..^1].strip()
-    let val = stripQuotes(raw)
+    var val = stripQuotes(raw)
+    if val == "auto":
+      let backendOverride = getEnv("BYBYLANG_BACKEND").strip()
+      if backendOverride.len > 0: val = backendOverride
     traceInfo("Setting GPU backend: " & val)
     result.add("gpuBackendSelected = parseBackend(\"" & val & "\")")
 
@@ -400,83 +503,98 @@ proc genGpuLine(line: string): seq[string] =
             traceWarn("apflu needs 1 operand: " & line)
             result.add("# [WARN] cú pháp 'gpu apflu' cần 1 toán hạng: " & line)
 
-        elif opName == "apflu_backward":
-          # gpu apflu_backward X, DY -> DX alpha A beta B
-          # gpu apflu_backward X, DY -> DX               (alpha=0.1, beta=1.0 mặc định)
-          if operands.len >= 2:
+        elif opName == "permute":
+          # THEM MOI: gpu permute SRC -> Y newStrides NS oldStrides OS dimsMap DM n N
+          # NS/OS/DM la TEN BIEN seq[int32] (hoac seq[int]) co san, N la scalar.
+          if operands.len >= 1:
+            let src = operands[0].strip()
+            let rhsParts = rhs.splitWhitespace()
+            let target = rhsParts[0]
+            let ns = findNamedParam(rhsParts, "newStrides", "")
+            let os = findNamedParam(rhsParts, "oldStrides", "")
+            let dm = findNamedParam(rhsParts, "dimsMap", "")
+            let n = findNamedParam(rhsParts, "n", "0")
+            if ns.len > 0 and os.len > 0 and dm.len > 0:
+              result.add("var " & target & " = gpuPermute(gpuBackendSelected, " & src & ", " & ns & ".mapIt(int32(it)), " & os & ".mapIt(int32(it)), " & dm & ".mapIt(int32(it)), " & n & ")")
+            else:
+              traceWarn("Invalid permute syntax: " & line)
+              result.add("# [WARN] cú pháp 'gpu permute' cần: gpu permute SRC -> Y newStrides NS oldStrides OS dimsMap DM n N : " & line)
+          else:
+            traceWarn("permute needs 1 operand: " & line)
+            result.add("# [WARN] cú pháp 'gpu permute' cần 1 toán hạng: " & line)
+
+        elif opName == "split_slice":
+          # THEM MOI: gpu split_slice SRC -> Y dimTotal DT thisSize TS offset OFF inner IN n N
+          if operands.len >= 1:
+            let src = operands[0].strip()
+            let rhsParts = rhs.splitWhitespace()
+            let target = rhsParts[0]
+            let dimTotal = findNamedParam(rhsParts, "dimTotal", "0")
+            let thisSize = findNamedParam(rhsParts, "thisSize", "0")
+            let offset = findNamedParam(rhsParts, "offset", "0")
+            let inner = findNamedParam(rhsParts, "inner", "0")
+            let n = findNamedParam(rhsParts, "n", "0")
+            result.add("var " & target & " = gpuSplitSlice(gpuBackendSelected, " & src & ", " & dimTotal & ", " & thisSize & ", " & offset & ", " & inner & ", " & n & ")")
+          else:
+            traceWarn("split_slice needs 1 operand: " & line)
+            result.add("# [WARN] cú pháp 'gpu split_slice' cần 1 toán hạng: " & line)
+
+        elif opName == "concat":
+          # THEM MOI: gpu concat FLATSRC -> Y srcBase SB srcDimSize SDS srcDimOffset SDO
+          #           numTensors NT totalDim TD inner IN
+          # SB/SDS/SDO la TEN BIEN seq[int32] (hoac seq[int]) co san.
+          if operands.len >= 1:
+            let flatSrc = operands[0].strip()
+            let rhsParts = rhs.splitWhitespace()
+            let target = rhsParts[0]
+            let sb = findNamedParam(rhsParts, "srcBase", "")
+            let sds = findNamedParam(rhsParts, "srcDimSize", "")
+            let sdo = findNamedParam(rhsParts, "srcDimOffset", "")
+            let numT = findNamedParam(rhsParts, "numTensors", "0")
+            let totalDim = findNamedParam(rhsParts, "totalDim", "0")
+            let inner = findNamedParam(rhsParts, "inner", "0")
+            if sb.len > 0 and sds.len > 0 and sdo.len > 0:
+              result.add("var " & target & " = gpuConcat(gpuBackendSelected, " & flatSrc & ", " & sb & ".mapIt(int32(it)), " & sds & ".mapIt(int32(it)), " & sdo & ".mapIt(int32(it)), " & numT & ", " & totalDim & ", " & inner & ")")
+            else:
+              traceWarn("Invalid concat syntax: " & line)
+              result.add("# [WARN] cú pháp 'gpu concat' cần: gpu concat FLATSRC -> Y srcBase SB srcDimSize SDS srcDimOffset SDO numTensors NT totalDim TD inner IN : " & line)
+          else:
+            traceWarn("concat needs 1 operand: " & line)
+            result.add("# [WARN] cú pháp 'gpu concat' cần 1 toán hạng: " & line)
+
+        elif opName == "argmax_index":
+          # THEM MOI: gpu argmax_index X -> VAL, IDX outer O dimSize D inner I
+          if operands.len >= 1:
             let x = operands[0].strip()
-            let dy = operands[1].strip()
+            let rhsMain = rhs.split("outer")[0]
+            let rhsTargets = rhsMain.splitWhitespace().mapIt(it.replace(",", "").strip())
             let rhsParts = rhs.splitWhitespace()
-            if rhsParts.len >= 5 and rhsParts[1] == "alpha" and rhsParts[3] == "beta":
-              let target = rhsParts[0]
-              let alpha = rhsParts[2]
-              let beta = rhsParts[4]
-              result.add("var " & target & " = gpuApfluBackward(gpuBackendSelected, " & x & ", " & dy & ", " & alpha & ", " & beta & ")")
-            elif rhsParts.len >= 1:
-              result.add("var " & rhsParts[0] & " = gpuApfluBackward(gpuBackendSelected, " & x & ", " & dy & ", 0.1'f32, 1.0'f32)")
+            if rhsTargets.len >= 2:
+              let targetVal = rhsTargets[0]
+              let targetIdx = rhsTargets[1]
+              let outer = findNamedParam(rhsParts, "outer", "0")
+              let dimSize = findNamedParam(rhsParts, "dimSize", "0")
+              let inner = findNamedParam(rhsParts, "inner", "0")
+              result.add("let amRes = gpuArgmaxIndex(gpuBackendSelected, " & x & ", " & outer & ", " & dimSize & ", " & inner & ")")
+              result.add("var " & targetVal & " = amRes.val")
+              result.add("var " & targetIdx & " = amRes.idx")
             else:
-              traceWarn("Invalid apflu_backward syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu apflu_backward' cần: gpu apflu_backward X, DY -> DX [alpha A beta B] : " & line)
+              traceWarn("Invalid argmax_index syntax: " & line)
+              result.add("# [WARN] cú pháp 'gpu argmax_index' cần: gpu argmax_index X -> VAL, IDX outer O dimSize D inner I : " & line)
           else:
-            traceWarn("apflu_backward needs 2 operands: " & line)
-            result.add("# [WARN] cú pháp 'gpu apflu_backward' cần 2 toán hạng X, DY: " & line)
+            traceWarn("argmax_index needs 1 operand: " & line)
+            result.add("# [WARN] cú pháp 'gpu argmax_index' cần 1 toán hạng: " & line)
 
-        elif opName == "fused_add_act":
-          # gpu fused_add_act A, B -> C act "relu"   ("relu" | "sigmoid" | "tanh" | "none")
-          if operands.len >= 2:
-            let a = operands[0].strip()
-            let b = operands[1].strip()
-            let rhsParts = rhs.splitWhitespace()
-            if rhsParts.len >= 3 and rhsParts[1] == "act":
-              let target = rhsParts[0]
-              let act = stripQuotes(rhsParts[2])
-              result.add("var " & target & " = gpuFusedAddAct(gpuBackendSelected, " & a & ", " & b & ", \"" & act & "\")")
-            else:
-              traceWarn("Invalid fused_add_act syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu fused_add_act' cần: gpu fused_add_act A, B -> C act \"relu\" : " & line)
-          else:
-            traceWarn("fused_add_act needs 2 operands: " & line)
-            result.add("# [WARN] cú pháp 'gpu fused_add_act' cần 2 toán hạng A, B: " & line)
-
-        elif opName == "matmul2":
-          # gpu matmul2 A1, B1, A2, B2 -> C1, C2 m1 M k1 K n1 N m2 M k2 K n2 N
-          if operands.len >= 4:
-            let a1 = operands[0].strip()
-            let b1 = operands[1].strip()
-            let a2 = operands[2].strip()
-            let b2 = operands[3].strip()
-            let rhsParts = rhs.splitWhitespace()
-            if rhsParts.len >= 14:
-              let targetC1 = rhsParts[0].replace(",", "").strip()
-              let targetC2 = rhsParts[1].strip()
-              var m1 = "0"; var k1 = "0"; var n1 = "0"
-              var m2 = "0"; var k2 = "0"; var n2 = "0"
-              for i in 0..<rhsParts.len:
-                if rhsParts[i] == "m1" and i+1 < rhsParts.len:
-                  m1 = rhsParts[i+1]
-                elif rhsParts[i] == "k1" and i+1 < rhsParts.len:
-                  k1 = rhsParts[i+1]
-                elif rhsParts[i] == "n1" and i+1 < rhsParts.len:
-                  n1 = rhsParts[i+1]
-                elif rhsParts[i] == "m2" and i+1 < rhsParts.len:
-                  m2 = rhsParts[i+1]
-                elif rhsParts[i] == "k2" and i+1 < rhsParts.len:
-                  k2 = rhsParts[i+1]
-                elif rhsParts[i] == "n2" and i+1 < rhsParts.len:
-                  n2 = rhsParts[i+1]
-              if m1 != "0" and k1 != "0" and n1 != "0" and m2 != "0" and k2 != "0" and n2 != "0":
-                result.add("let mm2Res = gpuMatmul2(gpuBackendSelected, " & a1 & ", " & b1 & ", " & m1 & ", " & k1 & ", " & n1 & ", " & a2 & ", " & b2 & ", " & m2 & ", " & k2 & ", " & n2 & ")")
-                result.add("var " & targetC1 & " = mm2Res.c1")
-                result.add("var " & targetC2 & " = mm2Res.c2")
-              else:
-                traceWarn("Invalid matmul2 syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu matmul2' cần: gpu matmul2 A1, B1, A2, B2 -> C1, C2 m1 M k1 K n1 N m2 M k2 K n2 N : " & line)
-            else:
-              traceWarn("Invalid matmul2 syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu matmul2' cần: gpu matmul2 A1, B1, A2, B2 -> C1, C2 m1 M k1 K n1 N m2 M k2 K n2 N : " & line)
-          else:
-            traceWarn("matmul2 needs 4 operands: " & line)
-            result.add("# [WARN] cú pháp 'gpu matmul2' cần 4 toán hạng A1, B1, A2, B2: " & line)
+        elif opName == "dropout_mask":
+          # THEM MOI: gpu dropout_mask -> Y n N p P seed S  (KHONG co operand
+          # dau vao - day la op SINH mask moi, khong bien doi tensor co san,
+          # nen "lhs" chi la ten op, khong co toan hang truoc "->")
+          let rhsParts = rhs.splitWhitespace()
+          let target = rhsParts[0]
+          let n = findNamedParam(rhsParts, "n", "0")
+          let p = findNamedParam(rhsParts, "p", "0.5")
+          let seed = findNamedParam(rhsParts, "seed", "42")
+          result.add("var " & target & " = gpuDropoutMask(gpuBackendSelected, " & n & ", " & p & "'f32, uint32(" & seed & "))")
 
         else:
           if operands.len >= 2:
@@ -516,6 +634,30 @@ proc genGpuLine(line: string): seq[string] =
               else:
                 traceWarn("Invalid embedding syntax: " & line)
                 result.add("# [WARN] cú pháp 'gpu embedding' cần: gpu embedding TABLE, INDICES -> Y vocab V dim D : " & line)
+            elif opName == "gather":
+              # THEM MOI: gpu gather SRC, IDX -> Y  (IDX la bien seq[int32]
+              # hoac seq[int] - .mapIt(int32(it)) an toan ca 2 truong hop)
+              let target = rhs.splitWhitespace()[0]
+              result.add("var " & target & " = gpuGather(gpuBackendSelected, " & a & ", " & b & ".mapIt(int32(it)))")
+            elif opName == "compare":
+              # THEM MOI: gpu compare A, B -> Y op 0   (op: 0=gt 1=lt 2=eq 3=ge 4=le)
+              let rhsParts = rhs.splitWhitespace()
+              let target = rhsParts[0]
+              let cmpOp = findNamedParam(rhsParts, "op", "2")
+              result.add("var " & target & " = gpuCompare(gpuBackendSelected, " & a & ", " & b & ", " & cmpOp & ")")
+            elif opName == "fused_add_act":
+              # THEM MOI: gpu fused_add_act A, B -> Y act "relu"
+              let rhsParts = rhs.splitWhitespace()
+              let target = rhsParts[0]
+              let act = stripQuotes(findNamedParam(rhsParts, "act", "\"relu\""))
+              result.add("var " & target & " = gpuFusedAddAct(gpuBackendSelected, " & a & ", " & b & ", \"" & act & "\")")
+            elif opName == "apflu_backward":
+              # THEM MOI: gpu apflu_backward X, DY -> Y alpha 0.1 beta 0.1
+              let rhsParts = rhs.splitWhitespace()
+              let target = rhsParts[0]
+              let alpha = findNamedParam(rhsParts, "alpha", "0.1")
+              let beta = findNamedParam(rhsParts, "beta", "0.1")
+              result.add("var " & target & " = gpuApfluBackward(gpuBackendSelected, " & a & ", " & b & ", " & alpha & "'f32, " & beta & "'f32)")
             else:
               var target = rhs
               if "size" in rhs:
@@ -530,6 +672,19 @@ proc genGpuLine(line: string): seq[string] =
                        elif opName == "sigmoid": "gpuSigmoid"
                        else: "gpuTanh"
               result.add("var " & target & " = " & fn & "(gpuBackendSelected, " & x & ")")
+            of "sqrt", "exp", "log":
+              # THEM MOI: gpu sqrt X -> Y / gpu exp X -> Y / gpu log X -> Y
+              let target = rhs.splitWhitespace()[0]
+              let fn = if opName == "sqrt": "gpuSqrt"
+                       elif opName == "exp": "gpuExp"
+                       else: "gpuLog"
+              result.add("var " & target & " = " & fn & "(gpuBackendSelected, " & x & ")")
+            of "pow":
+              # THEM MOI: gpu pow X -> Y p 2.0
+              let rhsParts = rhs.splitWhitespace()
+              let target = rhsParts[0]
+              let p = findNamedParam(rhsParts, "p", "2.0")
+              result.add("var " & target & " = gpuPow(gpuBackendSelected, " & x & ", " & p & "'f32)")
             of "softmax":
               let rhsParts = rhs.splitWhitespace()
               if rhsParts.len >= 5 and rhsParts[1] == "rows" and rhsParts[3] == "cols":
@@ -571,6 +726,535 @@ proc genHeaderedBlock(tokens: seq[Token], idx: var int, indent: string, headerLi
     result.add(genBlock(tokens, idx, indent & "  ", funcNames, localVars))
   else:
     result.add(indent & "  discard")
+# --------------------------
+# Sinh code cho block "session:" - dùng Session API (sessionBegin/
+# sessionUpload/session<Op>/sessionEnd/sessionRead/sessionFree) của
+# gpubackend.nim để gộp nhiều lệnh "gpu ..." vào 1 session GPU.
+# --------------------------
+proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
+                      blockIndent: int, localVars: var seq[string]): seq[string] =
+  result = @[]
+  idx.inc  # bỏ qua dòng "session:"
+
+  var bodyLines: seq[string] = @[]
+  if idx < tokens.len and tokens[idx].indent > blockIndent:
+    let sessionIndent = tokens[idx].indent
+    while idx < tokens.len and tokens[idx].indent >= sessionIndent:
+      let t = tokens[idx]
+      if t.sym notin ["empty", "comment"]:
+        bodyLines.add(t.text.strip())
+      idx.inc
+  else:
+    traceWarn("Khối 'session:' rỗng")
+    result.add(indent & "discard")
+    return
+
+  traceInfo("Session block voi " & $bodyLines.len & " dong")
+
+  var uploaded = initTable[string, string]()      # tên biến (đã có trên CPU) -> tên handle
+  var produced = initTable[string, string]()      # tên biến (mới sinh TRONG session, chưa về CPU) -> tên handle
+  var producedSize = initTable[string, string]()  # tên biến (produced) -> biểu thức kích thước (vì chưa có .len)
+  var handleDecls: seq[string] = @[]
+  var opLines: seq[string] = @[]
+  var resultHandles: seq[tuple[varName: string, handleVar: string, size: string]] = @[]
+  var extraFreeHandles: seq[string] = @[]           # handle trung gian (vd. buffer add trước activation trong fused_add_act) - không nằm trong resultHandles nên phải free riêng
+  var passthrough: seq[string] = @[]               # dòng chạy bình thường, không qua session
+  var sessionSourceLines: seq[string] = @[]         # các dòng "gpu ..." tối ưu được trong session (để fallback)
+
+  var hcount = 0
+  proc newHandle(): string =
+    hcount.inc
+    return "sh" & $hcount
+
+  # Nếu varName vừa được 1 lệnh trước đó TRONG CÙNG session tạo ra (còn nằm
+  # trên GPU, chưa sessionRead về CPU), dùng lại handle GPU đó luôn - không
+  # upload lại từ biến Nim (biến đó còn chưa tồn tại ở thời điểm này).
+  # Ngược lại, upload biến CPU hiện có (chỉ upload 1 lần, cache lại).
+  proc ensureUploaded(varName: string): string =
+    if varName in produced:
+      return produced[varName]
+    if varName in uploaded:
+      return uploaded[varName]
+    let h = newHandle()
+    handleDecls.add("    var " & h & " = sessionUpload(gpuBackendSelected, " & varName & ")")
+    uploaded[varName] = h
+    return h
+
+  # Kích thước (số phần tử) của varName. Nếu varName vừa được sinh TRONG
+  # session (chưa có dạng seq[float32] thật trên CPU) thì dùng lại biểu thức
+  # kích thước đã biết từ lúc sinh ra nó, thay vì "varName.len" (biến chưa
+  # tồn tại ở bước này).
+  proc sizeOf(varName: string): string =
+    if varName in producedSize:
+      return producedSize[varName]
+    return varName & ".len"
+
+  for line in bodyLines:
+    if line.len == 0: continue
+    if not line.startsWith("gpu "):
+      passthrough.add(line)
+      continue
+
+    let rest = line[3..^1].strip()
+    let arrowParts = rest.split("->")
+    if arrowParts.len != 2:
+      passthrough.add(line)   # ví dụ "gpu backend is ..." / "gpu array ..."
+      continue
+
+    let lhs = arrowParts[0].strip()
+    let rhs = arrowParts[1].strip()
+    let lhsWords = lhs.split()
+    if lhsWords.len < 1:
+      passthrough.add(line)
+      continue
+
+    let opName = lhsWords[0].toLowerAscii()
+    let operandsStr = lhs[opName.len..^1].strip()
+    let operands = operandsStr.split(",").mapIt(it.strip())
+
+    case opName
+    of "add", "sub", "mul", "div":
+      if operands.len >= 2:
+        var target = rhs
+        var sizeExpr = sizeOf(operands[0])
+        if "size" in rhs:
+          let parts2 = rhs.split("size")
+          target = parts2[0].strip()
+          sizeExpr = parts2[1].strip()
+        let ha = ensureUploaded(operands[0])
+        let hb = ensureUploaded(operands[1])
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionVecOp(gpuBackendSelected, \"" & opName & "\", " &
+                    ha & ", " & hb & ", " & hc & ", " & sizeExpr & ")")
+        resultHandles.add((target, hc, sizeExpr))
+        produced[target] = hc
+        producedSize[target] = sizeExpr
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "relu", "sigmoid", "tanh":
+      if operands.len >= 1 and rhs.splitWhitespace().len >= 1:
+        let x = operands[0]
+        let target = rhs.splitWhitespace()[0]
+        let ha = ensureUploaded(x)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let xsize = sizeOf(x)
+        opLines.add("    discard sessionActivation(gpuBackendSelected, \"" & opName & "\", " &
+                    ha & ", " & hc & ", " & xsize & ")")
+        resultHandles.add((target, hc, xsize))
+        produced[target] = hc
+        producedSize[target] = xsize
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "softmax":
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 1 and rhsParts.len >= 5 and rhsParts[1] == "rows" and rhsParts[3] == "cols":
+        let x = operands[0]
+        let target = rhsParts[0]
+        let rows = rhsParts[2]; let cols = rhsParts[4]
+        let ha = ensureUploaded(x)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionSoftmax(gpuBackendSelected, " & ha & ", " & hc &
+                    ", " & rows & ", " & cols & ")")
+        resultHandles.add((target, hc, rows & " * " & cols))
+        produced[target] = hc
+        producedSize[target] = rows & " * " & cols
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "matmul":
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 2 and rhsParts.len >= 7 and rhsParts[1] == "m" and
+         rhsParts[3] == "k" and rhsParts[5] == "n":
+        let ha = ensureUploaded(operands[0])
+        let hb = ensureUploaded(operands[1])
+        let target = rhsParts[0]
+        let m = rhsParts[2]; let k = rhsParts[4]; let n = rhsParts[6]
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionMatmul(gpuBackendSelected, " & ha & ", " & hb &
+                    ", " & hc & ", " & m & ", " & k & ", " & n & ")")
+        resultHandles.add((target, hc, m & " * " & n))
+        produced[target] = hc
+        producedSize[target] = m & " * " & n
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "layernorm":
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 3 and rhsParts.len >= 5 and rhsParts[1] == "rows" and rhsParts[3] == "cols":
+        let hx = ensureUploaded(operands[0])
+        let hg = ensureUploaded(operands[1])
+        let hb = ensureUploaded(operands[2])
+        let target = rhsParts[0]
+        let rows = rhsParts[2]; let cols = rhsParts[4]
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionLayernormEnc(gpuBackendSelected, " & hx & ", " & hg &
+                    ", " & hb & ", " & hc & ", " & rows & ", " & cols & ")")
+        resultHandles.add((target, hc, rows & " * " & cols))
+        produced[target] = hc
+        producedSize[target] = rows & " * " & cols
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "rope":
+      # gpu rope X, COS, SIN -> Y seqlen T heads H dim D
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 3 and rhsParts.len >= 7 and rhsParts[1] == "seqlen" and
+         rhsParts[3] == "heads" and rhsParts[5] == "dim":
+        let hx = ensureUploaded(operands[0])
+        let hcos = ensureUploaded(operands[1])
+        let hsin = ensureUploaded(operands[2])
+        let target = rhsParts[0]
+        let seqlen = rhsParts[2]; let heads = rhsParts[4]; let dim = rhsParts[6]
+        opLines.add("    discard sessionRope(gpuBackendSelected, " & hx & ", " & hcos &
+                    ", " & hsin & ", " & seqlen & ", " & heads & ", " & dim & ")")
+        # sessionRope xoay in-place trên handle X -> đọc lại chính hx làm kết quả
+        resultHandles.add((target, hx, operands[0] & ".len"))
+        produced[target] = hx
+        producedSize[target] = sizeOf(operands[0])
+        sessionSourceLines.add(line)
+      else:
+        traceWarn("Cú pháp 'gpu rope' cần: gpu rope X, COS, SIN -> Y seqlen T heads H dim D")
+        passthrough.add(line)
+
+    of "fused_add_act":
+      # gpu fused_add_act A, B -> Y act "relu"
+      # Ghép TRỰC TIẾP vào session bao ngoài bằng sessionVecOp("add") +
+      # sessionActivation(act) - CÙNG 2 kernel thật mà gpuFusedAddAct()
+      # (gpubackend.nim) dùng, nhưng ở đây gộp chung sessionBegin/End với
+      # các lệnh "gpu ..." khác trong cùng khối "session:" thay vì mở
+      # 1 session con riêng (gpuFusedAddAct gọi rời sẽ tự sessionBegin/End
+      # của chính nó - vẫn đúng, chỉ không được gộp chung).
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 2 and rhsParts.len >= 1:
+        let target = rhsParts[0]
+        let act = stripQuotes(findNamedParam(rhsParts, "act", "\"relu\""))
+        let ha = ensureUploaded(operands[0])
+        let hb = ensureUploaded(operands[1])
+        let hc = newHandle()
+        let sizeExpr = sizeOf(operands[0])
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionVecOp(gpuBackendSelected, \"add\", " &
+                    ha & ", " & hb & ", " & hc & ", " & sizeExpr & ")")
+        if act == "none":
+          resultHandles.add((target, hc, sizeExpr))
+          produced[target] = hc
+        else:
+          let hy = newHandle()
+          handleDecls.add("    var " & hy & ": SessionHandle")
+          opLines.add("    discard sessionActivation(gpuBackendSelected, \"" & act & "\", " &
+                      hc & ", " & hy & ", " & sizeExpr & ")")
+          resultHandles.add((target, hy, sizeExpr))
+          produced[target] = hy
+          extraFreeHandles.add(hc)
+        producedSize[target] = sizeExpr
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "sqrt", "exp", "log":
+      if operands.len >= 1 and rhs.splitWhitespace().len >= 1:
+        let x = operands[0]
+        let target = rhs.splitWhitespace()[0]
+        let ha = ensureUploaded(x)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let xsize = sizeOf(x)
+        opLines.add("    discard sessionActivation(gpuBackendSelected, \"" & opName & "\", " &
+                    ha & ", " & hc & ", " & xsize & ")")
+        resultHandles.add((target, hc, xsize))
+        produced[target] = hc
+        producedSize[target] = xsize
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "pow":
+      # gpu pow A -> Y p 2.0 - opCode 7, cần truyền thêm p qua sessionActivation.
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 1 and rhsParts.len >= 1:
+        let x = operands[0]
+        let target = rhsParts[0]
+        let p = findNamedParam(rhsParts, "p", "2.0")
+        let ha = ensureUploaded(x)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let xsize = sizeOf(x)
+        opLines.add("    discard sessionActivation(gpuBackendSelected, \"pow\", " &
+                    ha & ", " & hc & ", " & xsize & ", " & p & "'f32)")
+        resultHandles.add((target, hc, xsize))
+        produced[target] = hc
+        producedSize[target] = xsize
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "apflu":
+      # gpu apflu A -> Y alpha 0.1 beta 1.0 - Metal CHỈ hỗ trợ đúng
+      # alpha=0.1/beta=1.0 trong session (xem sessionApfluEnc); nếu backend
+      # là Metal và alpha/beta khác giá trị đó, sessionApfluEnc tự trả false
+      # -> dòng này rơi ra immediate như bình thường (gpuApflu vẫn đúng mọi
+      # alpha/beta vì đó là hàm CPU/kernel tổng quát hơn).
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 1 and rhsParts.len >= 1:
+        let x = operands[0]
+        let target = rhsParts[0]
+        let alpha = findNamedParam(rhsParts, "alpha", "0.1")
+        let beta = findNamedParam(rhsParts, "beta", "1.0")
+        let ha = ensureUploaded(x)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let xsize = sizeOf(x)
+        opLines.add("    discard sessionApfluEnc(gpuBackendSelected, " & ha & ", " & hc &
+                    ", " & xsize & ", " & alpha & "'f32, " & beta & "'f32)")
+        resultHandles.add((target, hc, xsize))
+        produced[target] = hc
+        producedSize[target] = xsize
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "apflu_backward":
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 2 and rhsParts.len >= 1:
+        let x = operands[0]; let dy = operands[1]
+        let target = rhsParts[0]
+        let alpha = findNamedParam(rhsParts, "alpha", "0.1")
+        let beta = findNamedParam(rhsParts, "beta", "0.1")
+        let hx = ensureUploaded(x)
+        let hdy = ensureUploaded(dy)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let xsize = sizeOf(x)
+        opLines.add("    discard sessionApfluBackwardEnc(gpuBackendSelected, " & hx & ", " & hdy &
+                    ", " & hc & ", " & xsize & ", " & alpha & "'f32, " & beta & "'f32)")
+        resultHandles.add((target, hc, xsize))
+        produced[target] = hc
+        producedSize[target] = xsize
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "gather":
+      # IDX phải là mảng int (seq[int]/seq[int32]) upload qua
+      # sessionUploadIndices - KHÔNG dùng ensureUploaded (chỉ dành cho
+      # seq[float32]). Không cache lại (idx thường nhỏ, ít khi tái dùng).
+      if operands.len >= 2 and rhs.splitWhitespace().len >= 1:
+        let src = operands[0]; let idx = operands[1]
+        let target = rhs.splitWhitespace()[0]
+        let hsrc = ensureUploaded(src)
+        let hidx = newHandle()
+        handleDecls.add("    var " & hidx & " = sessionUploadIndices(gpuBackendSelected, " &
+                    idx & ".mapIt(int32(it)))")
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let idxSize = idx & ".len"
+        opLines.add("    discard sessionGatherEnc(gpuBackendSelected, " & hsrc & ", " & hidx &
+                    ", " & hc & ", " & idxSize & ")")
+        resultHandles.add((target, hc, idxSize))
+        produced[target] = hc
+        producedSize[target] = idxSize
+        extraFreeHandles.add(hidx)
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "compare":
+      let rhsParts = rhs.splitWhitespace()
+      if operands.len >= 2 and rhsParts.len >= 1:
+        let a = operands[0]; let b = operands[1]
+        let target = rhsParts[0]
+        let cmpOp = findNamedParam(rhsParts, "op", "2")
+        let ha = ensureUploaded(a)
+        let hb = ensureUploaded(b)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        let sizeExpr = sizeOf(a)
+        opLines.add("    discard sessionCompareEnc(gpuBackendSelected, " & ha & ", " & hb &
+                    ", " & hc & ", " & cmpOp & ", " & sizeExpr & ")")
+        resultHandles.add((target, hc, sizeExpr))
+        produced[target] = hc
+        producedSize[target] = sizeExpr
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "dropout_mask":
+      # KHÔNG có operand đầu vào (op sinh mask mới) - "rhs" chứa cả target
+      # lẫn tham số n/p/seed.
+      let rhsParts = rhs.splitWhitespace()
+      if rhsParts.len >= 1:
+        let target = rhsParts[0]
+        let n = findNamedParam(rhsParts, "n", "0")
+        let p = findNamedParam(rhsParts, "p", "0.5")
+        let seed = findNamedParam(rhsParts, "seed", "42")
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionDropoutMaskEnc(gpuBackendSelected, " & hc & ", " &
+                    n & ", " & p & "'f32, uint32(" & seed & "))")
+        resultHandles.add((target, hc, n))
+        produced[target] = hc
+        producedSize[target] = n
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    of "split_slice":
+      if operands.len >= 1 and rhs.splitWhitespace().len >= 1:
+        let src = operands[0]
+        let rhsParts = rhs.splitWhitespace()
+        let target = rhsParts[0]
+        let dimTotal = findNamedParam(rhsParts, "dimTotal", "0")
+        let thisSize = findNamedParam(rhsParts, "thisSize", "0")
+        let offset = findNamedParam(rhsParts, "offset", "0")
+        let inner = findNamedParam(rhsParts, "inner", "0")
+        let n = findNamedParam(rhsParts, "n", "0")
+        let hsrc = ensureUploaded(src)
+        let hc = newHandle()
+        handleDecls.add("    var " & hc & ": SessionHandle")
+        opLines.add("    discard sessionSplitSliceEnc(gpuBackendSelected, " & hsrc & ", " & hc &
+                    ", " & dimTotal & ", " & thisSize & ", " & offset & ", " & inner & ", " & n & ")")
+        resultHandles.add((target, hc, n))
+        produced[target] = hc
+        producedSize[target] = n
+        sessionSourceLines.add(line)
+      else:
+        passthrough.add(line)
+
+    else:
+      traceWarn("GPU op '" & opName & "' chưa có bản session - dùng immediate")
+      passthrough.add(line)
+
+  # --- Sinh khối Nim: thử session, fallback immediate nếu không mở được ---
+  # Các biến kết quả PHẢI khai báo "var" ở NGOÀI block (vì "block:" trong Nim
+  # tạo scope riêng - khai báo bên trong sẽ mất hiệu lực ngay khi ra khỏi
+  # block), rồi bên trong chỉ gán giá trị (không "var" nữa).
+  for rh in resultHandles:
+    if rh.varName notin localVars:
+      result.add(indent & "var " & rh.varName & ": seq[float32] = @[]")
+      localVars.add(rh.varName)
+
+  result.add(indent & "block:")
+  if opLines.len > 0:
+    result.add(indent & "  var sessOk = sessionBegin(gpuBackendSelected)")
+    result.add(indent & "  if sessOk:")
+    for d in handleDecls: result.add(indent & d)
+    for o in opLines: result.add(indent & o)
+    result.add(indent & "    discard sessionEnd(gpuBackendSelected)")
+    for rh in resultHandles:
+      result.add(indent & "    " & rh.varName & " = sessionRead(gpuBackendSelected, " &
+                 rh.handleVar & ", " & rh.size & ")")
+    var freed: seq[string] = @[]
+    for rh in resultHandles:
+      if rh.handleVar notin freed:
+        result.add(indent & "    sessionFree(gpuBackendSelected, " & rh.handleVar & ")")
+        freed.add(rh.handleVar)
+    for h in extraFreeHandles:
+      if h notin freed:
+        result.add(indent & "    sessionFree(gpuBackendSelected, " & h & ")")
+        freed.add(h)
+    for _, h in uploaded:
+      if h notin freed:
+        result.add(indent & "    sessionFree(gpuBackendSelected, " & h & ")")
+        freed.add(h)
+    result.add(indent & "  else:")
+    result.add(indent & "    echo \"[WARN] session không khởi tạo được, fallback sang immediate\"")
+    # sessionSourceLines và resultHandles được thêm song song (1-1, cùng thứ
+    # tự) ở vòng lặp phía trên nên ghép cặp trực tiếp theo chỉ số được.
+    for i in 0..<sessionSourceLines.len:
+      let l = sessionSourceLines[i]
+      let rh = resultHandles[i]
+      if l.startsWith("gpu rope"):
+        # rope KHÔNG có bản immediate (gpubackend.nim chỉ có sessionRope) -
+        # không thể chạy ngoài session được, nên fallback giữ nguyên input.
+        result.add(indent & "    echo \"[WARN] gpu rope: backend không hỗ trợ session, bỏ qua RoPE (giữ nguyên input)\"")
+        let firstOperand = l.split("gpu rope")[1].split("->")[0].split(",")[0].strip()
+        result.add(indent & "    " & rh.varName & " = " & firstOperand)
+      else:
+        for gl in genGpuLine(l):
+          var fixed = gl
+          let varDecl = "var " & rh.varName & " "
+          if fixed.startsWith(varDecl):
+            fixed = rh.varName & fixed[("var " & rh.varName).len..^1]
+          result.add(indent & "    " & fixed)
+  else:
+    result.add(indent & "  discard  # không có lệnh gpu nào tối ưu được bằng session trong block này")
+
+  # --- Các dòng khác (không phải gpu tối ưu-session được) chạy bình thường ---
+  for l in passthrough:
+    if l.startsWith("gpu "):
+      for gl in genGpuLine(l):
+        result.add(indent & "  " & gl)
+    else:
+      result.add(indent & "  " & l)
+
+proc genMicroKernelBlock(tokens: seq[Token], idx: var int, indent: string,
+    blockIndent: int, localVars: var seq[string]): seq[string] =
+  ## Native BybyLang syntax compiles directly to the micro-VM instruction API.
+  result = @[]
+  let header = tokens[idx].text.strip().strip(chars = {':'})
+  let parts = header.split("->", maxsplit = 1)
+  if parts.len != 2:
+    raise newException(ValueError,
+      "micro kernel syntax: micro kernel NAME INPUT -> OUTPUT threads N tg N out N:")
+  let left = parts[0].splitWhitespace()
+  let right = parts[1].splitWhitespace()
+  if left.len < 2 or right.len < 1:
+    raise newException(ValueError,
+      "micro kernel needs a name, input array, and output variable")
+  let kernelId = left[0]
+  let inputName = left[1]
+  let outputName = right[0]
+  let threads = findNamedParam(right, "threads", "0")
+  let tgSize = findNamedParam(right, "tg", "0")
+  let outputElems = findNamedParam(right, "out", "0")
+  if not kernelId[0].isAlphaAscii and kernelId[0] != '_':
+    raise newException(ValueError, "invalid micro kernel name: " & kernelId)
+  for c in kernelId:
+    if not c.isAlphaNumeric and c != '_':
+      raise newException(ValueError, "invalid micro kernel name: " & kernelId)
+
+  idx.inc
+  var body: seq[string] = @[]
+  if idx < tokens.len and tokens[idx].indent > blockIndent:
+    let bodyIndent = tokens[idx].indent
+    while idx < tokens.len and tokens[idx].indent >= bodyIndent:
+      let t = tokens[idx]
+      if t.sym notin ["empty", "comment"]:
+        body.add(t.text.strip())
+      idx.inc
+  if body.len == 0:
+    raise newException(ValueError, "micro kernel '" & kernelId & "' has an empty body")
+
+  if outputName notin localVars:
+    result.add(indent & "var " & outputName & ": seq[float32] = @[]")
+    localVars.add(outputName)
+  let programName = "microProgram_" & kernelId
+  result.add(indent & "block:")
+  result.add(indent & "  var " & programName & " = VmProgram()")
+  for instruction in body:
+    let words = instruction.splitWhitespace()
+    if words.len == 0 or not words[0].startsWith("emit"):
+      raise newException(ValueError,
+        "micro kernel body accepts VM emit instructions, got: " & instruction)
+    let operands = if words.len > 1: words[1..^1].join(", ") else: ""
+    let call = programName & "." & words[0] & "("
+    result.add(indent & "  " & call & operands & ")")
+  result.add(indent & "  " & outputName & " = executeMicroKernel(gpuBackendSelected, \"bybylang_" &
+    kernelId & "\", " & programName & ", " & inputName & ", " & outputElems &
+    ", " & threads & ", " & tgSize & ")")
+
 proc genBlock(tokens: seq[Token], idx: var int, indent: string,
               funcNames: seq[string], localVars: var seq[string]): seq[string] =
   result = @[]
@@ -595,10 +1279,21 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
     of "import":
       idx.inc
 
+    of "nimimport":
+      # DA duoc gom rieng va emit 1 lan o dau file trong generateNimCode -
+      # bo qua tai day de khong emit trung lap hoac emit sai vi tri (Nim
+      # KHONG cho phep "import" nam trong than proc, chi duoc o top-level
+      # module scope).
+      idx.inc
+
     of "print":
       traceDebug("Generating print: " & tk.text)
       result.add(indent & "echo " & tk.text.replace("print", "").strip())
       idx.inc
+
+    of "microkernel":
+      traceInfo("Generating native BybyLang micro kernel")
+      result.add(genMicroKernelBlock(tokens, idx, indent, blockIndent, localVars))
 
     of "function":
       let fBase = tk.indent
@@ -633,6 +1328,10 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
                                        parts[0].strip() & ".." & parts[1].strip())
         traceDebug("Generating for: " & forLine)
         result.add(genHeaderedBlock(tokens, idx, indent, forLine, blockIndent, funcNames, localVars))
+
+      elif line == "session:":
+        traceDebug("Generating session block")
+        result.add(genSessionBlock(tokens, idx, indent, blockIndent, localVars))
 
       elif line.startsWith("gpu "):
         for l in genGpuLine(line):
@@ -759,7 +1458,17 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
 
   var code = newSeq[string]()
   code.add("import strutils, sequtils")
-  code.add("import gpubackend")
+  code.add("import bybylang")
+  # THEM MOI: gom TAT CA "import nim \"X\"" tu toan bo tokens (ke ca tu file
+  # .bybylang duoc import long nhau qua resolveImports - cac token nimimport
+  # da duoc giu nguyen xuyen suot qua trinh resolve) - emit 1 LAN DUY NHAT
+  # o dau file, KHONG trung lap, TRUOC moi proc/top-level code (Nim yeu cau
+  # import o module scope, dat cang som cang an toan).
+  var nimImportsSeen = initTable[string, bool]()
+  for t in tokens:
+    if t.sym == "nimimport" and t.text.len > 0 and t.text notin nimImportsSeen:
+      nimImportsSeen[t.text] = true
+      code.add("import " & t.text)
   code.add("const RAM_SIZE = 1024")
   code.add("var RAM: array[0..RAM_SIZE-1, int]")
   code.add("var BUS: seq[string] = @[]")
@@ -840,10 +1549,18 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
   traceInfo("Generated " & $code.len & " lines of Nim code")
   echo "[INFO] Generated Nim code to ", nimFile
   
-  let cmd = "nim c -d:release --path:\"" & getAppDir() & "\" -o:\"" & outFile & "\" \"" & nimFile & "\""
+  let nimcacheDir = getEnv("BYBYLANG_NIMCACHE").strip()
+  let nimcacheArg = if nimcacheDir.len > 0:
+      " --nimcache:" & quoteShell(nimcacheDir)
+    else: ""
+  let cmd = "nim c -d:release --path:" & quoteShell(getAppDir()) & nimcacheArg &
+    " -o:" & quoteShell(outFile) & " " & quoteShell(nimFile)
   traceInfo("Compiling with: " & cmd)
-  let res = execProcess(cmd)
-  echo res
+  let res = execCmdEx(cmd)
+  echo res.output
+  if res.exitCode != 0:
+    raise newException(CatchableError,
+      "AOT compile failed with exit code " & $res.exitCode)
   echo "[INFO] Built executable: ", outFile
 
 # --------------------------
@@ -895,4 +1612,5 @@ proc main() =
 
   traceInfo("BybyLang finished")
 
-main()
+when isMainModule:
+  main()

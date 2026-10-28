@@ -1,0 +1,44 @@
+#version 450
+// matmul_gemv.comp - GEMV rieng cho m=1 (mirror matmul_gemv_kernel ben Metal).
+// SUA (BUG DA TIM RA): ban truoc dung subgroupAdd() + gia dinh subgroup
+// size = 32 (dung tren Apple GPU qua Metal simdgroup, NHUNG SAI tren
+// Intel Iris Plus qua Vulkan/MoltenVK - SIMD width goc cua Intel Gen9 la
+// 8 hoac 16, KHONG phai 32). Khi subgroup thuc te < 32, workgroup 32
+// thread bi chia thanh NHIEU subgroup rieng - moi subgroup co
+// gl_SubgroupInvocationID==0 RIENG -> NHIEU thread cung ghi de c[col]
+// (race condition) va moi subgroup chi cong duoc 1 phan K -> ket qua SAI
+// (day chinh la nguyen nhan token rac "!!!!" chi xay ra o Vulkan, khong
+// xay ra o Metal). Fix: KHONG dung subgroupAdd/gia dinh phan cung nua -
+// dung shared memory + tree reduction theo dung local_size_x (32) - luon
+// dung bat ke phan cung report subgroup size bao nhieu.
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer BufA { float a[]; };  // [K]
+layout(std430, binding = 1) readonly buffer BufB { float b[]; };  // [K,N]
+layout(std430, binding = 2) writeonly buffer BufC { float c[]; }; // [N]
+layout(push_constant) uniform PC { int M; int K; int N; } pc;
+
+shared float sdata[32];
+
+void main() {
+    int col = int(gl_WorkGroupID.x);
+    uint lid = gl_LocalInvocationID.x;   // 0..31, LUON duy nhat trong workgroup
+    float sum = 0.0;
+    if (col < pc.N) {
+        for (int i = int(lid); i < pc.K; i += 32) {
+            sum += a[i] * b[i * pc.N + col];
+        }
+    }
+    sdata[lid] = sum;
+    barrier();
+    // Tree reduction trong shared memory - dung voi MOI kich thuoc
+    // subgroup phan cung vi khong dua vao subgroupAdd nua.
+    for (uint stride = 16u; stride > 0u; stride >>= 1) {
+        if (lid < stride) {
+            sdata[lid] += sdata[lid + stride];
+        }
+        barrier();
+    }
+    if (lid == 0u && col < pc.N) {
+        c[col] = sdata[0];
+    }
+}

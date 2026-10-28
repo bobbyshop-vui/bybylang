@@ -1,0 +1,96 @@
+#version 450
+// attention_decode_gqa.comp - MIRROR CHINH XAC attention_decode_gqa_kernel.cu
+// (backends/cuda/kernels/attention_decode_gqa_kernel.cu, v2) sang GLSL. CUNG
+// 1 thuat toan 3 buoc (max -> exp/sum -> weighted-sum output) dung shared
+// memory + tree-reduction, KHONG tu sang tac thuat toan khac.
+//
+//   q: [H, D]      - H query head trong 1 nhom GQA
+//   k, v: [S, D]   - dung chung cho ca H head (1 cap KV-head GQA)
+//   o: [H, D]      - ket qua attention cho tung query head
+//   scores: [H, S] - buffer scratch
+//
+// Dispatch convention (PHAI khop vulkanSessionAttentionDecodeGqaEnc):
+//   groupCount = (H, 1, 1)   -- 1 workgroup / query head
+//   local_size_x = 128       -- khop ATTN_DECODE_TG ben CUDA/Metal/OpenCL
+//
+// CANH BAO (mirror nguyen van tu ban CUDA): kernel goc CHUA CHAY TREN PHAN
+// CUNG THAT luc viet - BAT BUOC verify bang BYBY_VERIFY_ATTN_DECODE=1 (xem
+// nim_inference.nim) truoc khi tin dung ket qua tren may that.
+
+#define ATTN_DECODE_TG 128
+
+layout(local_size_x = ATTN_DECODE_TG) in;
+
+layout(std430, binding = 0) readonly buffer BufQ      { float q[]; };       // [H,D]
+layout(std430, binding = 1) readonly buffer BufK      { float k[]; };       // [S,D]
+layout(std430, binding = 2) readonly buffer BufV      { float v[]; };       // [S,D]
+layout(std430, binding = 3) writeonly buffer BufO     { float o[]; };       // [H,D]
+layout(std430, binding = 4) buffer BufScores          { float scores[]; };  // [H,S] scratch
+
+layout(push_constant) uniform PC {
+    int H;
+    int S;
+    int D;
+    float scale;
+} pc;
+
+shared float sharedReduce[ATTN_DECODE_TG];
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int tid = int(gl_LocalInvocationID.x);
+    if (h >= pc.H) return;
+
+    int qBase = h * pc.D;
+    int sBase = h * pc.S;
+
+    // Buoc 1: dot(q_h, k_tj) cho cac tj do thread nay phu trach + max cuc bo
+    float localMax = -1e30;
+    for (int tj = tid; tj < pc.S; tj += ATTN_DECODE_TG) {
+        float dotv = 0.0;
+        int kBase = tj * pc.D;
+        for (int d = 0; d < pc.D; ++d) {
+            dotv += q[qBase + d] * k[kBase + d];
+        }
+        float sc = dotv * pc.scale;
+        scores[sBase + tj] = sc;
+        if (sc > localMax) localMax = sc;
+    }
+    sharedReduce[tid] = localMax;
+    barrier();
+    for (int stride = ATTN_DECODE_TG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sharedReduce[tid] = max(sharedReduce[tid], sharedReduce[tid + stride]);
+        }
+        barrier();
+    }
+    float mx = sharedReduce[0];
+    barrier();
+
+    // Buoc 2: exp(score-mx) + sum cuc bo, tree-reduction lay tong
+    float localSum = 0.0;
+    for (int tj = tid; tj < pc.S; tj += ATTN_DECODE_TG) {
+        float e = exp(scores[sBase + tj] - mx);
+        scores[sBase + tj] = e;
+        localSum += e;
+    }
+    sharedReduce[tid] = localSum;
+    barrier();
+    for (int stride = ATTN_DECODE_TG / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sharedReduce[tid] += sharedReduce[tid + stride];
+        }
+        barrier();
+    }
+    float invSum = 1.0 / sharedReduce[0];
+    barrier();
+
+    // Buoc 3: output - chia D cho cac thread, moi thread tu lap S.
+    for (int d = tid; d < pc.D; d += ATTN_DECODE_TG) {
+        float acc = 0.0;
+        for (int tj = 0; tj < pc.S; ++tj) {
+            acc += scores[sBase + tj] * v[tj * pc.D + d];
+        }
+        o[qBase + d] = acc * invSum;
+    }
+}

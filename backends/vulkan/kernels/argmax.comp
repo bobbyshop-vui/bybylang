@@ -1,0 +1,45 @@
+#version 450
+// GPU argmax (giá trị + chỉ số) theo chiều dimSize, layout [outer,dimSize,inner]
+// phẳng, ra [outer,inner]. Mỗi workgroup xử lý 1 cặp (o,i), local_size_x
+// phải >= dimSize (giống argmax_reduce trong argmax_kernel.cu, cùng thuật
+// toán tree-reduce bằng shared memory).
+layout(local_size_x = 1024) in;
+layout(std430, binding = 0) readonly buffer BufX     { float x[]; };
+layout(std430, binding = 1) writeonly buffer BufVal  { float outVal[]; };
+layout(std430, binding = 2) writeonly buffer BufIdx  { int outIdx[]; };
+layout(push_constant) uniform PC { int outer; int dimSize; int inner; } pc;
+
+shared float sVal[1024];
+shared int   sIdx[1024];
+
+void main() {
+    uint pair = gl_WorkGroupID.x;
+    if (pair >= uint(pc.outer * pc.inner)) return;
+    int o = int(pair) / pc.inner;
+    int i = int(pair) % pc.inner;
+
+    uint d = gl_LocalInvocationID.x;
+    if (int(d) < pc.dimSize) {
+        sVal[d] = x[(o * pc.dimSize + int(d)) * pc.inner + i];
+        sIdx[d] = int(d);
+    } else {
+        sVal[d] = -3.402823466e+38;
+        sIdx[d] = 0;
+    }
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (d < stride) {
+            if (sVal[d + stride] > sVal[d]) {
+                sVal[d] = sVal[d + stride];
+                sIdx[d] = sIdx[d + stride];
+            }
+        }
+        barrier();
+    }
+
+    if (d == 0u) {
+        outVal[pair] = sVal[0];
+        outIdx[pair] = sIdx[0];
+    }
+}

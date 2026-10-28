@@ -1,0 +1,22 @@
+#version 450
+// Mirror rope_kernel (vecop_matmul.metal) - in-place RoPE rotate-half.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer BufX { float x[]; };          // [T,Hn,D] in-place
+layout(std430, binding = 1) readonly buffer BufCos { float cosT[]; };  // [T, D/2]
+layout(std430, binding = 2) readonly buffer BufSin { float sinT[]; };  // [T, D/2]
+layout(push_constant) uniform PC { int Hn; int D; int T; } pc;
+
+void main() {
+    int half_ = pc.D / 2;
+    int i = int(gl_GlobalInvocationID.x);
+    int h = int(gl_GlobalInvocationID.y);
+    int t = int(gl_GlobalInvocationID.z);
+    if (i >= half_ || h >= pc.Hn || t >= pc.T) return;
+    int base = (t * pc.Hn + h) * pc.D;
+    float c = cosT[t * half_ + i];
+    float s = sinT[t * half_ + i];
+    float x1 = x[base + i];
+    float x2 = x[base + i + half_];
+    x[base + i]          = x1 * c - x2 * s;
+    x[base + i + half_]  = x2 * c + x1 * s;
+}
