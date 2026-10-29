@@ -537,9 +537,7 @@ proc ensureInit() =
   lib.vkCmdCopyBuffer = loadInstanceProc[typeof(lib.vkCmdCopyBuffer)]("vkCmdCopyBuffer")
   lib.vkResetCommandBuffer = loadInstanceProc[typeof(lib.vkResetCommandBuffer)]("vkResetCommandBuffer")
 
-  # ---- 3. Chọn physical device đầu tiên (giống Metal: "GPU đầu tiên tìm
-  # thấy" - Iris Plus 640 là GPU duy nhất trên máy Intel Mac này nên không
-  # cần logic chọn phức tạp) ----
+  # ---- 3. Prefer a discrete GPU; allow explicit device index selection. ----
   var devCount: uint32 = 0
   gpuCheck(lib.vkEnumeratePhysicalDevices(gInstance, addr devCount, nil) == VK_SUCCESS, "vkEnumeratePhysicalDevices (dem) that bai")
   gpuCheck(devCount > 0, "Khong tim thay physical device Vulkan nao")
@@ -630,7 +628,12 @@ proc ensureInit() =
   gpuCheck(lib.vkCreateCommandPool(gDevice, addr poolInfo, nil, addr gCommandPool) == VK_SUCCESS, "vkCreateCommandPool that bai")
 
   gInitialized = true
+  let weightMemory = if useDeviceLocalWeights(gDeviceCaps.properties.deviceType,
+      getEnv("BYBY_VULKAN_DEVICE_LOCAL", "auto")): "device-local/VRAM"
+    else: "host-visible/shared"
   stderr.writeLine "[vulkan] device=" & gDeviceCaps.deviceName &
+    " type=" & deviceClass(gDeviceCaps.properties.deviceType) &
+    " residentWeights=" & weightMemory &
     " subgroup=" & $gDeviceCaps.subgroupSize & " maxThreads=" & $gDeviceCaps.maxThreads &
     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
     " matrix=" & (if gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
@@ -1335,8 +1338,7 @@ proc vulkanSessionCopyInto*(src: VulkanBufferHandle, dst: var VulkanBufferHandle
 proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
   ensureInit()
   let localMode = getEnv("BYBY_VULKAN_DEVICE_LOCAL", "auto")
-  let deviceLocal = localMode == "1" or
-    (localMode == "auto" and gDeviceCaps.properties.deviceType == 2)
+  let deviceLocal = useDeviceLocalWeights(gDeviceCaps.properties.deviceType, localMode)
   let allocBytes = max(4'u64, (nBytes + 3) and not 3'u64)
   let flags = if deviceLocal: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
               else: VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
@@ -1363,11 +1365,11 @@ proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
     vulkanSessionFree(result)
     raise newException(CatchableError, "resident Vulkan upload failed: " & gVkLastError)
 
-proc vulkanSessionUploadPrivate*(data: seq[float32]): VulkanBufferHandle =
+proc vulkanSessionUploadPrivate*(data: openArray[float32]): VulkanBufferHandle =
   uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil),
     uint64(data.len * sizeof(float32)))
 
-proc vulkanSessionUploadBytesPrivate*(data: seq[uint8]): VulkanBufferHandle =
+proc vulkanSessionUploadBytesPrivate*(data: openArray[uint8]): VulkanBufferHandle =
   uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil), uint64(data.len))
 
 proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
@@ -2219,6 +2221,6 @@ proc vulkanKernelDispatch*(nThreads, tgSize: int; tgBytes = 0): bool =
   gVkTgBytes = 0
 
 # Alias used by fp4 / session upload path
-proc vulkanSessionUploadU8*(data: seq[uint8]): VulkanBufferHandle =
+proc vulkanSessionUploadU8*(data: openArray[uint8]): VulkanBufferHandle =
   ## Discrete GPUs retain weights in device-local VRAM after one staging copy.
   vulkanSessionUploadBytesPrivate(data)

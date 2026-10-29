@@ -2611,3 +2611,12 @@ int metal_jit_compile(const char* source, const char* kernelName) {
         return 1;
     }
 }
+
+int metal_device_max_tg_threads(void) {
+    if (!gDevice) return 0;
+    return (int)gDevice.maxThreadsPerThreadgroup.width;
+}
+int metal_device_max_tg_bytes(void) {
+    if (!gDevice) return 0;
+    return (int)gDevice.maxThreadgroupMemoryLength;
+}

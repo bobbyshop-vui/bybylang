@@ -61,7 +61,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
   var plans = @[VkQ4Plan(kind: q4Reference, name: "reference-tg128")]
   let geometries = if M == 1: @[(4, 1)] else: @[(1, 8), (2, 4)]
   for (rows, batch) in geometries:
-    for tg in [32, 64, 128]:
+    for tg in [32, 64, 128, 256, 512, 1024]:
       if tg > gDeviceCaps.maxThreads or rows * batch * tg * 4 > gDeviceCaps.maxSharedBytes: continue
       try:
         plans.add q4Compile(tg, rows, batch)

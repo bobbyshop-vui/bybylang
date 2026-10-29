@@ -370,6 +370,10 @@ int metal_enc_max_tg_threads(void);
 /* JIT: compile Metal source luc runtime (bytecode lower -> kernel moi). */
 int metal_jit_compile(const char* source, const char* kernelName);
 
+
+int metal_device_max_tg_threads(void);
+int metal_device_max_tg_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

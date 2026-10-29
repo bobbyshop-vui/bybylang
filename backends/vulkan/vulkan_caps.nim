@@ -237,3 +237,16 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
 
 proc deviceName*(caps: VulkanCaps): string =
   $cast[cstring](unsafeAddr caps.properties.deviceName[0])
+
+proc deviceClass*(deviceType: uint32): string =
+  case deviceType
+  of 1: "iGPU"
+  of 2: "dGPU"
+  of 3: "virtual-GPU"
+  of 4: "CPU"
+  else: "other"
+
+proc useDeviceLocalWeights*(deviceType: uint32; mode = "auto"): bool =
+  ## Private/device-local resident weights are permitted only on a dGPU.
+  ## An old DEVICE_LOCAL=1 setting must never force the iGPU/UMA path private.
+  deviceType == 2'u32 and mode in ["auto", "1"]

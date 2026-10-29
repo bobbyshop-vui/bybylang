@@ -586,19 +586,18 @@ when defined(macosx):
     ## transpose CPU truoc). Dung cho attention decode (K/V-cache).
     metal_matmul_nt_enc_c(a, b, c, cint(m), cint(k), cint(n)) != 0
 
-  proc metalUploadBytes*(data: seq[uint8]): MetalBufferHandle =
+  proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle =
     discard metalInit()
-    var d = data
-    metal_upload_bytes_c(addr d[0], cint(d.len))
+    if data.len == 0: return nil
+    metal_upload_bytes_c(unsafeAddr data[0], cint(data.len))
 
-  proc metalUploadPrivate*(data: seq[float32]): MetalBufferHandle =
+  proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle =
     ## Bản Private-storage của metalSessionUpload - CHỈ dùng cho resident
     ## weight fp32 (int8/int4-symmetric/tied-embedding qua beResidentUploadFp32)
     ## mà CPU không đọc/ghi lại sau lúc upload.
     discard metalInit()
     if data.len == 0: return nil
-    var d = data
-    metal_upload_private_c(addr d[0], cint(d.len))
+    metal_upload_private_c(unsafeAddr data[0], cint(data.len))
 
   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle =
     ## Bản Private-storage của metalUploadBytes - dùng cho wq (Q4 packed) resident.
@@ -748,8 +747,8 @@ when not defined(macosx):
   proc metalSessionMatmulEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool = false
   proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool = false
   proc metalInit*(): bool = false
-  proc metalUploadBytes*(data: seq[uint8]): MetalBufferHandle = nil
-  proc metalUploadPrivate*(data: seq[float32]): MetalBufferHandle = nil
+  proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle = nil
+  proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle = nil
   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle = nil
   proc metalSessionMatmulQ4Enc*(a, wq, scales, zeros, c: MetalBufferHandle,
                                  m, k, n, groupSize, nGroupsPerRow: int): bool = false
@@ -832,3 +831,7 @@ when not defined(macosx):
     raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
   proc metalAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
     raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+
+when defined(macosx):
+  proc metalDeviceMaxTgThreads*(): cint {.importc: "metal_device_max_tg_threads", header: "metal_shim.h".}
+  proc metalDeviceMaxTgBytes*(): cint {.importc: "metal_device_max_tg_bytes", header: "metal_shim.h".}

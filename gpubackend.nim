@@ -11,6 +11,7 @@
 # Nếu backend được chỉ định cụ thể mà không khả dụng, hoặc chạy lỗi, sẽ tự rơi (fallback)
 # về CPU để chương trình luôn cho ra kết quả đúng thay vì crash.
 import std/[strutils, math]
+import ./backends/cpu/cpu_backend as cpu
 import backends/metal/metal_backend
 import backends/vulkan/vulkan_driver
 
@@ -145,7 +146,7 @@ proc gpuSqrt*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   of gbCuda: return vulkanActivation("sqrt", x)
   of gbMetal: return metalActivation("sqrt", x)
   of gbVulkan: return vulkanActivation("sqrt", x)
-  of gbCpu, gbAuto: raise newException(ValueError, "gpuSqrt: CPU fallback bi cam - khong co GPU backend nao kha dung")
+  of gbCpu, gbAuto: return cpu.sqrt(x)
 
 proc gpuExp*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   ## CAM fallback CPU - xem gpuSqrt() o tren.
@@ -156,7 +157,7 @@ proc gpuExp*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   of gbCuda: return vulkanActivation("exp", x)
   of gbMetal: return metalActivation("exp", x)
   of gbVulkan: return vulkanActivation("exp", x)
-  of gbCpu, gbAuto: raise newException(ValueError, "gpuExp: CPU fallback bi cam - khong co GPU backend nao kha dung")
+  of gbCpu, gbAuto: return cpu.exp(x)
 
 proc gpuLog*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   ## CAM fallback CPU - xem gpuSqrt() o tren.
@@ -167,7 +168,7 @@ proc gpuLog*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   of gbCuda: return vulkanActivation("log", x)
   of gbMetal: return metalActivation("log", x)
   of gbVulkan: return vulkanActivation("log", x)
-  of gbCpu, gbAuto: raise newException(ValueError, "gpuLog: CPU fallback bi cam - khong co GPU backend nao kha dung")
+  of gbCpu, gbAuto: return cpu.log(x)
 
 proc gpuPow*(backend: GpuBackend, x: seq[float32], p: float32): seq[float32] =
   ## CAM fallback CPU - xem gpuSqrt() o tren.
@@ -178,7 +179,7 @@ proc gpuPow*(backend: GpuBackend, x: seq[float32], p: float32): seq[float32] =
   of gbCuda: return vulkanActivation("pow", x, p)
   of gbMetal: return metalActivation("pow", x, p)
   of gbVulkan: return vulkanActivation("pow", x, p)
-  of gbCpu, gbAuto: raise newException(ValueError, "gpuPow: CPU fallback bi cam - khong co GPU backend nao kha dung")
+  of gbCpu, gbAuto: return cpu.pow(x, p)
 
 proc cpuTanh(x: seq[float32]): seq[float32] =
   result = newSeq[float32](x.len)
@@ -458,7 +459,12 @@ proc gpuOp*(op: string, backend: GpuBackend, a, b: seq[float32]): seq[float32] =
     of gbVulkan:
       return vulkanVecOp(op, a, b)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuOp: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      case op
+      of "add": return cpu.add(a, b)
+      of "sub": return cpu.sub(a, b)
+      of "mul": return cpu.mul(a, b)
+      of "div": return cpu.divide(a, b)
+      else: return cpuVecOp(op, a, b)
   except CatchableError as e:
     handleGpuFailure(chosen, "vecop:" & op, e)
     return cpuVecOp(op, a, b)
@@ -473,7 +479,7 @@ proc gpuRelu*(backend: GpuBackend, x: seq[float32]): seq[float32] =
     of gbCuda: return vulkanActivation("relu", x)
     of gbMetal: return metalActivation("relu", x)
     of gbVulkan: return vulkanActivation("relu", x)
-    of gbCpu, gbAuto: raise newException(ValueError, "gpuRelu: CPU fallback bi cam - khong co GPU backend nao kha dung")
+    of gbCpu, gbAuto: return cpu.relu(x)
   except CatchableError as e:
     handleGpuFailure(chosen, "relu", e)
     return cpuRelu(x)
@@ -487,7 +493,7 @@ proc gpuSigmoid*(backend: GpuBackend, x: seq[float32]): seq[float32] =
     of gbCuda: return vulkanActivation("sigmoid", x)
     of gbMetal: return metalActivation("sigmoid", x)
     of gbVulkan: return vulkanActivation("sigmoid", x)
-    of gbCpu, gbAuto: raise newException(ValueError, "gpuSigmoid: CPU fallback bi cam - khong co GPU backend nao kha dung")
+    of gbCpu, gbAuto: return cpu.sigmoid(x)
   except CatchableError as e:
     handleGpuFailure(chosen, "sigmoid", e)
     return cpuSigmoid(x)
@@ -501,7 +507,7 @@ proc gpuTanh*(backend: GpuBackend, x: seq[float32]): seq[float32] =
     of gbCuda: return vulkanActivation("tanh", x)
     of gbMetal: return metalActivation("tanh", x)
     of gbVulkan: return vulkanActivation("tanh", x)
-    of gbCpu, gbAuto: raise newException(ValueError, "gpuTanh: CPU fallback bi cam - khong co GPU backend nao kha dung")
+    of gbCpu, gbAuto: return cpu.tanh(x)
   except CatchableError as e:
     handleGpuFailure(chosen, "tanh", e)
     return cpuTanh(x)
@@ -522,7 +528,7 @@ proc gpuApflu*(backend: GpuBackend, x: seq[float32], alpha: float32 = 0.1'f32, b
     of gbVulkan:
       return vulkanApflu(x, alpha, beta)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuApflu: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.apflu(x, alpha, beta)
   except CatchableError as e:
     handleGpuFailure(chosen, "apflu", e)
     return cpuApflu(x, alpha, beta)
@@ -543,7 +549,7 @@ proc gpuApfluBackward*(backend: GpuBackend, x, dy: seq[float32], alpha: float32 
     of gbVulkan:
       return vulkanApfluBackward(x, dy, alpha, beta)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuApfluBackward: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.apfluBackward(x, dy, alpha, beta)
   except CatchableError as e:
     handleGpuFailure(chosen, "apflu_backward", e)
     return cpuApfluBackward(x, dy, alpha, beta)
@@ -564,7 +570,7 @@ proc gpuLayernormBackward*(backend: GpuBackend, dy, x, gamma, beta: seq[float32]
     of gbVulkan:
       return vulkanLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuLayernormBackward: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.layernormBackward(dy, x, gamma, beta, rows, cols, eps)
   except CatchableError as e:
     handleGpuFailure(chosen, "layernorm_backward", e)
     return cpuLayernormBackward(dy, x, gamma, beta, rows, cols, eps)
@@ -585,7 +591,8 @@ proc gpuAttentionFused*(backend: GpuBackend, q, k, v, mask: seq[float32], B, H, 
     of gbVulkan:
       return vulkanAttentionFused(q, k, v, mask, B, H, S, D, scale)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuAttentionFused: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      let r = cpu.attention(q, k, v, mask, mask.len, B, H, S, D, scale)
+      return (r.o, r.sMatrix)
   except CatchableError as e:
     handleGpuFailure(chosen, "attention_fused", e)
     return cpuAttentionFused(q, k, v, mask, B, H, S, D, scale)
@@ -606,7 +613,7 @@ proc gpuAttentionFusedBackward*(backend: GpuBackend, q, k, v, s_matrix, dy: seq[
     of gbVulkan:
       return vulkanAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuAttentionFusedBackward: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpuAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
   except CatchableError as e:
     handleGpuFailure(chosen, "attention_fused_backward", e)
     return cpuAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
@@ -620,7 +627,7 @@ proc gpuSoftmax*(backend: GpuBackend, x: seq[float32], rows, cols: int): seq[flo
     of gbCuda: return vulkanSoftmax(x, rows, cols)
     of gbMetal: return metalSoftmax(x, rows, cols)
     of gbVulkan: return vulkanSoftmax(x, rows, cols)
-    of gbCpu, gbAuto: raise newException(ValueError, "gpuSoftmax: CPU fallback bi cam - khong co GPU backend nao kha dung")
+    of gbCpu, gbAuto: return cpu.softmax(x, rows, cols)
   except CatchableError as e:
     handleGpuFailure(chosen, "softmax", e)
     return cpuSoftmax(x, rows, cols)
@@ -634,7 +641,7 @@ proc gpuLayernorm*(backend: GpuBackend, x, gamma, beta: seq[float32], rows, cols
     of gbCuda: return vulkanLayernorm(x, gamma, beta, rows, cols, eps)
     of gbMetal: return metalLayernorm(x, gamma, beta, rows, cols, eps)
     of gbVulkan: return vulkanLayernorm(x, gamma, beta, rows, cols, eps)
-    of gbCpu, gbAuto: raise newException(ValueError, "gpuLayernorm: CPU fallback bi cam - khong co GPU backend nao kha dung")
+    of gbCpu, gbAuto: return cpu.layernorm(x, gamma, beta, rows, cols, eps)
   except CatchableError as e:
     handleGpuFailure(chosen, "layernorm", e)
     return cpuLayernorm(x, gamma, beta, rows, cols, eps)
@@ -648,7 +655,7 @@ proc gpuEmbeddingLookup*(backend: GpuBackend, table: seq[float32], indices: seq[
     of gbCuda: return vulkanEmbeddingLookup(table, indices, vocab, dim)
     of gbMetal: return metalEmbeddingLookup(table, indices, vocab, dim)
     of gbVulkan: return vulkanEmbeddingLookup(table, indices, vocab, dim)
-    of gbCpu, gbAuto: raise newException(ValueError, "gpuEmbeddingLookup: CPU fallback bi cam - khong co GPU backend nao kha dung")
+    of gbCpu, gbAuto: return cpu.embeddingLookup(table, indices, vocab, dim)
   except CatchableError as e:
     handleGpuFailure(chosen, "embedding_lookup", e)
     return cpuEmbeddingLookup(table, indices, vocab, dim)
@@ -714,7 +721,7 @@ proc gpuMatmul*(backend: GpuBackend, a, b: seq[float32], m, k, n: int): seq[floa
     of gbVulkan:
       return vulkanMatmul(a, b, m, k, n)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuMatmul: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.matmul(a, b, m, k, n)
   except CatchableError as e:
     handleGpuFailure(chosen, "matmul", e)
     try:
@@ -814,7 +821,7 @@ proc gpuMatmulQ4*(backend: GpuBackend, a: seq[float32], wq: seq[uint8], scales, 
         handleGpuFailure(chosen, "matmul_q4", e)
         return cpuDequantMatmulQ4Fallback(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
     of gbCpu, gbAuto:
-      raise newException(ValueError, "gpuMatmulQ4: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.matmulQ4(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
     else:
       raise newException(ValueError, "gpuMatmulQ4: backend " & $chosen & " chua ho tro matmul_q4")
   except CatchableError as e:
@@ -876,6 +883,23 @@ type
     metalHandle*: MetalBufferHandle  # Metal
     cudaHandle*: CudaResidentTensor  # CUDA
     vulkanHandle*: VulkanBufferHandle  # Vulkan
+    cpuData*: seq[float32]           # CPU host buffer
+    cpuIndices*: seq[int32]          # CPU integer buffer (embedding/gather)
+
+proc cpuTake(h: SessionHandle; n: int): seq[float32] =
+  result = newSeq[float32](max(n, 0))
+  let count = min(max(n, 0), h.cpuData.len)
+  for i in 0 ..< count: result[i] = h.cpuData[i]
+
+proc cpuTakeIndices(h: SessionHandle; n: int): seq[int32] =
+  let count = max(n, 0)
+  if h.cpuIndices.len >= count:
+    result = h.cpuIndices[0 ..< count]
+  else:
+    result = newSeq[int32](count)
+    let bytes = min(count * sizeof(int32), h.cpuData.len * sizeof(float32))
+    if bytes > 0:
+      copyMem(addr result[0], unsafeAddr h.cpuData[0], bytes)
 
 # ─────────────────────────────────────────────────────────────
 # SESSION API CHUNG - Giao diện thống nhất cho cả các backend
@@ -916,6 +940,8 @@ proc sessionBegin*(backend: GpuBackend): bool =
     return true
   of gbVulkan:
     return vulkanSessionBegin()
+  of gbCpu:
+    return true
   else:
     return false
 
@@ -929,6 +955,12 @@ proc sessionMicroVmEnc*(backend: GpuBackend, code, mem: SessionHandle,
   if chosen == gbVulkan:
     return vulkanSessionMicroVmEnc(code.vulkanHandle, mem.vulkanHandle,
       nThreads, tgFloats, tgSize)
+  if chosen == gbCpu:
+    var words = newSeq[uint32](code.cpuData.len)
+    if words.len > 0:
+      copyMem(addr words[0], unsafeAddr code.cpuData[0], words.len * sizeof(uint32))
+    var memv = mem.cpuData
+    return cpu.vmRun(words, memv, @[], nThreads, tgFloats, tgSize)
   false
 
 proc sessionJitMicroVmEnc*(backend: GpuBackend, kernelName, source: string,
@@ -959,6 +991,8 @@ proc sessionUpload*(backend: GpuBackend, data: seq[float32]): SessionHandle =
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     result.vulkanHandle = vulkanSessionUpload(data)
+  of gbCpu:
+    result.cpuData = data
   else:
     discard
 
@@ -979,10 +1013,12 @@ proc sessionUploadBorrowed*(backend: GpuBackend, data: var seq[float32]): Sessio
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     result.vulkanHandle = vulkanSessionUpload(data)
+  of gbCpu:
+    result.cpuData = data
   else:
     discard
 
-proc sessionUploadPrivate*(backend: GpuBackend, data: seq[float32]): SessionHandle =
+proc sessionUploadPrivate*(backend: GpuBackend, data: openArray[float32]): SessionHandle =
   ## Bản Private-storage của sessionUpload - CHỈ dùng cho weight RESIDENT
   ## (upload 1 LẦN lúc load model, CPU không đọc/ghi lại sau đó) - hiện dùng
   ## cho beResidentUploadFp32 (weight int8/int4-symmetric/tied-embedding qua
@@ -1008,6 +1044,8 @@ proc sessionUploadPrivate*(backend: GpuBackend, data: seq[float32]): SessionHand
     # One staging upload to device-local VRAM on discrete GPUs. UMA keeps
     # host-visible coherent memory; both paths return a real resident handle.
     result.vulkanHandle = vulkanSessionUploadPrivate(data)
+  of gbCpu:
+    result.cpuData = @data
   else:
     discard
 
@@ -1024,6 +1062,8 @@ proc sessionUploadIndices*(backend: GpuBackend, data: seq[int32]): SessionHandle
   if data.len > 0:
     copyMem(addr bits[0], unsafeAddr data[0], data.len * sizeof(int32))
   result = sessionUpload(chosen, bits)
+  if chosen == gbCpu:
+    result.cpuIndices = data
 
 proc cuAllocScratch*(n: int): CudaResidentTensor =
   ## CUDA removed — stub.
@@ -1047,6 +1087,8 @@ proc sessionAllocHeap*(backend: GpuBackend, totalElems: int): pointer =
       return metalAllocHeap(totalElems * sizeof(float32))
     else:
       return nil
+  of gbCpu:
+    return nil
   else:
     return nil
 
@@ -1069,6 +1111,9 @@ proc sessionAllocFromHeap*(backend: GpuBackend, heap: pointer, n: int): SessionH
         result.metalHandle = metalAllocFromHeap(heap, n)
     else:
       result.metalHandle = nil
+  of gbCpu:
+    if heap != nil:
+      result.cpuData = newSeq[float32](max(n, 0))
   else:
     discard
 
@@ -1107,6 +1152,8 @@ proc sessionAllocScratch*(backend: GpuBackend, n: int): SessionHandle =
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     result.vulkanHandle = vulkanSessionAllocScratch(n)
+  of gbCpu:
+    result.cpuData = newSeq[float32](max(n, 0))
   else:
     discard
 
@@ -1142,6 +1189,9 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
     if c.vulkanHandle.buf == nil:
       c.vulkanHandle = vulkanSessionAllocScratch(M * N)
     return vulkanSessionMatmulEnc(a.vulkanHandle, b.vulkanHandle, c.vulkanHandle, M, K, N)
+  of gbCpu:
+    c.cpuData = cpu.matmul(cpuTake(a, M * K), cpuTake(b, K * N), M, K, N)
+    return true
   else:
     return false
 
@@ -1173,6 +1223,9 @@ proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHa
     if c.vulkanHandle.buf == nil:
       c.vulkanHandle = vulkanSessionAllocScratch(M * N)
     return vulkanSessionMatmulNTEnc(a.vulkanHandle, b.vulkanHandle, c.vulkanHandle, M, K, N)
+  of gbCpu:
+    c.cpuData = cpu.matmulNT(cpuTake(a, M * K), cpuTake(b, N * K), M, K, N)
+    return true
   else:
     return false
 
@@ -1216,6 +1269,9 @@ proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle
     if y.vulkanHandle.buf == nil:
       y.vulkanHandle = vulkanSessionAllocScratch(rows * cols)
     return vulkanSessionSoftmaxEnc(x.vulkanHandle, y.vulkanHandle, rows, cols)
+  of gbCpu:
+    y.cpuData = cpu.softmax(cpuTake(x, rows * cols), rows, cols)
+    return true
   else:
     return false
 
@@ -1245,6 +1301,10 @@ proc sessionLayernormEnc*(backend: GpuBackend, x, gamma, beta: SessionHandle, y:
     if y.vulkanHandle.buf == nil:
       y.vulkanHandle = vulkanSessionAllocScratch(rows * cols)
     return vulkanSessionLayernormEnc(x.vulkanHandle, gamma.vulkanHandle, beta.vulkanHandle, y.vulkanHandle, rows, cols, eps)
+  of gbCpu:
+    y.cpuData = cpu.layernorm(cpuTake(x, rows * cols), cpuTake(gamma, cols),
+                              cpuTake(beta, cols), rows, cols, eps)
+    return true
   else:
     return false
 
@@ -1276,6 +1336,9 @@ proc sessionRmsnormEnc*(backend: GpuBackend, x, gamma: SessionHandle, y: var Ses
     if y.vulkanHandle.buf == nil:
       y.vulkanHandle = vulkanSessionAllocScratch(rows * cols)
     return vulkanSessionRmsnormEnc(x.vulkanHandle, gamma.vulkanHandle, y.vulkanHandle, rows, cols, eps)
+  of gbCpu:
+    y.cpuData = cpu.rmsnorm(cpuTake(x, rows * cols), cpuTake(gamma, cols), rows, cols, eps)
+    return true
   else:
     return false
 
@@ -1312,6 +1375,12 @@ proc sessionAttentionFusedEnc*(backend: GpuBackend, q, k, v: SessionHandle, o, s
       sMatrix.vulkanHandle = vulkanSessionAllocScratch(B * H * S * S)
     return vulkanSessionAttentionFusedEnc(q.vulkanHandle, k.vulkanHandle, v.vulkanHandle,
                                            o.vulkanHandle, sMatrix.vulkanHandle, B, H, S, D, scale)
+  of gbCpu:
+    let r = cpu.attention(cpuTake(q, B * H * S * D), cpuTake(k, B * H * S * D),
+                          cpuTake(v, B * H * S * D), @[], 0, B, H, S, D, scale)
+    o.cpuData = r.o
+    sMatrix.cpuData = r.sMatrix
+    return true
   else:
     return false
 
@@ -1352,6 +1421,27 @@ proc sessionAttentionDecodeGqaEnc*(backend: GpuBackend, q, k, v: SessionHandle, 
       scores.vulkanHandle = vulkanSessionAllocScratch(H * S)
     return vulkanSessionAttentionDecodeGqaEnc(q.vulkanHandle, k.vulkanHandle, v.vulkanHandle,
                                                o.vulkanHandle, scores.vulkanHandle, H, S, D, scale)
+  of gbCpu:
+    let qv = cpuTake(q, H * D)
+    let kv = cpuTake(k, S * D)
+    let vv = cpuTake(v, S * D)
+    o.cpuData = cpuAttentionDecodeGqa(qv, kv, vv, H, S, D, scale)
+    var sc = newSeq[float32](H * S)
+    for h in 0 ..< H:
+      var mx = -1e30'f32
+      for t in 0 ..< S:
+        var dot = 0'f32
+        for d in 0 ..< D: dot += qv[h * D + d] * kv[t * D + d]
+        sc[h * S + t] = dot * scale
+        if sc[h * S + t] > mx: mx = sc[h * S + t]
+      var total = 0'f32
+      for t in 0 ..< S:
+        let e = exp(sc[h * S + t] - mx)
+        sc[h * S + t] = e
+        total += e
+      for t in 0 ..< S: sc[h * S + t] /= total
+    scores.cpuData = sc
+    return true
   else:
     return false
 
@@ -1386,6 +1476,20 @@ proc sessionAttentionDecodeAllHeadsEnc*(backend: GpuBackend, q, kAll, vAll: Sess
       o.vulkanHandle = vulkanSessionAllocScratch(H * D)
     return vulkanSessionAttentionDecodeAllHeadsEnc(q.vulkanHandle, kAll.vulkanHandle, vAll.vulkanHandle,
                                                     o.vulkanHandle, H, HKV, D, S, maxSeqLen)
+  of gbCpu:
+    let qv = cpuTake(q, H * D)
+    let rep = max(1, H div HKV)
+    var outv = newSeq[float32](H * D)
+    let scale = 1.0'f32 / sqrt(float32(D))
+    for h in 0 ..< H:
+      let hkv = min(HKV - 1, h div rep)
+      let kOff = hkv * maxSeqLen * D
+      let kv = cpuTake(kAll, kOff + S * D)[kOff ..< kOff + S * D]
+      let vv = cpuTake(vAll, kOff + S * D)[kOff ..< kOff + S * D]
+      let oh = cpuAttentionDecodeGqa(qv[h * D ..< (h + 1) * D], kv, vv, 1, S, D, scale)
+      for d in 0 ..< D: outv[h * D + d] = oh[d]
+    o.cpuData = outv
+    return true
   else:
     return false
 
@@ -1424,6 +1528,16 @@ proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var 
     if c.vulkanHandle.buf == nil:  # chua co scratch buffer -> cap phat 1 lan
       c.vulkanHandle = vulkanSessionAllocScratch(n)
     return vulkanSessionVecOpEnc(a.vulkanHandle, b.vulkanHandle, c.vulkanHandle, opCode, n)
+  of gbCpu:
+    let av = cpuTake(a, n)
+    let bv = cpuTake(b, n)
+    c.cpuData = case op
+      of "add": cpu.add(av, bv)
+      of "sub": cpu.sub(av, bv)
+      of "mul": cpu.mul(av, bv)
+      of "div": cpu.divide(av, bv)
+      else: cpu.add(av, bv)
+    return true
   else:
     return false
 
@@ -1449,6 +1563,10 @@ proc sessionRope*(backend: GpuBackend, x: SessionHandle, cosT, sinT: SessionHand
   of gbVulkan:
     var xv = x
     return vulkanSessionRopeEnc(xv.vulkanHandle, cosT.vulkanHandle, sinT.vulkanHandle, Hn, D, T)
+  of gbCpu:
+    var xv = x.cpuData
+    cpu.rope(xv, cosT.cpuData, sinT.cpuData, T, Hn, D)
+    return true
   of gbCuda:
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
@@ -1488,6 +1606,10 @@ proc sessionScale*(backend: GpuBackend, x: SessionHandle, scalar: float32, n: in
     # sai thay vì báo lỗi rõ ràng - ĐÂY LÀ ĐIỂM CẦN TỰ VERIFY TRÊN MÁY THẬT.
     var xv = x
     return vulkanSessionActivationEnc(8, xv.vulkanHandle, xv.vulkanHandle, n, scalar)
+  of gbCpu:
+    var xv = x.cpuData
+    cpu.scale(xv, scalar)
+    return true
   else:
     return false
 
@@ -1518,6 +1640,12 @@ proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionH
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     return vulkanSessionCopyInto(src.vulkanHandle, dst.vulkanHandle, srcOffsetElems, dstOffsetElems, n)
+  of gbCpu:
+    let need = dstOffsetElems + n
+    if dst.cpuData.len < need: dst.cpuData.setLen(need)
+    for i in 0 ..< n:
+      dst.cpuData[dstOffsetElems + i] = src.cpuData[srcOffsetElems + i]
+    return true
   else:
     return false
 
@@ -1563,6 +1691,19 @@ proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: va
     if y.vulkanHandle.buf == nil:
       y.vulkanHandle = vulkanSessionAllocScratch(n)
     return vulkanSessionActivationEnc(opCode, x.vulkanHandle, y.vulkanHandle, n, p)
+  of gbCpu:
+    let xv = cpuTake(x, n)
+    y.cpuData = case opCode
+      of 0: cpu.relu(xv)
+      of 1: cpu.sigmoid(xv)
+      of 2: cpu.tanh(xv)
+      of 3: cpu.apflu(xv, 0.1'f32, 1.0'f32)
+      of 4: cpu.exp(xv)
+      of 5: cpu.log(xv)
+      of 6: cpu.sqrt(xv)
+      of 7: cpu.pow(xv, p)
+      else: cpu.relu(xv)
+    return true
   else:
     return false
 
@@ -1591,6 +1732,9 @@ proc sessionApfluEnc*(backend: GpuBackend, x: SessionHandle, y: var SessionHandl
     # cũng đang chạy CPU fallback, không phải bug mới) - trả false để
     # caller fallback về immediate, KHÔNG bịa kernel chưa test.
     return false
+  of gbCpu:
+    y.cpuData = cpu.apflu(cpuTake(x, n), alpha, beta)
+    return true
   else:
     return false
 
@@ -1613,6 +1757,9 @@ proc sessionApfluBackwardEnc*(backend: GpuBackend, x, dy: SessionHandle, dx: var
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     return false
+  of gbCpu:
+    dx.cpuData = cpu.apfluBackward(cpuTake(x, n), cpuTake(dy, n), alpha, beta)
+    return true
   else:
     return false
 
@@ -1635,6 +1782,9 @@ proc sessionGatherEnc*(backend: GpuBackend, src, idx: SessionHandle, dst: var Se
     if dst.vulkanHandle.buf == nil:
       dst.vulkanHandle = vulkanSessionAllocScratch(n)
     return vulkanSessionGatherEnc(src.vulkanHandle, idx.vulkanHandle, dst.vulkanHandle, n)
+  of gbCpu:
+    dst.cpuData = cpu.gather(src.cpuData, cpuTakeIndices(idx, n))
+    return true
   else:
     return false
 
@@ -1657,6 +1807,11 @@ proc sessionCompareEnc*(backend: GpuBackend, a, b: SessionHandle, mask: var Sess
     if mask.vulkanHandle.buf == nil:
       mask.vulkanHandle = vulkanSessionAllocScratch(n)
     return vulkanSessionCompareEnc(a.vulkanHandle, b.vulkanHandle, mask.vulkanHandle, op, n)
+  of gbCpu:
+    let r = cpu.compare(cpuTake(a, n), cpuTake(b, n), op)
+    mask.cpuData = newSeq[float32](n)
+    for i in 0 ..< n: mask.cpuData[i] = (if r[i]: 1.0'f32 else: 0.0'f32)
+    return true
   else:
     return false
 
@@ -1680,6 +1835,9 @@ proc sessionDropoutMaskEnc*(backend: GpuBackend, mask: var SessionHandle, n: int
     if mask.vulkanHandle.buf == nil:
       mask.vulkanHandle = vulkanSessionAllocScratch(n)
     return vulkanSessionDropoutMaskEnc(mask.vulkanHandle, seed, p, n)
+  of gbCpu:
+    mask.cpuData = cpu.dropoutMask(n, p, seed)
+    return true
   else:
     return false
 
@@ -1704,6 +1862,12 @@ proc sessionArgmaxIndexEnc*(backend: GpuBackend, x: SessionHandle, val, idx: var
     if val.vulkanHandle.buf == nil: val.vulkanHandle = vulkanSessionAllocScratch(pairs)
     if idx.vulkanHandle.buf == nil: idx.vulkanHandle = vulkanSessionAllocScratch(pairs)
     return vulkanSessionArgmaxIndexEnc(x.vulkanHandle, val.vulkanHandle, idx.vulkanHandle, outer, dimSize, inner)
+  of gbCpu:
+    let r = cpu.argmaxIndex(cpuTake(x, outer * dimSize * inner), outer, dimSize, inner)
+    val.cpuData = r.val
+    idx.cpuData = newSeq[float32](r.idx.len)
+    for i in 0 ..< r.idx.len: idx.cpuData[i] = float32(r.idx[i])
+    return true
   else:
     return false
 
@@ -1728,6 +1892,10 @@ proc sessionPermuteEnc*(backend: GpuBackend, src: SessionHandle, dst: var Sessio
     # - KHÔNG dùng buffer đã upload như Metal/CUDA, khác 1 chút vì
     # dispatchGeneric push-constant embed bảng ngay trong call.
     return false
+  of gbCpu:
+    dst.cpuData = cpu.permute(cpuTake(src, n), cpuTakeIndices(newStrides, ndim),
+      cpuTakeIndices(oldStrides, ndim), cpuTakeIndices(dimsMap, ndim), n)
+    return true
   else:
     return false
 
@@ -1749,6 +1917,12 @@ proc sessionSplitSliceEnc*(backend: GpuBackend, src: SessionHandle, dst: var Ses
   of gbVulkan:
     if dst.vulkanHandle.buf == nil: dst.vulkanHandle = vulkanSessionAllocScratch(n)
     return vulkanSessionSplitSliceEnc(src.vulkanHandle, dst.vulkanHandle, dimTotal, thisSize, offset, inner, n)
+  of gbCpu:
+    let unit = thisSize * inner
+    let outer = if unit > 0: n div unit else: 0
+    dst.cpuData = cpu.splitSlice(cpuTake(src, outer * dimTotal * inner),
+      dimTotal, thisSize, offset, inner, n)
+    return true
   else:
     return false
 
@@ -1774,6 +1948,13 @@ proc sessionLayernormBackwardEnc*(backend: GpuBackend, dy, x, gamma, beta: Sessi
     # vulkanLayernormBackward immediate hiện đang CPU fallback (không có
     # layernorm_backward.comp thật) - trả false, KHÔNG bịa shader chưa test.
     return false
+  of gbCpu:
+    let r = cpu.layernormBackward(cpuTake(dy, rows * cols), cpuTake(x, rows * cols),
+      cpuTake(gamma, cols), cpuTake(beta, cols), rows, cols, eps)
+    dx.cpuData = r.dx
+    dgamma.cpuData = r.dgamma
+    dbeta.cpuData = r.dbeta
+    return true
   else:
     return false
 
@@ -1803,6 +1984,14 @@ proc sessionAttentionFusedBackwardEnc*(backend: GpuBackend, q, k, v, sMatrix, dy
     if dv.vulkanHandle.buf == nil: dv.vulkanHandle = vulkanSessionAllocScratch(qkvLen)
     return vulkanSessionAttentionFusedBackwardEnc(q.vulkanHandle, k.vulkanHandle, v.vulkanHandle,
       sMatrix.vulkanHandle, dy.vulkanHandle, dq.vulkanHandle, dk.vulkanHandle, dv.vulkanHandle, B, H, S, D, scale)
+  of gbCpu:
+    let r = cpuAttentionFusedBackward(cpuTake(q, B * H * S * D), cpuTake(k, B * H * S * D),
+      cpuTake(v, B * H * S * D), cpuTake(sMatrix, B * H * S * S),
+      cpuTake(dy, B * H * S * D), B, H, S, D, scale)
+    dq.cpuData = r.dq
+    dk.cpuData = r.dk
+    dv.cpuData = r.dv
+    return true
   else:
     return false
 
@@ -1825,6 +2014,9 @@ proc sessionEmbeddingLookupEnc*(backend: GpuBackend, table, indices: SessionHand
     # vulkanEmbeddingLookup immediate hiện đang CPU fallback (chưa có
     # embedding.comp thật) - trả false.
     return false
+  of gbCpu:
+    y.cpuData = cpu.embeddingLookup(table.cpuData, cpuTakeIndices(indices, numIndices), vocab, dim)
+    return true
   else:
     return false
 
@@ -1849,6 +2041,8 @@ proc sessionEnd*(backend: GpuBackend): bool =
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     return vulkanSessionEnd()
+  of gbCpu:
+    return true
   else:
     return false
 
@@ -1872,6 +2066,8 @@ proc sessionCommitContinue*(backend: GpuBackend): bool =
       return false
   of gbVulkan:
     return vulkanSessionCommitContinue()
+  of gbCpu:
+    return true
   else:
     return false
 
@@ -1894,6 +2090,8 @@ proc sessionRecoverQueue*(backend: GpuBackend): bool =
       return false
   of gbVulkan:
     return vulkanRecoverQueue()
+  of gbCpu:
+    return true
   else:
     return false
 
@@ -1914,6 +2112,8 @@ proc sessionGetLastError*(backend: GpuBackend): string =
       return ""
   of gbVulkan:
     return vulkanGetLastError()
+  of gbCpu:
+    return ""
   else:
     return ""
 
@@ -1934,6 +2134,11 @@ proc sessionRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] =
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     return vulkanSessionRead(h.vulkanHandle, n)
+  of gbCpu:
+    result = newSeq[float32](max(n, 0))
+    let count = min(n, h.cpuData.len)
+    for i in 0 ..< count: result[i] = h.cpuData[i]
+    return result
   else:
     return @[]
 
@@ -1954,6 +2159,9 @@ proc sessionFree*(backend: GpuBackend, h: var SessionHandle) =
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
     vulkanSessionFree(h.vulkanHandle)
+  of gbCpu:
+    h.cpuData = @[]
+    h.cpuIndices = @[]
   else:
     discard
   h.kind = gbCpu
@@ -1980,6 +2188,13 @@ proc gpuFusedAddAct*(backend: GpuBackend, a, b: seq[float32], act: string): seq[
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
 
+  if chosen == gbCpu:
+    let actCode = case act
+      of "relu": 1
+      of "sigmoid": 2
+      of "tanh": 3
+      else: 0
+    return cpu.fusedAddAct(a, b, actCode)
   if chosen notin {gbMetal, gbCuda, gbVulkan}:
     raise newException(ValueError,
       "gpuFusedAddAct: CPU fallback bi cam - khong co GPU backend nao kha dung")
@@ -2241,7 +2456,7 @@ proc gpuGather*(backend: GpuBackend, src: seq[float32], idx: seq[int32]): seq[fl
     of gbMetal: return metalGather(src, idx)
     of gbVulkan: return vulkanGather(src, idx)
     of gbCpu:
-      raise newException(ValueError, "gpuGather: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.gather(src, idx)
     of gbAuto:
       result = newSeq[float32](idx.len)
       for i in 0 ..< idx.len: result[i] = src[idx[i]]
@@ -2260,7 +2475,7 @@ proc gpuArgmaxIndex*(backend: GpuBackend, x: seq[float32], outer, dimSize, inner
     of gbMetal: return metalArgmaxIndex(x, outer, dimSize, inner)
     of gbVulkan: return vulkanArgmaxIndex(x, outer, dimSize, inner)
     of gbCpu:
-      raise newException(ValueError, "gpuArgmaxIndex: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.argmaxIndex(x, outer, dimSize, inner)
     of gbAuto: discard # roi xuong ban CPU ben duoi
   except CatchableError as e:
     handleGpuFailure(chosen, "argmax", e)
@@ -2290,7 +2505,7 @@ proc gpuCompare*(backend: GpuBackend, a, b: seq[float32], op: int): seq[bool] =
       for i in 0 ..< m32.len: mask[i] = uint8(m32[i])
     of gbMetal: mask = metalCompare(a, b, op)
     of gbCpu:
-      raise newException(ValueError, "gpuCompare: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.compare(a, b, op)
     of gbAuto: mask = @[]
   except CatchableError as e:
     handleGpuFailure(chosen, "compare", e)
@@ -2318,7 +2533,7 @@ proc gpuDropoutMask*(backend: GpuBackend, n: int, p: float32, seed: uint32): seq
     of gbMetal: return metalDropoutMask(n, p, seed)
     of gbVulkan: return vulkanDropoutMask(n, p, seed)
     of gbCpu:
-      raise newException(ValueError, "gpuDropoutMask: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.dropoutMask(n, p, seed)
     of gbAuto: discard
   except CatchableError as e:
     handleGpuFailure(chosen, "dropout_mask", e)
@@ -2349,7 +2564,7 @@ proc gpuPermute*(backend: GpuBackend, src: seq[float32], newStrides, oldStrides,
     of gbMetal: return metalPermute(src, newStrides, oldStrides, dimsMap, n)
     of gbVulkan: return vulkanPermute(src, newStrides, oldStrides, dimsMap, n)
     of gbCpu:
-      raise newException(ValueError, "gpuPermute: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.permute(src, newStrides, oldStrides, dimsMap, n)
     of gbAuto: discard
   except CatchableError as e:
     handleGpuFailure(chosen, "permute", e)
@@ -2375,7 +2590,7 @@ proc gpuSplitSlice*(backend: GpuBackend, src: seq[float32], dimTotal, thisSize, 
     of gbMetal: return metalSplitSlice(src, dimTotal, thisSize, offset, inner, n)
     of gbVulkan: return vulkanSplitSlice(src, dimTotal, thisSize, offset, inner, n)
     of gbCpu:
-      raise newException(ValueError, "gpuSplitSlice: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.splitSlice(src, dimTotal, thisSize, offset, inner, n)
     of gbAuto: discard
   except CatchableError as e:
     handleGpuFailure(chosen, "split_slice", e)
@@ -2400,7 +2615,7 @@ proc gpuConcat*(backend: GpuBackend, flatSrc: seq[float32], srcBase, srcDimSize,
     of gbMetal: return metalConcat(flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, n)
     of gbVulkan: return vulkanConcat(flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, n)
     of gbCpu:
-      raise newException(ValueError, "gpuConcat: CPU fallback bi cam - khong co GPU backend nao kha dung")
+      return cpu.concat(flatSrc, srcBase, srcDimSize, srcDimOffset, totalDim, inner, n)
     of gbAuto: discard
   except CatchableError as e:
     handleGpuFailure(chosen, "concat", e)

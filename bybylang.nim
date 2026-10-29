@@ -30,6 +30,7 @@
 # đó vẫn chạy đúng, chỉ là không được gộp session).
 import strutils, os, osproc, tables, sequtils, times
 import ./gpubackend
+import ./backends/cpu/cpu_backend as cpu
 import ./micro_kernel
 import ./backends/metal/metal_backend
 import ./backends/vulkan/vulkan_driver
@@ -203,8 +204,15 @@ proc executeMicroKernel*(backend: GpuBackend; kernelName: string;
     of gbCuda: gbVulkan
     else: backend
   let isVulkan = selected == gbVulkan
+  if selected == gbCpu:
+    var outv = newSeq[float32](outputElems)
+    if nThreads <= 0 or tgSize <= 0 or tgSize > nThreads:
+      raise newException(ValueError, "micro kernel needs positive output, threads and group sizes")
+    if not cpu.vmRun(program.words, outv, inputValues, nThreads, 0, tgSize):
+      raise newException(ValueError, "CPU micro kernel failed: " & cpu.cpuLastErrorMessage())
+    return outv
   if selected notin {gbMetal, gbVulkan}:
-    raise newException(ValueError, "micro kernel requires a Metal or Vulkan backend")
+    raise newException(ValueError, "micro kernel requires a Metal, Vulkan or CPU backend")
   if outputElems <= 0 or nThreads <= 0 or tgSize <= 0 or tgSize > nThreads:
     raise newException(ValueError, "micro kernel needs positive output, threads and group sizes")
   if inputValues.len == 0:
