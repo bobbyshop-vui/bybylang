@@ -13,11 +13,8 @@ layout(std430, binding = 2) writeonly buffer Output { float y[]; };
 layout(std430, binding = 3) readonly buffer LutScale { float lut[]; };
 layout(std430, binding = 4) readonly buffer Zero { float zero[]; };
 layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow; } p;
-// Double-buffer K tiles to issue two matrix operations per barrier pair.
-shared floate4m3_t aTile0[16 * 16];
-shared floate4m3_t bTile0[16 * 16];
-shared floate4m3_t aTile1[16 * 16];
-shared floate4m3_t bTile1[16 * 16];
+shared floate4m3_t aTile[16 * 16];
+shared floate4m3_t bTile[16 * 16];
 shared float cTile[16 * 16];
 
 uint loadByte(uint i) { return (w[i >> 2] >> ((i & 3) * 8)) & 255; }
@@ -38,22 +35,16 @@ void main() {
     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sum =
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-    for (uint base = 0; base < p.K; base += 32) {
+    for (uint base = 0; base < p.K; base += 16) {
         for (uint i = lid; i < 256; i += gl_WorkGroupSize.x) {
             uint row = row0 + i / 16;
-            uint k0 = base + i % 16;
-            uint k1 = k0 + 16;
-            aTile0[i] = floate4m3_t(row < p.M && k0 < p.K ? x[row * p.K + k0] : 0.0);
-            bTile0[i] = floate4m3_t(weightAt(col0 + i / 16, k0));
-            aTile1[i] = floate4m3_t(row < p.M && k1 < p.K ? x[row * p.K + k1] : 0.0);
-            bTile1[i] = floate4m3_t(weightAt(col0 + i / 16, k1));
+            uint k = base + i % 16;
+            aTile[i] = floate4m3_t(row < p.M && k < p.K ? x[row * p.K + k] : 0.0);
+            bTile[i] = floate4m3_t(weightAt(col0 + i / 16, k));
         }
         barrier();
-        coopMatLoad(a, aTile0, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(b, bTile0, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
-        sum = coopMatMulAdd(a, b, sum);
-        coopMatLoad(a, aTile1, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(b, bTile1, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(a, aTile, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b, bTile, 0, 16, gl_CooperativeMatrixLayoutColumnMajor);
         sum = coopMatMulAdd(a, b, sum);
         barrier();
     }
