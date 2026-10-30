@@ -1662,7 +1662,8 @@ proc vulkanSessionFp4GemmEnc*(a, w, lut: VulkanBufferHandle;
     return true
   result = tryCooperativeMatmul(a, w, c, lut, lut, M, K, N, 1)
   if result and not gFp16Fp4Logged:
-    stderr.writeLine "[vulkan] FP4-KM prefill route=FP16 tile decode + FP32 accumulation"
+    stderr.writeLine "[vulkan] FP4-KM prefill route=FP16 tile decode + FP32 accumulation " &
+      "(native FP8 cooperative matrix unavailable/disabled)"
     gFp16Fp4Logged = true
 
 proc vulkanSessionMatmulNTAcceleratedEnc*(a, w: VulkanBufferHandle;
