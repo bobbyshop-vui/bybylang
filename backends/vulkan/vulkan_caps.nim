@@ -144,6 +144,10 @@ type
     sType*: uint32
     pNext*: pointer
     cooperativeMatrix*, cooperativeMatrixRobustBufferAccess*: uint32
+  VkFloat8Features* = object
+    sType*: uint32
+    pNext*: pointer
+    shaderFloat8*, shaderFloat8CooperativeMatrix*: uint32
   VkMemoryModelFeatures* = object
     sType*: uint32
     pNext*: pointer
@@ -161,6 +165,7 @@ type
     extensions*: HashSet[string]
     subgroupSize*: int
     float16*, int8*, storage8*, memoryModel*, cooperativeMatrix*: bool
+    float8E4M3CooperativeMatrix*: bool
     tileM*, tileN*, tileK*: int
     maxThreads*, maxSharedBytes*: int
     minStorageAlignment*: uint64
@@ -190,6 +195,7 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
       if enumExt(device, nil, addr count, addr ext[0]) == 0:
         for e in ext: result.extensions.incl($cast[cstring](unsafeAddr e.extensionName[0]))
   let hasCoop = "VK_KHR_cooperative_matrix" in result.extensions
+  let hasFloat8 = "VK_EXT_shader_float8" in result.extensions
   let getProps2 = cast[proc(d: pointer; p: ptr VkPhysicalDeviceProperties2) {.cdecl.}](
     resolve(instance, "vkGetPhysicalDeviceProperties2"))
   if getProps2 != nil:
@@ -203,7 +209,9 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
   let getFeatures2 = cast[proc(d: pointer; p: ptr VkFeatures2) {.cdecl.}](
     resolve(instance, "vkGetPhysicalDeviceFeatures2"))
   if getFeatures2 == nil: return
-  var coop = VkCoopFeatures(sType: CoopFeaturesType)
+  var float8 = VkFloat8Features(sType: 1000567000'u32)
+  var coop = VkCoopFeatures(sType: CoopFeaturesType,
+    pNext: (if hasFloat8: addr float8 else: nil))
   var memoryModel = VkMemoryModelFeatures(sType: MemoryModelType,
     pNext: (if hasCoop: addr coop else: nil))
   var storage = VkStorage8Features(sType: Storage8Type,
@@ -215,8 +223,11 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
   result.int8 = fp.shaderInt8 != 0
   result.storage8 = storage.storageBuffer8BitAccess != 0
   result.memoryModel = memoryModel.vulkanMemoryModel != 0
+  let shaderFloat8 = hasFloat8 and float8.shaderFloat8 != 0 and
+    float8.shaderFloat8CooperativeMatrix != 0
   if result.properties.apiVersion < 0x00403000'u32 or not hasCoop or
-     coop.cooperativeMatrix == 0 or not result.float16 or not result.memoryModel or
+     coop.cooperativeMatrix == 0 or (not result.float16 and not shaderFloat8) or
+     not result.memoryModel or
      result.subgroupSize <= 0: return
   let getTiles = cast[proc(d: pointer; count: ptr uint32; p: ptr VkCoopTile): int32 {.cdecl.}](
     resolve(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"))
@@ -233,7 +244,13 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
        t.scope == 3 and t.saturating == 0 and t.m == 16 and t.n == 16 and t.k == 16:
       result.tileM = int(t.m); result.tileN = int(t.n); result.tileK = int(t.k)
       result.cooperativeMatrix = true
-      break
+    # FP4-KM can be decoded directly into an E4M3 tile while loading weights.
+    # Restrict this first implementation to the tile shape compiled by its
+    # shader; every other advertised FP8 shape safely uses the FP16 kernel.
+    if shaderFloat8 and t.aType == 1000491002'u32 and
+       t.bType == 1000491002'u32 and t.cType == 1 and t.resultType == 1 and
+       t.scope == 3 and t.saturating == 0 and t.m == 16 and t.n == 16 and t.k == 16:
+      result.float8E4M3CooperativeMatrix = true
 
 proc deviceName*(caps: VulkanCaps): string =
   $cast[cstring](unsafeAddr caps.properties.deviceName[0])

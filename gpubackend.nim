@@ -963,6 +963,17 @@ proc sessionMicroVmEnc*(backend: GpuBackend, code, mem: SessionHandle,
     return cpu.vmRun(words, memv, @[], nThreads, tgFloats, tgSize)
   false
 
+proc sessionJitPrewarm*(backend: GpuBackend;
+                        jobs: openArray[tuple[name, source: string]]) =
+  ## Compile a batch of shaders before the hot path starts. Vulkan shells out
+  ## to glslc per kernel, so this runs them concurrently; other backends have
+  ## no on-disk shader step and ignore the request.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  if chosen == gbVulkan:
+    vulkanJitPrewarm(jobs)
+
 proc sessionJitMicroVmEnc*(backend: GpuBackend, kernelName, source: string,
                            mem: SessionHandle, nThreads, tgSize: int; tgFloats = 1024): bool =
   var chosen = backend
@@ -1239,6 +1250,17 @@ proc sessionMatmulNTAccelerated*(backend: GpuBackend, a, b: SessionHandle,
     if vulkanSessionMatmulNTAcceleratedEnc(a.vulkanHandle, b.vulkanHandle,
         c.vulkanHandle, M, K, N): return true
   sessionMatmulNT(backend, a, b, c, M, K, N)
+
+proc sessionMatmulNTFp16Coop*(backend: GpuBackend, a, b: SessionHandle,
+    c: var SessionHandle; M, K, N: int): bool =
+  ## Try only the Vulkan FP16-input/FP32-accumulate cooperative matrix path.
+  ## False lets inference choose its existing MSL/VM fallback without first
+  ## silently executing a second FP32 matmul.
+  if normalizeBackend(backend) != gbVulkan: return false
+  if c.vulkanHandle.buf == nil:
+    c = sessionAllocScratch(gbVulkan, M * N)
+  vulkanSessionMatmulNTAcceleratedEnc(a.vulkanHandle, b.vulkanHandle,
+    c.vulkanHandle, M, K, N)
 
 proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
     c: var SessionHandle; M, K, N: int): bool =

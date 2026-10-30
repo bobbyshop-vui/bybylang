@@ -83,6 +83,7 @@ const
   OP_VTG_END*      = 0x9A'u32
   OP_LOAD_VACT*    = 0x9B'u32   # R[a] = (threadgroup ao nay co viec that) ? 1 : 0
   OP_U_LOAD_U32*   = 0x9D'u32   # U[a] = *(uint*)(memU8 + U[b] + word)  (nap 4 byte/lane, DIA CHI PHAI chia het 4; buffer 2)
+  OP_U_LOAD_IN4*   = 0x9E'u32   # R[a..a+3] = inF32[U[b]+word .. +3]  (mot lenh 16 byte; buffer 4)
   OP_GRID_EPILOGUE* = 0x9C'u32  # word kế tiếp = chi so ctrl; TG cuoi cung reset counter, chep err -> lastErr
 
 type
@@ -90,13 +91,17 @@ type
     words*: seq[uint32]
 
 proc pack3(op, a, b, c: uint32): uint32 {.inline.} =
-  (op and 0xFF'u32) or ((a and 0xF) shl 8) or ((b and 0xF) shl 12) or ((c and 0xF) shl 16)
+  ## 5-bit register fields: 32 float registers R[] and 32 int registers U[].
+  ## (Was 4 bits = 16.) The hot FP4 GEMM needs 16 accumulators (8 rows x 2
+  ## output columns) plus 4 vector-loaded inputs, 8 decoded weights, 2 group
+  ## scales and a loop counter; 16 registers could not express that.
+  (op and 0xFF'u32) or ((a and 0x1F) shl 8) or ((b and 0x1F) shl 13) or ((c and 0x1F) shl 18)
 
 proc pack2(op, a, b: uint32): uint32 {.inline.} =
-  (op and 0xFF'u32) or ((a and 0xF) shl 8) or ((b and 0xF) shl 12)
+  (op and 0xFF'u32) or ((a and 0x1F) shl 8) or ((b and 0x1F) shl 13)
 
 proc pack1(op, a: uint32): uint32 {.inline.} =
-  (op and 0xFF'u32) or ((a and 0xF) shl 8)
+  (op and 0xFF'u32) or ((a and 0x1F) shl 8)
 
 # ── Emit (ghi “file” trong RAM) ──────────────────────────────
 
@@ -136,7 +141,7 @@ proc emitMul*(p: var VmProgram; rd, ra, rb: uint32) =
 
 proc emitFma*(p: var VmProgram; rd, ra, rb, rc: uint32) =
   p.emit pack3(OP_FMA, rd, ra, rb)
-  p.emit (rc and 0xF)
+  p.emit (rc and 0x1F)
 
 proc emitLutU8*(p: var VmProgram; rd, ri: uint32) =
   ## R[rd] = lut[uint(R[ri]) & 255]
@@ -224,7 +229,7 @@ proc opHasWord*(op: uint32): bool {.inline.} =
   of OP_LOAD_F32, OP_STORE_F32, OP_LOAD_U8, OP_LOAD_CONST, OP_FMA,
      OP_ADD_CONST, OP_MUL_CONST, OP_TG_LOAD_F32, OP_TG_STORE_F32,
      OP_U_CONST, OP_U_ADDK, OP_U_MULK, OP_U_ANDK, OP_U_SHRK, OP_U_SHLK,
-     OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_CONSTF, OP_U_LOAD_IN, OP_U_STORE_F32,
+     OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_CONSTF, OP_U_LOAD_IN, OP_U_LOAD_IN4, OP_U_STORE_F32,
      OP_U_LOAD_F32, OP_U_ATOMIC_ADD: true
   else: false
 
@@ -255,6 +260,11 @@ proc emitULoadConstF*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
   p.emit pack2(OP_U_LOAD_CONSTF, rd, ub); p.emit off
 proc emitULoadIn*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
   p.emit pack2(OP_U_LOAD_IN, rd, ub); p.emit off
+proc emitULoadIn4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+  ## R[rd..rd+3] = 4 float lien tiep cua inF32 tai U[ub]+off. Dia chi phai
+  ## chia het 4 float (16 byte) - kernel bat buoc dam bao dieu nay.
+  doAssert rd + 3 <= 31, "emitULoadIn4: vuot qua 32 thanh ghi R[]"
+  p.emit pack2(OP_U_LOAD_IN4, rd, ub); p.emit off
 proc emitUStoreF32*(p: var VmProgram; rs, ub: uint32; off: uint32 = 0) =
   p.emit pack2(OP_U_STORE_F32, rs, ub); p.emit off
 proc emitULoadF32*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =

@@ -4,7 +4,9 @@
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import "metal_shim.h"
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <sys/sysctl.h>
 #include <math.h>
 
 // ─────────────────────────────────────────────────────────────
@@ -274,6 +276,8 @@ int metal_matmul(const char* kernel_src, const float* a, const float* b, float* 
 // MPSSupportsMTLDevice) - vì vậy hàm này PHẢI có fallback ở tầng gọi.
 int metal_matmul_mps(const float* a, const float* b, float* c, int m, int k, int n, char** error_out) {
     if (error_out) *error_out = NULL;
+    // Hard policy: M=1 decode must use native kernels, even for direct callers.
+    if (m <= 1) return 0;
     @autoreleasepool {
         // Dùng chung device/queue đã init sẵn bởi ensureMetalInit qua 1 lần
         // gọi metal_available()-style init nhẹ (không cần compile lib MSL
@@ -968,8 +972,16 @@ int metal_init(const char* kernel_src) {
 
 int metal_mps_supported(void) { return gDevice && MPSSupportsMTLDevice(gDevice); }
 
+int metal_is_apple_silicon(void) {
+    int arm64 = 0;
+    size_t size = sizeof(arm64);
+    return sysctlbyname("hw.optional.arm64", &arm64, &size, NULL, 0) == 0 && arm64 == 1;
+}
+
 int metal_matmul_mps_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
                             int m, int k, int n, int cRowStride, int cColumnOffset) {
+    // Reject decode before any MPS descriptor/encoder is constructed.
+    if (m <= 1) return 0;
     @autoreleasepool {
         if (!gSessionEncoder || !gSessionCmdBuf || !MPSSupportsMTLDevice(gDevice) ||
             !a || !b || !c || m <= 0 || k <= 0 || n <= 0 ||
@@ -2567,6 +2579,80 @@ int metal_recover_queue(void) {
     return 1;
 }
 
+/* ---- MTLBinaryArchive: giu pipeline JIT da compile giua cac lan chay ----
+   Moi kernel micro-VM moi ton ~0.2-0.5 s de dich (newLibraryWithSource +
+   newComputePipelineStateWithDescriptor). Prefill mot prompt ngan dung ~20
+   kernel, tuc ~4 s trong 12 s wall - phai tra lai tu dau o MOI tien trinh.
+   Vulkan da co shader cache tren dia; day la ban tuong duong cua Metal. */
+static id<MTLBinaryArchive> gJitArchive = nil;
+static NSString* gJitArchivePath = nil;
+static dispatch_once_t gJitArchiveOnce;
+
+static void metal_jit_archive_save(void) {
+    if (!gJitArchive || !gJitArchivePath) return;
+    static dispatch_once_t warnOnce;
+    @autoreleasepool {
+        NSError* err = nil;
+        if ([gJitArchive serializeToURL:[NSURL fileURLWithPath:gJitArchivePath] error:&err]) {
+            NSLog(@"[metal_jit] archive saved %@", gJitArchivePath);
+        } else {
+            /* serializeToURL la Apple-silicon only; tren Intel no tra NO + nil
+               error. Chi canh bao mot lan de khoi spam moi lan chay. */
+            dispatch_once(&warnOnce, ^{
+                NSLog(@"[metal_jit] archive serialize khong ho tro tren may nay (%@) - chi cache trong tien trinh", err ?: @"Intel");
+            });
+        }
+    }
+}
+
+static void metal_jit_archive_init(void) {
+    if (!gDevice) return;
+    @autoreleasepool {
+        if (@available(macOS 11.0, *)) {
+            const char* env = getenv("BYBY_METAL_JIT_ARCHIVE");
+            NSString* path = nil;
+            if (env && env[0]) {
+                path = [NSString stringWithUTF8String:env];
+            } else {
+                NSArray* dirs = NSSearchPathForDirectoriesInDomains(
+                    NSCachesDirectory, NSUserDomainMask, YES);
+                NSString* base = dirs.count ? dirs[0] : NSTemporaryDirectory();
+                NSString* dir = [base stringByAppendingPathComponent:@"nimformers"];
+                [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                         withIntermediateDirectories:YES
+                                                          attributes:nil
+                                                               error:NULL];
+                if (![[NSFileManager defaultManager] fileExistsAtPath:dir]) {
+                    dir = NSTemporaryDirectory();
+                }
+                path = [dir stringByAppendingPathComponent:@"metal-jit.binarchive"];
+            }
+            NSString* parent = [path stringByDeletingLastPathComponent];
+            NSError* dirErr = nil;
+            if (parent.length > 0 &&
+                ![[NSFileManager defaultManager] createDirectoryAtPath:parent
+                                          withIntermediateDirectories:YES
+                                                           attributes:nil
+                                                                error:&dirErr]) {
+                NSLog(@"[metal_jit] khong tao duoc thu muc archive %@ (%@) - chay khong cache", parent, dirErr);
+                return;
+            }
+            MTLBinaryArchiveDescriptor* ad = [MTLBinaryArchiveDescriptor new];
+            BOOL loaded = [[NSFileManager defaultManager] fileExistsAtPath:path];
+            if (loaded) ad.url = [NSURL fileURLWithPath:path];
+            NSError* err = nil;
+            gJitArchive = [gDevice newBinaryArchiveWithDescriptor:ad error:&err];
+            if (!gJitArchive) {
+                NSLog(@"[metal_jit] archive khong mo duoc (%@) - chay khong cache", err);
+                return;
+            }
+            gJitArchivePath = path;
+            atexit(metal_jit_archive_save);
+            NSLog(@"[metal_jit] archive %@ (%@)", loaded ? @"loaded" : @"new", path);
+        }
+    }
+}
+
 int metal_jit_compile(const char* source, const char* kernelName) {
     if (!source || !kernelName) return 0;
     @autoreleasepool {
@@ -2577,6 +2663,7 @@ int metal_jit_compile(const char* source, const char* kernelName) {
         if (!gJitPipelines) {
             gJitPipelines = [NSMutableDictionary dictionary];
         }
+        dispatch_once(&gJitArchiveOnce, ^{ metal_jit_archive_init(); });
         NSString* name = [NSString stringWithUTF8String:kernelName];
         if (gJitPipelines[name]) {
             return 1; /* already cached */
@@ -2597,11 +2684,26 @@ int metal_jit_compile(const char* source, const char* kernelName) {
         MTLComputePipelineDescriptor* desc = [MTLComputePipelineDescriptor new];
         desc.computeFunction = fn;
         desc.maxCallStackDepth = 32; /* tránh Stack Overflow Exception (Code=12) */
+        if (gJitArchive) {
+            NSError* archiveErr = nil;
+            if ([gJitArchive addComputePipelineFunctionsWithDescriptor:desc error:&archiveErr]) {
+                desc.binaryArchives = @[gJitArchive];
+            } else {
+                NSLog(@"[metal_jit] khong them duoc pipeline %@ vao archive (%@)", name, archiveErr);
+            }
+        }
         id<MTLComputePipelineState> pso =
             [gDevice newComputePipelineStateWithDescriptor:desc
                                                    options:MTLPipelineOptionNone
                                                 reflection:nil
                                                      error:&err];
+        if (!pso && gJitArchive) {
+            desc.binaryArchives = nil;
+            pso = [gDevice newComputePipelineStateWithDescriptor:desc
+                                                         options:MTLPipelineOptionNone
+                                                      reflection:nil
+                                                           error:&err];
+        }
         if (!pso) {
             NSLog(@"[metal_jit] pipeline fail: %@", err);
             return 0;

@@ -143,7 +143,7 @@ when defined(macosx):
     # limit / tile size gì nữa. Fallback về kernel tay viết (đã có tile động
     # ở #A) nếu MPS không khả dụng trên máy này hoặc lỗi. Có thể tắt hẳn
     # bằng cách đổi bbMatmulBackend ở trên thành bmUseKernel.
-    if bbMatmulBackend == bmUseMps and not gMpsFailedOnce:
+    if m > 1 and bbMatmulBackend == bmUseMps and not gMpsFailedOnce:
       var err: cstring = nil
       let okMps = metal_matmul_mps_c(addr aVar[0], addr bVar[0], addr result[0], cint(m), cint(k), cint(n), addr err)
       if okMps != 0:
@@ -575,10 +575,14 @@ when defined(macosx):
   proc metal_matmul_mps_nt_enc_c(a, b, c: MetalBufferHandle;
       m, k, n, stride, offset: cint): cint {.importc: "metal_matmul_mps_nt_enc", header: "metal_shim.h".}
   proc metal_mps_supported_c(): cint {.importc: "metal_mps_supported", header: "metal_shim.h".}
+  proc metal_is_apple_silicon_c(): cint {.importc: "metal_is_apple_silicon", header: "metal_shim.h".}
   proc metalMpsSupported*(): bool = metal_mps_supported_c() != 0
+  proc metalIsAppleSilicon*(): bool = metal_is_apple_silicon_c() != 0
 
   proc metalSessionMatmulMpsNTEnc*(a, b, c: MetalBufferHandle;
       m, k, n, stride, offset: int): bool =
+    # Single-token decode is strictly native GEMV/compute, never MPS.
+    if m <= 1: return false
     metal_matmul_mps_nt_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(stride), cint(offset)) != 0
 
   proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool =

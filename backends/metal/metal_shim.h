@@ -149,6 +149,8 @@ int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHan
 int metal_matmul_mps_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
                             int m, int k, int n, int cRowStride, int cColumnOffset);
 int metal_mps_supported(void);
+// Runtime machine check. Returns 1 on Apple Silicon (including Rosetta), 0 otherwise.
+int metal_is_apple_silicon(void);
 // Tune Q4 workgroup/kernel geometry outside an open inference session.
 int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scales,
     MetalBufferHandle zeros, int k, int n, int groupSize, int groupsPerRow, int m);

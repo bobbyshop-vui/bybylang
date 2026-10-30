@@ -401,6 +401,9 @@ var gInstance: VkInstance
 var gPhysicalDevice: VkPhysicalDevice
 var gDeviceCaps: VulkanCaps
 var gCoopEnabled = false
+var gFp8CoopEnabled = false
+var gFp8Fp4Logged = false
+var gFp16Fp4Logged = false
 var gDevice: VkDevice
 var gQueue: VkQueue
 var gQueueFamilyIndex: uint32
@@ -585,11 +588,18 @@ proc ensureInit() =
   var devExtNames: seq[cstring]
   if "VK_KHR_portability_subset" in gDeviceCaps.extensions:
     devExtNames.add cstring("VK_KHR_portability_subset")
-  gCoopEnabled = gDeviceCaps.cooperativeMatrix and
+  gFp8CoopEnabled = gDeviceCaps.float8E4M3CooperativeMatrix and
+    getEnv("BYBY_VULKAN_TENSOR_CORES", "1") != "0" and findExe("glslc").len > 0
+  gCoopEnabled = (gDeviceCaps.cooperativeMatrix or gFp8CoopEnabled) and
     getEnv("BYBY_VULKAN_TENSOR_CORES", "1") != "0" and findExe("glslc").len > 0
   if gCoopEnabled: devExtNames.add cstring("VK_KHR_cooperative_matrix")
+  if gFp8CoopEnabled: devExtNames.add cstring("VK_EXT_shader_float8")
+  var float8Features = VkFloat8Features(sType: 1000567000'u32,
+    shaderFloat8: uint32(gFp8CoopEnabled),
+    shaderFloat8CooperativeMatrix: uint32(gFp8CoopEnabled))
   var coopFeatures = VkCoopFeatures(sType: CoopFeaturesType,
-    cooperativeMatrix: uint32(gCoopEnabled))
+    cooperativeMatrix: uint32(gCoopEnabled),
+    pNext: (if gFp8CoopEnabled: addr float8Features else: nil))
   var memoryFeatures = VkMemoryModelFeatures(sType: MemoryModelType,
     vulkanMemoryModel: uint32(gCoopEnabled),
     pNext: (if gCoopEnabled: addr coopFeatures else: nil))
@@ -609,6 +619,7 @@ proc ensureInit() =
   if rDev != VK_SUCCESS and gCoopEnabled:
     # A driver rejecting optional MMA features still gets the ordinary path.
     gCoopEnabled = false
+    gFp8CoopEnabled = false
     devExtNames.setLen(devExtNames.len - 1)
     memoryFeatures.vulkanMemoryModel = 0
     memoryFeatures.pNext = nil
@@ -636,7 +647,8 @@ proc ensureInit() =
     " residentWeights=" & weightMemory &
     " subgroup=" & $gDeviceCaps.subgroupSize & " maxThreads=" & $gDeviceCaps.maxThreads &
     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
-    " matrix=" & (if gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
+    " matrix=" & (if gFp8CoopEnabled: "KHR_cooperative_matrix FP8-E4M3/FP32 + FP16/FP32"
+      elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
   stderr.writeLine "[vulkan] Khoi tao xong: instance+device+queue+commandPool san sang (queueFamily=" & $gQueueFamilyIndex & ")"
 
 proc vulkanDeviceCaps*(): VulkanCaps =
@@ -1122,18 +1134,35 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
                           numBindings: numBindings, pushConstSize: pushConstSize)
   gPipelineCache[cacheKey] = result
 
+const DSetPoolSets = 256
+
+var gDSetPool: VkDescriptorPool
+var gDSetPoolLeft = 0
+
+proc takeDescriptorPool(): VkDescriptorPool =
+  ## One session-scoped pool instead of one pool per dispatch: on a fast GPU
+  ## the ~1000 prefill dispatches are dominated by that driver allocation.
+  ## The pool is retired into gSessionCleanupPools when it runs out, and
+  ## destroyed only at sessionEnd() - after the fence wait.
+  if gDSetPoolLeft <= 0:
+    if gDSetPool != nil: gSessionCleanupPools.add(gDSetPool)
+    var poolSize = VkDescriptorPoolSize(descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      descriptorCount: uint32(DSetPoolSets * 8))
+    var poolInfo = VkDescriptorPoolCreateInfo(
+      sType: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, pNext: nil, flags: 0,
+      maxSets: uint32(DSetPoolSets), poolSizeCount: 1, pPoolSizes: addr poolSize)
+    gpuCheck(lib.vkCreateDescriptorPool(gDevice, addr poolInfo, nil, addr gDSetPool) == VK_SUCCESS,
+      "vkCreateDescriptorPool (session) that bai")
+    gDSetPoolLeft = DSetPoolSets
+  dec gDSetPoolLeft
+  result = gDSetPool
+
 proc makeDescriptorSet(entry: PipelineEntry, buffers: openArray[VulkanBufferHandle]; offsets: seq[uint64] = @[]): tuple[pool: VkDescriptorPool, dset: VkDescriptorSet] =
-  ## Tạo 1 descriptor pool nhỏ + 1 set trỏ đúng vào các buffer truyền vào -
-  ## pool này sống tới sessionEnd() thì mới destroy (không thể destroy ngay
-  ## vì lệnh dispatch chưa submit/chạy xong - giống lý do KHÔNG được
-  ## sessionRead() giữa chừng session).
-  var poolSize = VkDescriptorPoolSize(descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: uint32(entry.numBindings))
-  var poolInfo = VkDescriptorPoolCreateInfo(
-    sType: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, pNext: nil, flags: 0,
-    maxSets: 1, poolSizeCount: 1, pPoolSizes: addr poolSize
-  )
-  var pool: VkDescriptorPool
-  gpuCheck(lib.vkCreateDescriptorPool(gDevice, addr poolInfo, nil, addr pool) == VK_SUCCESS, "vkCreateDescriptorPool (session) that bai")
+  ## 1 descriptor set trỏ đúng vào các buffer truyền vào. Set lấy từ pool
+  ## của session (takeDescriptorPool) - pool chỉ bị destroy ở sessionEnd()
+  ## sau khi fence xong, vì lệnh dispatch chưa chạy xong thì chưa được phép
+  ## giải phóng set (giống lý do KHÔNG được sessionRead() giữa chừng session).
+  let pool = takeDescriptorPool()
 
   var setLayoutVar = entry.setLayout
   var allocInfo = VkDescriptorSetAllocateInfo(
@@ -1187,6 +1216,12 @@ proc vulkanSessionBegin*(): bool =
     return false
   gSessionCleanupPools.setLen(0)
   gSessionInternalBufs.setLen(0)
+  # A failed sessionEnd() can leave the live descriptor pool behind; nothing
+  # was submitted in that case, so drop it before the handle is reused.
+  if gDSetPool != nil:
+    lib.vkDestroyDescriptorPool(gDevice, gDSetPool, nil)
+    gDSetPool = nil
+    gDSetPoolLeft = 0
   gSessionActive = true
   result = true
 
@@ -1214,6 +1249,10 @@ proc vulkanSessionEnd*(): bool =
   elif not waitOk: gVkLastError = "vkWaitForFences that bai"
   lib.vkDestroyFence(gDevice, fence, nil)
   lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmdBufVar)
+  if gDSetPool != nil:
+    lib.vkDestroyDescriptorPool(gDevice, gDSetPool, nil)
+    gDSetPool = nil
+    gDSetPoolLeft = 0
   for p in gSessionCleanupPools:
     lib.vkDestroyDescriptorPool(gDevice, p, nil)
   gSessionCleanupPools.setLen(0)
@@ -1250,6 +1289,10 @@ proc vulkanRecoverQueue*(): bool =
     discard lib.vkEndCommandBuffer(gSessionCmdBuf)
     var cb = gSessionCmdBuf
     lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cb)
+    if gDSetPool != nil:
+      lib.vkDestroyDescriptorPool(gDevice, gDSetPool, nil)
+      gDSetPool = nil
+      gDSetPoolLeft = 0
     for p in gSessionCleanupPools:
       lib.vkDestroyDescriptorPool(gDevice, p, nil)
     gSessionCleanupPools.setLen(0)
@@ -1381,7 +1424,7 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
   let entry = getOrCreatePipeline(shaderName, buffers.len, pushConstSize,
     localSizeX, spirvPathOverride, sharedFloats)
   let (pool, dset) = makeDescriptorSet(entry, buffers, bufferOffsets)
-  gSessionCleanupPools.add(pool)
+  discard pool  # owned by the session pool, retired at sessionEnd
   lib.vkCmdBindPipeline(gSessionCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, entry.pipeline)
   var dsetVar = dset
   lib.vkCmdBindDescriptorSets(gSessionCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, entry.layout, 0, 1, addr dsetVar, 0, nil)
@@ -1420,6 +1463,77 @@ var gJitPathHits, gJitPathMisses, gJitDummyAllocations: int
 proc vulkanJitCacheStats*(): tuple[pathHits, pathMisses, dummyAllocations: int] =
   (gJitPathHits, gJitPathMisses, gJitDummyAllocations)
 
+proc vulkanJitCacheDir*(): string =
+  ## BYBY_VULKAN_JIT_DIR points the SPIR-V cache at persistent storage (Colab:
+  ## a mounted Drive, CI: a workspace cache). The default lives in the temp
+  ## dir, which a fresh container always starts empty - that is what makes the
+  ## first prefill spend ~10-20 s compiling shaders on a fast GPU.
+  let override = getEnv("BYBY_VULKAN_JIT_DIR")
+  if override.len > 0: return override
+  getTempDir() / "nimformers-vulkan-jit"
+
+proc vulkanJitShaderPaths(kernelName, source: string): tuple[srcPath, spvPath: string] =
+  let sourceKey = toHex(cast[uint64](hash(source)), 16) & "_" & $source.len
+  let dir = vulkanJitCacheDir()
+  createDir(dir)
+  let stem = kernelName & "_" & sourceKey
+  (dir / (stem & ".comp"), dir / (stem & ".spv"))
+
+proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
+  ## Compile every shader the next phase needs concurrently. Each glslc call is
+  ## a separate process, so N shaders cost about one compile instead of the
+  ## sum. On a fresh container (no SPIR-V disk cache) this is the difference
+  ## between ~15 s and ~2 s of first-prefill time, and it is the only prefill
+  ## cost that does not shrink on a faster GPU.
+  if getEnv("BYBY_VULKAN_DISPATCH_CACHE", "1") == "0": return
+  if jobs.len == 0: return
+  let compiler = findExe("glslc")
+  if compiler.len == 0:
+    raise newException(CatchableError,
+      "Vulkan JIT needs glslc on PATH (install shaderc/Vulkan SDK)")
+  let budget = max(2, min(8, countProcessors()))
+  type PendingJob = tuple[name, source, srcPath, spvPath: string, running: Process]
+  var pending: seq[PendingJob]
+  proc drain() =
+    for job in pending.mitems:
+      let code = job.running.waitForExit()
+      job.running.close()
+      if code == 0:
+        gJitSpvPaths[job.name] = (job.source, job.spvPath)
+      elif getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
+        stderr.writeLine "[vulkan_jit] prewarm failed kernel=" & job.name &
+          " exit=" & $code & " (retried on first dispatch)"
+    pending.setLen(0)
+  var spawned = 0
+  for job in jobs:
+    if job.name.len == 0 or job.source.len == 0: continue
+    let (srcPath, spvPath) = vulkanJitShaderPaths(job.name, job.source)
+    if fileExists(spvPath):
+      gJitSpvPaths[job.name] = (job.source, spvPath)
+      continue
+    if job.name in gJitSpvPaths and gJitSpvPaths[job.name].source == job.source:
+      continue
+    writeFile(srcPath, job.source)
+    var args = @["-fshader-stage=compute"]
+    if job.source.contains("GL_KHR_cooperative_matrix"):
+      args.add "--target-env=vulkan1.3"
+    args.add srcPath
+    args.add "-o"
+    args.add spvPath
+    try:
+      # poParentStreams keeps the child off our pipes: a failed compile can
+      # print freely without blocking a background prewarm.
+      pending.add((job.name, job.source, srcPath, spvPath,
+        startProcess(compiler, args = args, options = {poUsePath, poParentStreams})))
+    except OSError:
+      continue
+    inc spawned
+    if pending.len >= budget: drain()
+  drain()
+  if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0" and spawned > 0:
+    stderr.writeLine "[vulkan_jit] prewarm compiled " & $spawned &
+      " shader(s), concurrency " & $budget
+
 proc compileVulkanJitShader(kernelName, source: string): string =
   ## Runtime GLSL -> SPIR-V compile, cached by complete source hash. glslc is
   ## the Vulkan analogue of Metal's newLibraryWithSource JIT path.
@@ -1434,12 +1548,7 @@ proc compileVulkanJitShader(kernelName, source: string): string =
   if compiler.len == 0:
     raise newException(CatchableError,
       "Vulkan JIT needs glslc on PATH (install shaderc/Vulkan SDK)")
-  let sourceKey = toHex(cast[uint64](hash(source)), 16) & "_" & $source.len
-  let dir = getTempDir() / "nimformers-vulkan-jit"
-  createDir(dir)
-  let stem = kernelName & "_" & sourceKey
-  let srcPath = dir / (stem & ".comp")
-  let spvPath = dir / (stem & ".spv")
+  let (srcPath, spvPath) = vulkanJitShaderPaths(kernelName, source)
   if fileExists(spvPath):
     # cache hit - silent
     discard
@@ -1489,7 +1598,8 @@ proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
                          M, K, N, weightFormat: int; groupSize = 0;
                          groupsPerRow = 0): bool =
   ## Inference GEMM only. GEMV keeps its bandwidth-oriented scalar kernel.
-  if not gCoopEnabled or not gSessionActive or M < 8 or K < 64 or N < 16: return false
+  if not gCoopEnabled or not gDeviceCaps.cooperativeMatrix or not gSessionActive or
+      M < 8 or K < 64 or N < 16: return false
   if a.buf == nil or w.buf == nil or c.buf == nil: return false
   if a.sizeBytes < uint64(M) * uint64(K) * 4 or c.sizeBytes < uint64(M) * uint64(N) * 4:
     return false
@@ -1518,9 +1628,42 @@ proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
     uint32((N + 15) div 16), uint32((M + 15) div 16), 1,
     gDeviceCaps.subgroupSize, spv)
 
+proc tryFp4KmFp8Cooperative(a, w, c, lut: VulkanBufferHandle;
+                            M, K, N: int): bool =
+  ## Packed FP4-KM -> E4M3 is converted only for the current 16x16 MMA tile.
+  ## No full-size dequantized weight buffer is created.
+  if not gFp8CoopEnabled or not gSessionActive or M < 8 or K < 64 or N < 16:
+    return false
+  if a.buf == nil or w.buf == nil or c.buf == nil or lut.buf == nil: return false
+  if K mod 32 != 0 or w.sizeBytes < uint64(N * (K div 2) + N * (K div 32)) or
+      a.sizeBytes < uint64(M * K * 4) or c.sizeBytes < uint64(M * N * 4) or
+      lut.sizeBytes < 272'u64 * 4: return false
+  const source = staticRead("kernels/matmul_fp4km_fp8.glsl")
+  const kernelName = "coop_matmul_fp4km_fp8_e4m3"
+  var spv: string
+  try:
+    spv = compileVulkanJitShader(kernelName, source)
+  except CatchableError as e:
+    gFp8CoopEnabled = false
+    stderr.writeLine "[vulkan] FP8 cooperative shader unavailable; use FP16/packed fallback: " & e.msg
+    return false
+  var pc = [uint32(M), uint32(K), uint32(N), 0'u32, 0'u32]
+  result = dispatchGeneric(kernelName, [a, w, c, lut, lut], addr pc[0], 20,
+    uint32((N + 15) div 16), uint32((M + 15) div 16), 1,
+    gDeviceCaps.subgroupSize, spv)
+
 proc vulkanSessionFp4GemmEnc*(a, w, lut: VulkanBufferHandle;
                               c: var VulkanBufferHandle; M, K, N: int): bool =
-  tryCooperativeMatmul(a, w, c, lut, lut, M, K, N, 1)
+  if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
+  if tryFp4KmFp8Cooperative(a, w, c, lut, M, K, N):
+    if not gFp8Fp4Logged:
+      stderr.writeLine "[vulkan] FP4-KM prefill route=E4M3 FP8 tile decode + FP32 accumulation"
+      gFp8Fp4Logged = true
+    return true
+  result = tryCooperativeMatmul(a, w, c, lut, lut, M, K, N, 1)
+  if result and not gFp16Fp4Logged:
+    stderr.writeLine "[vulkan] FP4-KM prefill route=FP16 tile decode + FP32 accumulation"
+    gFp16Fp4Logged = true
 
 proc vulkanSessionMatmulNTAcceleratedEnc*(a, w: VulkanBufferHandle;
     c: var VulkanBufferHandle; M, K, N: int): bool =

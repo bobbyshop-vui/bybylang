@@ -89,11 +89,11 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   let w = p.words[st.pc]
   inc st.pc
   let op = w and 0xFF'u32
-  let a = (w shr 8) and 0xF
-  let b = (w shr 12) and 0xF
-  let c = (w shr 16) and 0xF
+  let a = (w shr 8) and 0x1F
+  let b = (w shr 13) and 0x1F
+  let c = (w shr 18) and 0x1F
   if op >= OP_U_TGID and op <= OP_U_ATOMIC_ADD: st.usesU = true
-  if op == OP_U_LOAD_IN: st.usesIn = true
+  if op == OP_U_LOAD_IN or op == OP_U_LOAD_IN4: st.usesIn = true
   case op
   of OP_NOP:
     discard
@@ -129,7 +129,7 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   of OP_MUL:
     st.body.add st.ind() & &"R[{a}] = R[{b}] * R[{c}];"
   of OP_FMA:
-    let rc = st.imm(p) and 0xF
+    let rc = st.imm(p) and 0x1F
     st.body.add st.ind() & &"R[{a}] = fma(R[{b}], R[{c}], R[{rc}]);"
   of OP_LUT_U8:
     if st.glsl:
@@ -267,6 +267,14 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   of OP_U_LOAD_IN:
     let k = st.imm(p)
     st.body.add st.ind() & &"R[{a}] = inF32[U[{b}] + {k}u];"
+  of OP_U_LOAD_IN4:
+    let k = st.imm(p)
+    if st.glsl:
+      st.body.add st.ind() & &"{{ vec4 v4 = vec4(inF32[U[{b}] + {k}u], inF32[U[{b}] + {k}u + 1u], inF32[U[{b}] + {k}u + 2u], inF32[U[{b}] + {k}u + 3u]);" &
+        &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
+    else:
+      st.body.add st.ind() & &"{{ float4 v4 = *(device const float4*)(inF32 + U[{b}] + {k}u);" &
+        &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
   of OP_U_STORE_F32:
     let k = st.imm(p)
     st.body.add st.ind() & &"memF32[U[{b}] + {k}u] = R[{a}];"
@@ -360,8 +368,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & "    const uint lid = gLid & 31u;"
       st.body.add st.ind() & "    const uint tid = tgid * 32u + lid;"
       st.body.add st.ind() & &"    threadgroup float* tgF32 = tgF32_ + vSub * {prm}u;"
-      st.body.add st.ind() & "    float R[16]; for (int i=0;i<16;++i) R[i]=0.f; R[0] = (float)tid;"
-      st.body.add st.ind() & "    uint U[16]; for (int i=0;i<16;++i) U[i]=0u;"
+      st.body.add st.ind() & "    float R[32]; for (int i=0;i<32;++i) R[i]=0.f; R[0] = (float)tid;"
+      st.body.add st.ind() & "    uint U[32]; for (int i=0;i<32;++i) U[i]=0u;"
       st.indent += 2
     else:
       st.body.add st.ind() & &"for (uint vIt = gTgid; vIt < {nVirt}u; vIt += gNtg) {{"
@@ -370,8 +378,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & "  const uint tid = vIt * gTgs + gLid;"
       st.body.add st.ind() & "  const bool vact = true;"
       st.body.add st.ind() & "  threadgroup float* tgF32 = tgF32_;"
-      st.body.add st.ind() & "  float R[16]; for (int i=0;i<16;++i) R[i]=0.f; R[0] = (float)tid;"
-      st.body.add st.ind() & "  uint U[16]; for (int i=0;i<16;++i) U[i]=0u;"
+      st.body.add st.ind() & "  float R[32]; for (int i=0;i<32;++i) R[i]=0.f; R[0] = (float)tid;"
+      st.body.add st.ind() & "  uint U[32]; for (int i=0;i<32;++i) U[i]=0u;"
       st.indent += 1
       if a == 2:
         # mode guard: chi chay than lenh neu tid < NT (than KHONG duoc chua barrier_tg)
@@ -425,11 +433,11 @@ proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
                 "  const uint gLid = lid, gTgid = tgid, gNtg = ntg, gTgs = tgs;",
                 "  uint gbEpoch = 0u;",
                 "  const bool vact = true;",
-                "  float R[16];",
-                "  for (int i=0;i<16;++i) R[i]=0.f;",
+                "  float R[32];",
+                "  for (int i=0;i<32;++i) R[i]=0.f;",
                 "  R[0] = (float)tid;",
-                "  uint U[16];",
-                "  for (int i=0;i<16;++i) U[i]=0u;"]
+                "  uint U[32];",
+                "  for (int i=0;i<32;++i) U[i]=0u;"]
     return """
 #include <metal_stdlib>
 using namespace metal;
@@ -453,10 +461,10 @@ kernel void """ & kernelName & """(
   # Khai báo U[]/inF32 chỉ khi program THẬT SỰ dùng (cờ đặt ngay lúc giải mã,
   # nên không cần pre-scan riêng) -> kernel cũ không đổi một ký tự.
   let uDecl = if st.usesU:
-      @["  uint U[16];", "  for (int i=0;i<16;++i) U[i]=0u;"]
+      @["  uint U[32];", "  for (int i=0;i<32;++i) U[i]=0u;"]
     else: newSeq[string]()
-  let lines = @["  float R[16];",
-                "  for (int i=0;i<16;++i) R[i]=0.f;",
+  let lines = @["  float R[32];",
+                "  for (int i=0;i<32;++i) R[i]=0.f;",
                 "  R[0] = (float)tid;"] & uDecl & st.body
   result = """
 #include <metal_stdlib>
@@ -485,13 +493,13 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
   st.closeBlocks()
   let uDecl = if st.usesU:
       @[
-        "  uint U[16];",
-        "  for (int i=0; i<16; ++i) U[i]=0u;"
+        "  uint U[32];",
+        "  for (int i=0; i<32; ++i) U[i]=0u;"
       ]
     else: newSeq[string]()
   let lines = @[
-    "  float R[16];",
-    "  for (int i=0; i<16; ++i) R[i]=0.0;",
+    "  float R[32];",
+    "  for (int i=0; i<32; ++i) R[i]=0.0;",
     "  R[0] = float(tid);"
   ] & uDecl & st.body
   result = "// Vulkan micro-VM JIT: " & kernelName & "\n" & """
@@ -520,6 +528,17 @@ void main() {
 """ & lines.join("\n") & "\n}\n"
   result = result.replace("as_type<float>(", "uintBitsToFloat(")
   result = result.replace("rsqrt(", "inversesqrt(")
+
+var gGlslByKernel = initTable[string, string]()
+
+proc lowerBytecodeToGlslCached*(p: VmProgram; kernelName: string): string =
+  ## Lowering is a pure function of (bytecode, kernel name) and costs
+  ## milliseconds for the scan/conv programs (thousands of emitted lines).
+  ## Inference encodes the same program on every layer, so cache by kernel
+  ## name: that name already embeds a hash of the program words.
+  if kernelName in gGlslByKernel: return gGlslByKernel[kernelName]
+  result = lowerBytecodeToGlsl(p, kernelName)
+  gGlslByKernel[kernelName] = result
 
 # ── Key program: hash chạy bằng MICRO-KERNEL trên GPU ────────
 ## Trước đây: `for w in p.words: h = h !& hash(w)` trên CPU. Giờ: 1 program
