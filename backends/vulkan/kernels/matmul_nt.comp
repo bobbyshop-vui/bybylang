@@ -9,7 +9,9 @@ layout(local_size_x = TILE, local_size_y = TILE) in;
 layout(std430, binding = 0) readonly buffer BufA { float a[]; };  // [M,K]
 layout(std430, binding = 1) readonly buffer BufB { float b[]; };  // [N,K] (KHONG phai [K,N])
 layout(std430, binding = 2) writeonly buffer BufC { float c[]; }; // [M,N]
-layout(push_constant) uniform PC { int M; int K; int N; } pc;
+// bOff: element offset of B inside its buffer (a weight wrapped in place
+// inside a model mmap starts after the page boundary).
+layout(push_constant) uniform PC { int M; int K; int N; int bOff; } pc;
 
 shared float tileA[TILE][TILE];
 shared float tileB[TILE][TILE];
@@ -27,7 +29,7 @@ void main() {
         int bCol = t * TILE + int(ty);   // chi so K cho B (B la [N,K] nen K la cot)
         tileA[ty][tx] = (row < uint(pc.M) && aCol < pc.K) ? a[row * uint(pc.K) + uint(aCol)] : 0.0;
         // B[N,K]: hang = col (chi so N), cot = bCol (chi so K)
-        tileB[ty][tx] = (col < uint(pc.N) && bCol < pc.K) ? b[col * uint(pc.K) + uint(bCol)] : 0.0;
+        tileB[ty][tx] = (col < uint(pc.N) && bCol < pc.K) ? b[uint(pc.bOff) + col * uint(pc.K) + uint(bCol)] : 0.0;
         barrier();
         for (int kk = 0; kk < TILE; ++kk) {
             // tileA[ty][kk] = A[row, t*TILE+kk] ; tileB[kk][tx] = B[col, t*TILE+kk]

@@ -7,7 +7,9 @@ layout(std430, binding = 1) readonly buffer Weight { uint w[]; };
 layout(std430, binding = 2) readonly buffer Scale { float scales[]; };
 layout(std430, binding = 3) readonly buffer Zero { float zeros[]; };
 layout(std430, binding = 4) writeonly buffer Output { float outData[]; };
-layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow; } p;
+// wqOff: byte position of the packed weights inside w; a weight wrapped in
+// place inside an unaligned model mmap need not start on a word.
+layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow, wqOff; } p;
 shared float partial[OUT_ROWS * BATCH_ROWS * WG_SIZE];
 
 void main() {
@@ -21,7 +23,12 @@ void main() {
         for (uint r = 0; r < OUT_ROWS; ++r) {
             uint n = n0 + r;
             if (n >= p.N) continue;
-            uint packed = w[(n * (p.K / 2) + k / 2) / 4];
+            // Rows hold K/2 bytes (a multiple of 4): every word shares the
+            // same 0-3 byte shift.
+            uint byteIdx = p.wqOff + n * (p.K / 2) + k / 2;
+            uint shift = 8 * (byteIdx & 3);
+            uint packed = shift == 0 ? w[byteIdx >> 2] :
+                (w[byteIdx >> 2] >> shift) | (w[(byteIdx >> 2) + 1] << (32 - shift));
             uint g = n * p.groupsPerRow + group;
             float scale = scales[g], zero = zeros[g];
             for (uint t = 0; t < 8; ++t) {

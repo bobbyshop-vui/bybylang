@@ -829,6 +829,30 @@ MetalBufferHandle metal_upload_borrowed(const float* data, int n) {
     }
 }
 
+MetalBufferHandle metal_wrap_host_nocopy(const void* data, size_t bytes) {
+    @autoreleasepool {
+        if (!gDevice || !data || bytes == 0) return NULL;
+        // Intel iGPUs report isLowPower; Apple Silicon reports unified memory.
+        // A discrete GPU would read these weights over PCIe on every token.
+        NSString *name = gDevice.name ?: @"";
+        BOOL discreteName = [name containsString:@"AMD"] || [name containsString:@"Radeon"] ||
+                            [name containsString:@"NVIDIA"];
+        BOOL shared = (gDevice.hasUnifiedMemory || gDevice.isLowPower) && !discreteName &&
+                      !gDevice.isRemovable;
+        const size_t page = (size_t)getpagesize();
+        const size_t length = (bytes + page - 1) / page * page;
+        if (!shared || page == 0 || (uintptr_t)data % page != 0 ||
+            length > gDevice.maxBufferLength) {
+            return NULL;
+        }
+        id<MTLBuffer> buf = [gDevice newBufferWithBytesNoCopy:(void *)data
+                                                       length:length
+                                                      options:MTLResourceStorageModeShared
+                                                  deallocator:nil];
+        return buf ? (__bridge_retained MetalBufferHandle)buf : NULL;
+    }
+}
+
 MetalBufferHandle metal_upload_indices(const int* data, int n) {
     @autoreleasepool {
         if (!gDevice) { NSLog(@"[metal_upload_indices] gDevice chua init - phai goi metal_init() truoc"); return NULL; }
@@ -1022,6 +1046,11 @@ int metal_matmul_mps_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBuffe
 }
 
 int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n) {
+    return metal_matmul_nt_off_enc(a, b, 0, c, m, k, n);
+}
+
+int metal_matmul_nt_off_enc(MetalBufferHandle a, MetalBufferHandle b, int bOffsetBytes,
+                            MetalBufferHandle c, int m, int k, int n) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_nt_enc] chua goi metal_session_begin"); return 0; }
         // Dung co dinh tile=8 (matmul_nt_kernel), giong het lua chon on dinh
@@ -1034,7 +1063,7 @@ int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHan
         id<MTLBuffer> bufC = (__bridge id<MTLBuffer>)c;
         [gSessionEncoder setComputePipelineState:pipeline];
         [gSessionEncoder setBuffer:bufA offset:0 atIndex:0];
-        [gSessionEncoder setBuffer:bufB offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:bufB offset:(NSUInteger)bOffsetBytes atIndex:1];
         [gSessionEncoder setBuffer:bufC offset:0 atIndex:2];
         [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:3];
         [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:4];
@@ -1128,10 +1157,10 @@ MetalBufferHandle metal_upload_bytes_private(const unsigned char* data, int n) {
 
 int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                          MetalBufferHandle zeros, MetalBufferHandle c,
-                         int m, int k, int n, int groupSize, int nGroupsPerRow) {
+                         int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_q4_enc] chua goi metal_session_begin"); return 0; }
-        if (q4EncodeSelected(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow)) return 1;
+        if (q4EncodeSelected(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
         id<MTLComputePipelineState> pipeline = getPipeline(MMQ4_KERNEL_NAME_ACTIVE);
         if (!pipeline) return 0;
         id<MTLBuffer> bufA = (__bridge id<MTLBuffer>)a;
@@ -1141,7 +1170,8 @@ int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHa
         id<MTLBuffer> bufC = (__bridge id<MTLBuffer>)c;
         [gSessionEncoder setComputePipelineState:pipeline];
         [gSessionEncoder setBuffer:bufA offset:0 atIndex:0];
-        [gSessionEncoder setBuffer:bufWq offset:0 atIndex:1];
+        // uchar reads: any byte offset is a valid binding offset.
+        [gSessionEncoder setBuffer:bufWq offset:(NSUInteger)wqOffset atIndex:1];
         [gSessionEncoder setBuffer:bufScales offset:0 atIndex:2];
         [gSessionEncoder setBuffer:bufZeros offset:0 atIndex:3];
         [gSessionEncoder setBuffer:bufC offset:0 atIndex:4];
@@ -1178,10 +1208,10 @@ int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHa
 // cho MBLOCK thay vì = M trực tiếp). Xem matmul_q4_batched.metal.
 int metal_matmul_q4_batched_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                                  MetalBufferHandle zeros, MetalBufferHandle c,
-                                 int m, int k, int n, int groupSize, int nGroupsPerRow) {
+                                 int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_q4_batched_enc] chua goi metal_session_begin"); return 0; }
-        if (q4EncodeSelected(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow)) return 1;
+        if (q4EncodeSelected(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
         id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_q4_batched_m4_kernel");
         if (!pipeline) return 0;
         id<MTLBuffer> bufA = (__bridge id<MTLBuffer>)a;
@@ -1191,7 +1221,8 @@ int metal_matmul_q4_batched_enc(MetalBufferHandle a, MetalBufferHandle wq, Metal
         id<MTLBuffer> bufC = (__bridge id<MTLBuffer>)c;
         [gSessionEncoder setComputePipelineState:pipeline];
         [gSessionEncoder setBuffer:bufA offset:0 atIndex:0];
-        [gSessionEncoder setBuffer:bufWq offset:0 atIndex:1];
+        // uchar reads: any byte offset is a valid binding offset.
+        [gSessionEncoder setBuffer:bufWq offset:(NSUInteger)wqOffset atIndex:1];
         [gSessionEncoder setBuffer:bufScales offset:0 atIndex:2];
         [gSessionEncoder setBuffer:bufZeros offset:0 atIndex:3];
         [gSessionEncoder setBuffer:bufC offset:0 atIndex:4];

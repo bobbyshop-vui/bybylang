@@ -49,12 +49,15 @@ static BBQ4Plan *q4MakePlan(NSUInteger tg, NSUInteger rows, NSUInteger batch) {
 
 static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w,
         MetalBufferHandle scale, MetalBufferHandle zero, MetalBufferHandle out,
-        int m, int k, int n, int group, int groups) {
+        int m, int k, int n, int group, int groups, int wqOffset) {
     if (!gSessionEncoder || !plan || plan.legacy) return 0;
+    // The kernel loads aligned words: bind at the word below wqOffset and
+    // let it shift the remaining 0-3 bytes in.
+    uint32_t wqShift = (uint32_t)(wqOffset & 3);
     [gSessionEncoder setComputePipelineState:plan.pipeline];
     [gSessionEncoder setThreadgroupMemoryLength:plan.threads * plan.rows * plan.batch * sizeof(float) atIndex:0];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
-    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)w offset:0 atIndex:1];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)w offset:(NSUInteger)(wqOffset & ~3) atIndex:1];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)scale offset:0 atIndex:2];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)zero offset:0 atIndex:3];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:4];
@@ -63,6 +66,7 @@ static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w
     [gSessionEncoder setBytes:&n length:4 atIndex:7];
     [gSessionEncoder setBytes:&group length:4 atIndex:8];
     [gSessionEncoder setBytes:&groups length:4 atIndex:9];
+    [gSessionEncoder setBytes:&wqShift length:4 atIndex:10];
     [gSessionEncoder dispatchThreadgroups:MTLSizeMake((n + plan.rows - 1) / plan.rows,
         (m + plan.batch - 1) / plan.batch, 1)
         threadsPerThreadgroup:MTLSizeMake(plan.threads, 1, 1)];
@@ -72,24 +76,24 @@ static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w
 
 static int q4EncodeSelected(MetalBufferHandle a, MetalBufferHandle w,
         MetalBufferHandle scale, MetalBufferHandle zero, MetalBufferHandle out,
-        int m, int k, int n, int group, int groups) {
+        int m, int k, int n, int group, int groups, int wqOffset) {
     if (gQ4Tuning || !q4TunedEnabled()) return 0;
     BBQ4Plan *plan = gQ4Plans[q4PlanKey(k, n, group, groups, m)];
-    return q4EncodePlan(plan, a, w, scale, zero, out, m, k, n, group, groups);
+    return q4EncodePlan(plan, a, w, scale, zero, out, m, k, n, group, groups, wqOffset);
 }
 
 int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
-        MetalBufferHandle zero, int k, int n, int group, int groups, int mode) {
+        MetalBufferHandle zero, int k, int n, int group, int groups, int mode, int wqOffset) {
     @autoreleasepool {
         const char *autoTune = getenv("BYBY_GPU_AUTOTUNE");
         if (!q4TunedEnabled() || (autoTune && strcmp(autoTune, "0") == 0)) return 0;
         if (!gDevice || !gLibrary || gSessionCmdBuf || k <= 0 || k % 8 || n <= 0 ||
-            group < 0 || (group > 0 && group % 8) || groups <= 0 ||
+            group < 0 || (group > 0 && group % 8) || groups <= 0 || wqOffset < 0 ||
             groups < (group > 0 ? (k + group - 1) / group : 1)) return 0;
         id<MTLBuffer> weight = (__bridge id<MTLBuffer>)w;
         id<MTLBuffer> scales = (__bridge id<MTLBuffer>)scale;
         id<MTLBuffer> zeros = (__bridge id<MTLBuffer>)zero;
-        if (weight.length < (NSUInteger)n * (k / 2) ||
+        if (weight.length < (NSUInteger)wqOffset + (NSUInteger)n * (k / 2) ||
             scales.length < (NSUInteger)n * groups * 4 ||
             zeros.length < (NSUInteger)n * groups * 4) return 0;
         if (!gQ4Plans) gQ4Plans = [NSMutableDictionary new];
@@ -123,9 +127,9 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
                 const double start = [NSProcessInfo processInfo].systemUptime;
                 if (!metal_session_begin(NULL, NULL)) return INFINITY;
                 int encoded = p.legacy ? (m == 1 ?
-                    metal_matmul_q4_enc(hIn, w, scale, zero, hOut, m, k, n, group, groups) :
-                    metal_matmul_q4_batched_enc(hIn, w, scale, zero, hOut, m, k, n, group, groups)) :
-                    q4EncodePlan(p, hIn, w, scale, zero, hOut, m, k, n, group, groups);
+                    metal_matmul_q4_enc(hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset) :
+                    metal_matmul_q4_batched_enc(hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset)) :
+                    q4EncodePlan(p, hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset);
                 int ended = metal_session_end();
                 return encoded && ended ? ([NSProcessInfo processInfo].systemUptime - start) * 1000 : INFINITY;
             };

@@ -51,6 +51,7 @@ layout(push_constant) uniform PushConsts {
     int N;
     int groupSize;
     int nGroupsPerRow;
+    int wqOff;          // byte position of the packed weights inside wq
 } pc;
 
 // shared memory cho tree reduction - NDST nho (2) -> mang nay gio RAT nho
@@ -74,7 +75,7 @@ void main() {
     float partial[MMQ4_NDST];
     for (int rr = 0; rr < MMQ4_NDST; ++rr) {
         int n = n0 + rr;
-        rowByteOff[rr] = n * bytesPerRow;
+        rowByteOff[rr] = pc.wqOff + n * bytesPerRow;
         rowGroupOff[rr] = n * pc.nGroupsPerRow;
         partial[rr] = 0.0;
     }

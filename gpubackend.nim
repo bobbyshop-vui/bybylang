@@ -1216,8 +1216,11 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
   else:
     return false
 
-proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool =
+proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int;
+                      bOffsetElems = 0): bool =
   ## Encode matmul-NT vào session: C(M x N) = A(M x K) @ B(N x K)^T.
+  ## bOffsetElems: B starts that many floats into its buffer (a weight
+  ## wrapped in place by sessionWrapHostRange).
   ## B GIỮ NGUYÊN layout gốc [N,K] (vd K-cache/V-cache [S,D] tự nhiên) -
   ## KHÔNG cần transpose CPU trước khi upload/gọi hàm này. Dùng cho attention
   ## decode để loại bỏ hoàn toàn chi phí transpose O(S*D)/token trước đây.
@@ -1234,7 +1237,8 @@ proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHa
       # buffer trước khi dùng làm output trên Metal.
       if c.metalHandle == nil:
         c.metalHandle = metalSessionAllocScratch(M * N)
-      return metalSessionMatmulNTEnc(a.metalHandle, b.metalHandle, c.metalHandle, M, K, N)
+      return metalSessionMatmulNTEnc(a.metalHandle, b.metalHandle, c.metalHandle, M, K, N,
+        bOffsetElems * sizeof(float32))
     else:
       return false
   of gbCuda:
@@ -1243,8 +1247,10 @@ proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHa
   of gbVulkan:
     if c.vulkanHandle.buf == nil:
       c.vulkanHandle = vulkanSessionAllocScratch(M * N)
-    return vulkanSessionMatmulNTEnc(a.vulkanHandle, b.vulkanHandle, c.vulkanHandle, M, K, N)
+    return vulkanSessionMatmulNTEnc(a.vulkanHandle, b.vulkanHandle, c.vulkanHandle, M, K, N,
+      bOffsetElems)
   of gbCpu:
+    if bOffsetElems != 0: return false
     c.cpuData = cpu.matmulNT(cpuTake(a, M * K), cpuTake(b, N * K), M, K, N)
     return true
   else:
@@ -2318,6 +2324,7 @@ type
   ResidentWeightHandle* = object
     kind*: GpuBackend
     k*, n*, groupSize*, nGroupsPerRow*: int
+    wqOffset*: int                  ## byte position of the packed weights in metalWq/vulkanWq
     metalWq*, metalScales*, metalZeros*: MetalBufferHandle
     vulkanWq*, vulkanScales*, vulkanZeros*: VulkanBufferHandle
     ## CUDA fields kept as stubs for binary/layout compatibility only.
@@ -2331,10 +2338,10 @@ proc residentPrepareQ4*(w: ResidentWeightHandle; M = 1): bool =
   if w.kind == gbMetal:
     when defined(macosx):
       return metalPrepareQ4Tuned(w.metalWq, w.metalScales, w.metalZeros,
-        w.k, w.n, w.groupSize, w.nGroupsPerRow, M)
+        w.k, w.n, w.groupSize, w.nGroupsPerRow, M, w.wqOffset)
   if w.kind == gbVulkan:
     return vulkanPrepareQ4Tuned(w.vulkanWq, w.vulkanScales, w.vulkanZeros,
-      w.k, w.n, w.groupSize, w.nGroupsPerRow, M)
+      w.k, w.n, w.groupSize, w.nGroupsPerRow, M, w.wqOffset)
   false
 
 proc residentUploadQ4*(backend: GpuBackend, wq: seq[uint8], scales, zeros: seq[float32],
@@ -2390,6 +2397,77 @@ proc residentUploadQ4*(backend: GpuBackend, wq: seq[uint8], scales, zeros: seq[f
         wT[c * n + row] = lut[int(nibble)]
     result.fallbackFp32 = sessionUpload(chosen, wT)
 
+proc sessionWrapHostRange*(backend: GpuBackend; data: pointer; bytes: int): tuple[h: SessionHandle, offset: int] =
+  ## Read-only GPU buffer over long-lived host memory (a model mmap) without
+  ## copying, on GPUs that share system memory. `data` may sit anywhere in
+  ## the mapping: the buffer starts at the enclosing page and `offset` is the
+  ## byte position of `data` inside it, for kernels that take an offset. The
+  ## handle is empty (nil metal/vulkan buffer) when wrapping is not possible;
+  ## see sessionUploadPrivatePtr.
+  result.h.kind = normalizeBackend(backend)
+  case result.h.kind
+  of gbMetal:
+    when defined(macosx):
+      let r = metalWrapHostRange(data, bytes)
+      result.h.metalHandle = r.buf
+      result.offset = r.offset
+  of gbVulkan:
+    let r = vulkanImportHostRange(data, bytes)
+    result.h.vulkanHandle = r.h
+    result.offset = r.offset
+  else: discard
+
+proc sessionUploadPrivatePtr*(backend: GpuBackend; data: pointer; bytes: int): SessionHandle =
+  ## GPU-only copy straight from host memory (VRAM on a dGPU), without an
+  ## intermediate Nim seq.
+  result.kind = normalizeBackend(backend)
+  case result.kind
+  of gbMetal:
+    when defined(macosx): result.metalHandle = metalUploadBytesPrivatePtr(data, bytes)
+  of gbVulkan:
+    result.vulkanHandle = vulkanSessionUploadBytesPrivate(
+      toOpenArray(cast[ptr UncheckedArray[uint8]](data), 0, bytes - 1))
+  else: discard
+
+proc residentUploadQ4Mapped*(backend: GpuBackend; wq: pointer; wqBytes: int;
+                             scales, zeros: openArray[float32];
+                             k, n, groupSize, nGroupsPerRow: int): tuple[w: ResidentWeightHandle, zeroCopy: bool] =
+  ## residentUploadQ4 for packed weights that live in a model mmap. On GPUs
+  ## that share system memory (Apple Silicon, Intel iGPU) the GPU buffer wraps
+  ## the pages holding wq in place, at any offset (w.wqOffset); otherwise wq
+  ## is copied straight from the mapping (into VRAM on a dGPU), never through
+  ## an intermediate Nim seq. The caller keeps the mapping alive until
+  ## residentFreeQ4. Scales/zeros are small and always copied.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  var w: ResidentWeightHandle
+  w.kind = chosen
+  w.k = k; w.n = n
+  w.groupSize = groupSize; w.nGroupsPerRow = nGroupsPerRow
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      (w.metalWq, w.wqOffset) = metalWrapHostRange(wq, wqBytes)
+      result.zeroCopy = w.metalWq != nil
+      if w.metalWq == nil: w.metalWq = metalUploadBytesPrivatePtr(wq, wqBytes)
+      w.metalScales = metalUploadPrivate(scales)
+      w.metalZeros = metalUploadPrivate(zeros)
+  of gbVulkan:
+    (w.vulkanWq, w.wqOffset) = vulkanImportHostRange(wq, wqBytes)
+    result.zeroCopy = w.vulkanWq.buf != nil
+    if w.vulkanWq.buf == nil:
+      w.vulkanWq = vulkanSessionUploadBytesPrivate(
+        toOpenArray(cast[ptr UncheckedArray[uint8]](wq), 0, wqBytes - 1))
+    w.vulkanScales = vulkanSessionUploadPrivate(scales)
+    w.vulkanZeros = vulkanSessionUploadPrivate(zeros)
+  else:
+    var bytes = newSeq[uint8](wqBytes)
+    if wqBytes > 0: copyMem(addr bytes[0], wq, wqBytes)
+    result.w = residentUploadQ4(chosen, bytes, @scales, @zeros, k, n, groupSize, nGroupsPerRow)
+    return
+  result.w = w
+
 proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHandle,
                        c: var SessionHandle, M: int): bool =
   ## Encode matmul C(M x N) = A(M x K) @ Wq(K x N) vào session đang mở, dùng
@@ -2426,18 +2504,21 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
       # fallback về đúng kernel cũ, không có đường nào bị cụt.
       if M > 1:
         if metalSessionMatmulQ4BatchedEnc(a.metalHandle, w.metalWq, w.metalScales, w.metalZeros,
-                                           c.metalHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow):
+                                           c.metalHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow,
+                                           w.wqOffset):
           return true
         # fallback: rơi xuống dùng kernel cũ bên dưới (không return ở đây)
       return metalSessionMatmulQ4Enc(a.metalHandle, w.metalWq, w.metalScales, w.metalZeros,
-                                      c.metalHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow)
+                                      c.metalHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow,
+                                      w.wqOffset)
     else:
       return false
   of gbVulkan:
     if c.vulkanHandle.buf == nil:
       c.vulkanHandle = vulkanSessionAllocScratch(M * w.n)
     return vulkanSessionMatmulQ4Enc(a.vulkanHandle, w.vulkanWq, w.vulkanScales, w.vulkanZeros,
-                                     c.vulkanHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow)
+                                     c.vulkanHandle, M, w.k, w.n, w.groupSize, w.nGroupsPerRow,
+                                     w.wqOffset)
   of gbCuda:
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")

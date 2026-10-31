@@ -459,6 +459,7 @@ when defined(macosx):
   proc metal_session_begin_c(kernelSrc: cstring, error_out: ptr cstring): cint {.importc: "metal_session_begin", header: "metal_shim.h".}
   proc metal_upload_c(data: ptr float32, n: cint): MetalBufferHandle {.importc: "metal_upload", header: "metal_shim.h".}
   proc metal_upload_borrowed_c(data: ptr float32, n: cint): MetalBufferHandle {.importc: "metal_upload_borrowed", header: "metal_shim.h".}
+  proc metal_wrap_host_nocopy_c(data: pointer, bytes: csize_t): MetalBufferHandle {.importc: "metal_wrap_host_nocopy", header: "metal_shim.h".}
   proc metal_alloc_scratch_c(n: cint): MetalBufferHandle {.importc: "metal_alloc_scratch", header: "metal_shim.h".}
   # THÊM MỚI: xem giải thích đầy đủ trong metal_shim.h/metal_shim.m -
   # MTLHeap để suballocate nhiều buffer cùng vòng đời (KV resident) RẺ
@@ -468,13 +469,14 @@ when defined(macosx):
   proc metal_free_heap_c(heap: pointer) {.importc: "metal_free_heap", header: "metal_shim.h".}
   proc metal_matmul_enc_c(a, b, c: MetalBufferHandle, m, k, n: cint): cint {.importc: "metal_matmul_enc", header: "metal_shim.h".}
   proc metal_matmul_nt_enc_c(a, b, c: MetalBufferHandle, m, k, n: cint): cint {.importc: "metal_matmul_nt_enc", header: "metal_shim.h".}
+  proc metal_matmul_nt_off_enc_c(a, b: MetalBufferHandle, bOffsetBytes: cint, c: MetalBufferHandle, m, k, n: cint): cint {.importc: "metal_matmul_nt_off_enc", header: "metal_shim.h".}
   proc metal_init_c(kernelSrc: cstring): cint {.importc: "metal_init", header: "metal_shim.h".}
   proc metal_upload_bytes_c(data: ptr uint8, n: cint): MetalBufferHandle {.importc: "metal_upload_bytes", header: "metal_shim.h".}
   proc metal_upload_private_c(data: ptr float32, n: cint): MetalBufferHandle {.importc: "metal_upload_private", header: "metal_shim.h".}
   proc metal_upload_bytes_private_c(data: ptr uint8, n: cint): MetalBufferHandle {.importc: "metal_upload_bytes_private", header: "metal_shim.h".}
-  proc metal_matmul_q4_enc_c(a, wq, scales, zeros, c: MetalBufferHandle, m, k, n, groupSize, nGroupsPerRow: cint): cint
+  proc metal_matmul_q4_enc_c(a, wq, scales, zeros, c: MetalBufferHandle, m, k, n, groupSize, nGroupsPerRow, wqOffset: cint): cint
     {.importc: "metal_matmul_q4_enc", header: "metal_shim.h".}
-  proc metal_matmul_q4_batched_enc_c(a, wq, scales, zeros, c: MetalBufferHandle, m, k, n, groupSize, nGroupsPerRow: cint): cint
+  proc metal_matmul_q4_batched_enc_c(a, wq, scales, zeros, c: MetalBufferHandle, m, k, n, groupSize, nGroupsPerRow, wqOffset: cint): cint
     {.importc: "metal_matmul_q4_batched_enc", header: "metal_shim.h".}
   proc metal_copy_into_enc_c(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: cint): cint {.importc: "metal_copy_into_enc", header: "metal_shim.h".}
   proc metal_softmax_enc_c(x, y: MetalBufferHandle, rows, cols: cint): cint {.importc: "metal_softmax_enc", header: "metal_shim.h".}
@@ -590,6 +592,12 @@ when defined(macosx):
     ## transpose CPU truoc). Dung cho attention decode (K/V-cache).
     metal_matmul_nt_enc_c(a, b, c, cint(m), cint(k), cint(n)) != 0
 
+  proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n, bOffsetBytes: int): bool =
+    ## B starts bOffsetBytes (a multiple of 4) into its buffer, e.g. a weight
+    ## wrapped inside a model mmap by metalWrapHostRange.
+    if bOffsetBytes == 0: return metalSessionMatmulNTEnc(a, b, c, m, k, n)
+    metal_matmul_nt_off_enc_c(a, b, cint(bOffsetBytes), c, cint(m), cint(k), cint(n)) != 0
+
   proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle =
     discard metalInit()
     if data.len == 0: return nil
@@ -610,24 +618,49 @@ when defined(macosx):
     var d = data
     metal_upload_bytes_private_c(addr d[0], cint(d.len))
 
+  proc metalUploadBytesPrivatePtr*(data: pointer; bytes: int): MetalBufferHandle =
+    ## metalUploadBytesPrivate straight from caller memory (e.g. a model mmap),
+    ## without first copying it into a Nim seq.
+    discard metalInit()
+    if data == nil or bytes <= 0 or bytes > high(cint): return nil
+    metal_upload_bytes_private_c(cast[ptr uint8](data), cint(bytes))
+
+  proc metalWrapHostNoCopy*(data: pointer; bytes: int): MetalBufferHandle =
+    ## See metal_wrap_host_nocopy: nil means copy with metalUploadBytesPrivatePtr.
+    discard metalInit()
+    if data == nil or bytes <= 0: return nil
+    metal_wrap_host_nocopy_c(data, csize_t(bytes))
+
+  proc getpagesize(): cint {.importc, header: "<unistd.h>".}
+
+  proc metalWrapHostRange*(data: pointer; bytes: int): tuple[buf: MetalBufferHandle, offset: int] =
+    ## metalWrapHostNoCopy for data at any address inside a mapping (a tensor
+    ## in an unaligned .nimq): the buffer starts at the enclosing page and
+    ## `offset` is the byte position of `data` inside it.
+    if data == nil or bytes <= 0: return
+    let offset = int(cast[uint](data) mod uint(getpagesize()))
+    result.buf = metalWrapHostNoCopy(cast[pointer](cast[uint](data) - uint(offset)), offset + bytes)
+    if result.buf != nil: result.offset = offset
+
   proc metalSessionMatmulQ4Enc*(a, wq, scales, zeros, c: MetalBufferHandle,
-                                 m, k, n, groupSize, nGroupsPerRow: int): bool =
+                                 m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool =
+    ## wqOffset: byte position of the packed weights inside wq.
     metal_matmul_q4_enc_c(a, wq, scales, zeros, c,
-      cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow)) != 0
+      cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow), cint(wqOffset)) != 0
 
   proc metal_prepare_q4_tuned_c(w, scales, zeros: MetalBufferHandle;
-      k, n, groupSize, groupsPerRow, m: cint): cint
+      k, n, groupSize, groupsPerRow, m, wqOffset: cint): cint
       {.importc: "metal_prepare_q4_tuned", header: "metal_shim.h".}
   proc metalPrepareQ4Tuned*(w, scales, zeros: MetalBufferHandle;
-      k, n, groupSize, groupsPerRow, m: int): bool =
+      k, n, groupSize, groupsPerRow, m: int; wqOffset = 0): bool =
     metal_prepare_q4_tuned_c(w, scales, zeros, cint(k), cint(n),
-      cint(groupSize), cint(groupsPerRow), cint(m)) != 0
+      cint(groupSize), cint(groupsPerRow), cint(m), cint(wqOffset)) != 0
 
   proc metalSessionMatmulQ4BatchedEnc*(a, wq, scales, zeros, c: MetalBufferHandle,
-                                        m, k, n, groupSize, nGroupsPerRow: int): bool =
+                                        m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool =
     ## THÊM MỚI: chỉ dùng cho M>1 (prefill) - xem matmul_q4_batched.metal.
     metal_matmul_q4_batched_enc_c(a, wq, scales, zeros, c,
-      cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow)) != 0
+      cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow), cint(wqOffset)) != 0
 
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: int): bool =
     metal_copy_into_enc_c(src, dst, cint(srcOffsetElems), cint(dstOffsetElems), cint(n)) != 0
@@ -754,10 +787,14 @@ when not defined(macosx):
   proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle = nil
   proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle = nil
   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle = nil
+  proc metalUploadBytesPrivatePtr*(data: pointer; bytes: int): MetalBufferHandle = nil
+  proc metalWrapHostNoCopy*(data: pointer; bytes: int): MetalBufferHandle = nil
+  proc metalWrapHostRange*(data: pointer; bytes: int): tuple[buf: MetalBufferHandle, offset: int] = discard
+  proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n, bOffsetBytes: int): bool = false
   proc metalSessionMatmulQ4Enc*(a, wq, scales, zeros, c: MetalBufferHandle,
-                                 m, k, n, groupSize, nGroupsPerRow: int): bool = false
+                                 m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool = false
   proc metalSessionMatmulQ4BatchedEnc*(a, wq, scales, zeros, c: MetalBufferHandle,
-                                        m, k, n, groupSize, nGroupsPerRow: int): bool = false
+                                        m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: int): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool = false
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool = false

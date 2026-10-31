@@ -128,6 +128,10 @@ type
     sType: uint32
     pNext: pointer
     supportedStages: uint32
+  VkExternalMemoryHostProperties = object
+    sType: uint32
+    pNext: pointer
+    minImportedHostPointerAlignment: uint64
   VkFeatures2 = object
     sType: uint32
     pNext: pointer
@@ -169,6 +173,7 @@ type
     tileM*, tileN*, tileK*: int
     maxThreads*, maxSharedBytes*: int
     minStorageAlignment*: uint64
+    hostImportAlignment*: uint64   ## 0 without VK_EXT_external_memory_host
 
 const
   Float16Int8Type* = 1000082000'u32
@@ -202,9 +207,13 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
     var coopProps = VkCoopProperties(sType: 1000506002)
     var subgroup = VkSubgroupProperties(sType: 1000094000,
       pNext: (if hasCoop: addr coopProps else: nil))
-    var props = VkPhysicalDeviceProperties2(sType: 1000059001, pNext: addr subgroup)
+    let hasHostImport = "VK_EXT_external_memory_host" in result.extensions
+    var hostProps = VkExternalMemoryHostProperties(sType: 1000178002, pNext: addr subgroup)
+    var props = VkPhysicalDeviceProperties2(sType: 1000059001,
+      pNext: (if hasHostImport: pointer(addr hostProps) else: pointer(addr subgroup)))
     getProps2(device, addr props)
     if (subgroup.supportedStages and 0x20) != 0: result.subgroupSize = int(subgroup.subgroupSize)
+    if hasHostImport: result.hostImportAlignment = hostProps.minImportedHostPointerAlignment
     if hasCoop and (coopProps.supportedStages and 0x20) == 0: return
   let getFeatures2 = cast[proc(d: pointer; p: ptr VkFeatures2) {.cdecl.}](
     resolve(instance, "vkGetPhysicalDeviceFeatures2"))

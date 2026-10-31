@@ -13,21 +13,23 @@ proc q4Key(K, N, group, groups, M: int): string =
   $K & "_" & $N & "_g" & $group & "_" & $groups & "_m" & $(if M == 1: 1 else: 8)
 
 proc q4ReferenceEnc(a, w, scales, zeros, c: VulkanBufferHandle;
-                    M, K, N, group, groups: int): bool =
-  var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups)]
-  dispatchGeneric("matmul_q4", [a, w, scales, zeros, c], addr pc[0], 20,
+                    M, K, N, group, groups, wqOffset: int): bool =
+  var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups), int32(wqOffset)]
+  dispatchGeneric("matmul_q4", [a, w, scales, zeros, c], addr pc[0], 24,
     uint32((N + MMQ4_NDST - 1) div MMQ4_NDST), uint32(M), 1)
 
 proc q4Encode(plan: VkQ4Plan; a, w, scales, zeros, c: VulkanBufferHandle;
-              M, K, N, group, groups: int; countDispatch = false): bool =
+              M, K, N, group, groups, wqOffset: int; countDispatch = false): bool =
   case plan.kind
   of q4Reference:
-    result = q4ReferenceEnc(a, w, scales, zeros, c, M, K, N, group, groups)
+    result = q4ReferenceEnc(a, w, scales, zeros, c, M, K, N, group, groups, wqOffset)
   of q4Cooperative:
-    result = tryCooperativeMatmul(a, w, c, scales, zeros, M, K, N, 2, group, groups)
+    # The cooperative kernel reads weights from the start of the buffer.
+    result = wqOffset == 0 and
+      tryCooperativeMatmul(a, w, c, scales, zeros, M, K, N, 2, group, groups)
   of q4Wide:
-    var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups)]
-    result = dispatchGeneric(plan.name, [a, w, scales, zeros, c], addr pc[0], 20,
+    var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups), int32(wqOffset)]
+    result = dispatchGeneric(plan.name, [a, w, scales, zeros, c], addr pc[0], 24,
       uint32((N + plan.rows - 1) div plan.rows),
       uint32((M + plan.batch - 1) div plan.batch), 1, plan.tg, plan.spv)
     if result and countDispatch: inc gVkQ4WideDispatches
@@ -41,10 +43,10 @@ proc q4Compile(tg, rows, batch: int): VkQ4Plan =
     sourceTemplate.replace("#version 450\n", "")
   result.spv = compileVulkanJitShader(result.name, source)
   # Create the PSO before timing or opening an inference command buffer.
-  discard getOrCreatePipeline(result.name, 5, 20, tg, result.spv)
+  discard getOrCreatePipeline(result.name, 5, 24, tg, result.spv)
 
 proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
-                           K, N, group, groups, mode: int): bool =
+                           K, N, group, groups, mode: int; wqOffset = 0): bool =
   ensureInit()
   if gSessionActive or getEnv("BYBY_Q4_TUNED", "1") == "0" or
      getEnv("BYBY_GPU_AUTOTUNE", "1") == "0" or findExe("glslc").len == 0: return false
@@ -52,7 +54,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
      (group > 0 and group mod 8 != 0) or groups <= 0: return false
   if groups < (if group > 0: (K + group - 1) div group else: 1): return false
   if w.buf == nil or scales.buf == nil or zeros.buf == nil or
-     w.sizeBytes < uint64(N) * uint64(K div 2) or
+     wqOffset < 0 or w.sizeBytes < uint64(wqOffset) + uint64(N) * uint64(K div 2) or
      scales.sizeBytes < uint64(N) * uint64(groups) * 4 or
      zeros.sizeBytes < uint64(N) * uint64(groups) * 4: return false
   let M = if mode == 1: 1 else: 8
@@ -67,7 +69,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
         plans.add q4Compile(tg, rows, batch)
       except CatchableError as e:
         stderr.writeLine "[q4-tune:vulkan] skip candidate: " & e.msg
-  if M > 1 and gCoopEnabled and K >= 64 and N >= 16:
+  if M > 1 and gCoopEnabled and K >= 64 and N >= 16 and wqOffset == 0:
     plans.add VkQ4Plan(kind: q4Cooperative, name: "KHR-cooperative-matrix")
   if plans.len == 1: return false
   var data = newSeq[float32](M * K)
@@ -81,7 +83,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
     if not vulkanSessionBegin(): return (false, 0.0)
     var encoded = false
     try:
-      encoded = q4Encode(plan, input, w, scales, zeros, output, M, K, N, group, groups)
+      encoded = q4Encode(plan, input, w, scales, zeros, output, M, K, N, group, groups, wqOffset)
     except CatchableError as e:
       stderr.writeLine "[q4-tune:vulkan] reject " & plan.name & ": " & e.msg
     if not vulkanSessionEnd():
@@ -133,12 +135,14 @@ proc vulkanQ4TuningStats*(): tuple[preparedPlans, wideDispatches: int] =
   (gVkQ4Plans.len, gVkQ4WideDispatches)
 
 proc vulkanSessionMatmulQ4Enc*(a: VulkanBufferHandle, wq, scales, zeros: VulkanBufferHandle,
-                                c: var VulkanBufferHandle, M, K, N, groupSize, nGroupsPerRow: int): bool =
+                                c: var VulkanBufferHandle, M, K, N, groupSize, nGroupsPerRow: int;
+                                wqOffset = 0): bool =
+  ## wqOffset: byte position of the packed weights inside wq.
   if getEnv("BYBY_Q4_TUNED", "1") != "0":
     let key = q4Key(K, N, groupSize, nGroupsPerRow, M)
     if key in gVkQ4Plans:
       if q4Encode(gVkQ4Plans[key], a, wq, scales, zeros, c,
-          M, K, N, groupSize, nGroupsPerRow, countDispatch = true): return true
-    elif tryCooperativeMatmul(a, wq, c, scales, zeros, M, K, N, 2,
+          M, K, N, groupSize, nGroupsPerRow, wqOffset, countDispatch = true): return true
+    elif wqOffset == 0 and tryCooperativeMatmul(a, wq, c, scales, zeros, M, K, N, 2,
         groupSize, nGroupsPerRow): return true
-  q4ReferenceEnc(a, wq, scales, zeros, c, M, K, N, groupSize, nGroupsPerRow)
+  q4ReferenceEnc(a, wq, scales, zeros, c, M, K, N, groupSize, nGroupsPerRow, wqOffset)

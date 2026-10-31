@@ -403,6 +403,9 @@ var gDeviceCaps: VulkanCaps
 var gCoopEnabled = false
 var gFp8CoopEnabled = false
 var gFp8Fp4Logged = false
+var gHostImportEnabled = false
+var vkGetMemoryHostPointerPropertiesEXT: proc(dev: VkDevice; handleType: uint32;
+  host: pointer; props: pointer): VkResult {.cdecl.}
 var gFp16Fp4Logged = false
 var gDevice: VkDevice
 var gQueue: VkQueue
@@ -588,6 +591,13 @@ proc ensureInit() =
   var devExtNames: seq[cstring]
   if "VK_KHR_portability_subset" in gDeviceCaps.extensions:
     devExtNames.add cstring("VK_KHR_portability_subset")
+  # Zero-copy model mmaps only where the GPU shares system memory (iGPU); a
+  # dGPU would read every weight over PCIe on each token. Added before the
+  # cooperative-matrix extension, which the retry below removes from the end.
+  gHostImportEnabled = gDeviceCaps.hostImportAlignment > 0 and
+    gDeviceCaps.properties.deviceType == 1'u32 and
+    getEnv("BYBY_VULKAN_MMAP_IMPORT", "1") != "0"
+  if gHostImportEnabled: devExtNames.add cstring("VK_EXT_external_memory_host")
   gFp8CoopEnabled = gDeviceCaps.float8E4M3CooperativeMatrix and
     getEnv("BYBY_VULKAN_TENSOR_CORES", "1") != "0" and findExe("glslc").len > 0
   gCoopEnabled = (gDeviceCaps.cooperativeMatrix or gFp8CoopEnabled) and
@@ -628,6 +638,10 @@ proc ensureInit() =
     rDev = lib.vkCreateDevice(gPhysicalDevice, addr devInfo, nil, addr dev)
   gpuCheck(rDev == VK_SUCCESS, "vkCreateDevice failed, VkResult=" & $rDev)
   gDevice = dev
+  if gHostImportEnabled:
+    vkGetMemoryHostPointerPropertiesEXT = cast[typeof(vkGetMemoryHostPointerPropertiesEXT)](
+      lib.vkGetInstanceProcAddr(gInstance, "vkGetMemoryHostPointerPropertiesEXT"))
+    gHostImportEnabled = vkGetMemoryHostPointerPropertiesEXT != nil
   lib.vkGetDeviceQueue(gDevice, gQueueFamilyIndex, 0, addr gQueue)
 
   # ---- 6. Command pool (dùng lại cho mọi lệnh compute sau này, giống
@@ -647,6 +661,7 @@ proc ensureInit() =
     " residentWeights=" & weightMemory &
     " subgroup=" & $gDeviceCaps.subgroupSize & " maxThreads=" & $gDeviceCaps.maxThreads &
     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
+    " mmapImport=" & (if gHostImportEnabled: $gDeviceCaps.hostImportAlignment else: "off") &
     " matrix=" & (if gFp8CoopEnabled: "KHR_cooperative_matrix FP8-E4M3/FP32 + FP16/FP32"
       elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
   stderr.writeLine "[vulkan] Khoi tao xong: instance+device+queue+commandPool san sang (queueFamily=" & $gQueueFamilyIndex & ")"
@@ -929,10 +944,10 @@ proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
   var setLayout: VkDescriptorSetLayout
   gpuCheck(lib.vkCreateDescriptorSetLayout(gDevice, addr setLayoutInfo, nil, addr setLayout) == VK_SUCCESS, "vkCreateDescriptorSetLayout that bai")
 
-  # push constant: 5 int32 (M,K,N,groupSize,nGroupsPerRow) = 20 byte, khớp
+  # push constant: 6 int32 (M,K,N,groupSize,nGroupsPerRow,wqOff) = 24 byte, khớp
   # struct PushConsts trong matmul_q4.comp - SAI THỨ TỰ/KIỂU Ở ĐÂY SẼ ĐỌC
   # NHẦM GIÁ TRỊ bên shader (không lỗi compile, chỉ tính sai âm thầm).
-  var pcRange = VkPushConstantRange(stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, offset: 0, size: 20)
+  var pcRange = VkPushConstantRange(stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, offset: 0, size: 24)
   var pipelineLayoutInfo = VkPipelineLayoutCreateInfo(
     sType: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, pNext: nil, flags: 0,
     setLayoutCount: 1, pSetLayouts: addr setLayout,
@@ -1001,8 +1016,8 @@ proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
   lib.vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, addr descSetVar, 0, nil)
 
   # push constants: PHẢI đúng thứ tự int32 khớp struct PushConsts trong .comp
-  var pcData = [int32(M), int32(K), int32(N), int32(groupSize), int32(nGroupsPerRow)]
-  lib.vkCmdPushConstants(cmdBuf, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 20, addr pcData[0])
+  var pcData = [int32(M), int32(K), int32(N), int32(groupSize), int32(nGroupsPerRow), 0'i32]
+  lib.vkCmdPushConstants(cmdBuf, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 24, addr pcData[0])
 
   let rowBlocks = uint32((N + MMQ4_NDST - 1) div MMQ4_NDST)
   lib.vkCmdDispatch(cmdBuf, rowBlocks, uint32(M), 1)
@@ -1408,6 +1423,83 @@ proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
     vulkanSessionFree(result)
     raise newException(CatchableError, "resident Vulkan upload failed: " & gVkLastError)
 
+proc vulkanImportHostBuffer*(data: pointer; bytes: int): VulkanBufferHandle =
+  ## Storage buffer over caller memory (a model mmap) without copying, on an
+  ## iGPU with VK_EXT_external_memory_host. `data` must be aligned to the
+  ## driver's import alignment and readable up to the next multiple of it; the
+  ## caller keeps it mapped until vulkanSessionFree. buf == nil means the
+  ## driver declined and the caller should copy instead.
+  ensureInit()
+  if not gHostImportEnabled or data == nil or bytes <= 0: return
+  let align = gDeviceCaps.hostImportAlignment
+  if cast[uint64](data) mod align != 0: return
+  let size = (uint64(bytes) + align - 1) div align * align
+  type
+    ExternalBufferInfo = object
+      sType: uint32
+      pNext: pointer
+      handleTypes: uint32
+    HostPointerProps = object
+      sType: uint32
+      pNext: pointer
+      memoryTypeBits: uint32
+    ImportHostPointerInfo = object
+      sType: uint32
+      pNext: pointer
+      handleType: uint32
+      pHostPointer: pointer
+  # HOST_ALLOCATION first; a file mapping may need MAPPED_FOREIGN_MEMORY.
+  for handleType in [0x80'u32, 0x100'u32]:
+    var hostProps = HostPointerProps(sType: 1000178001)
+    if vkGetMemoryHostPointerPropertiesEXT(gDevice, handleType, data,
+        addr hostProps) != VK_SUCCESS or hostProps.memoryTypeBits == 0: continue
+    var external = ExternalBufferInfo(sType: 1000072000, handleTypes: handleType)
+    var bufInfo = VkBufferCreateInfo(sType: VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      pNext: addr external, size: size,
+      usage: VK_BUFFER_USAGE_STORAGE_BUFFER_BIT or VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      sharingMode: VK_SHARING_MODE_EXCLUSIVE)
+    var buf: VkBuffer
+    if lib.vkCreateBuffer(gDevice, addr bufInfo, nil, addr buf) != VK_SUCCESS: continue
+    var req: VkMemoryRequirements
+    lib.vkGetBufferMemoryRequirements(gDevice, buf, addr req)
+    let typeBits = req.memoryTypeBits and hostProps.memoryTypeBits
+    var memProps: VkPhysicalDeviceMemoryProperties
+    lib.vkGetPhysicalDeviceMemoryProperties(gPhysicalDevice, addr memProps)
+    var typeIndex = -1
+    for i in 0 ..< int(memProps.memoryTypeCount):
+      if (typeBits and (1'u32 shl uint32(i))) != 0:
+        typeIndex = i
+        break
+    if typeIndex < 0 or req.size > size:
+      lib.vkDestroyBuffer(gDevice, buf, nil)
+      continue
+    var importInfo = ImportHostPointerInfo(sType: 1000178000, handleType: handleType,
+      pHostPointer: data)
+    var allocInfo = VkMemoryAllocateInfo(sType: VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      pNext: addr importInfo, allocationSize: size, memoryTypeIndex: uint32(typeIndex))
+    var mem: VkDeviceMemory
+    if lib.vkAllocateMemory(gDevice, addr allocInfo, nil, addr mem) != VK_SUCCESS:
+      lib.vkDestroyBuffer(gDevice, buf, nil)
+      continue
+    if lib.vkBindBufferMemory(gDevice, buf, mem, 0) != VK_SUCCESS:
+      lib.vkDestroyBuffer(gDevice, buf, nil)
+      lib.vkFreeMemory(gDevice, mem, nil)
+      continue
+    return VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: uint64(bytes))
+
+proc vulkanImportHostRange*(data: pointer; bytes: int): tuple[h: VulkanBufferHandle, offset: int] =
+  ## vulkanImportHostBuffer for data at any address inside a mapping (a tensor
+  ## in an unaligned .nimq): the buffer starts at the enclosing import-aligned
+  ## address and `offset` is the byte position of `data` inside it. Kernels
+  ## take that offset as an argument.
+  ensureInit()
+  if not gHostImportEnabled or data == nil or bytes <= 0: return
+  let align = gDeviceCaps.hostImportAlignment
+  result.offset = int(cast[uint64](data) mod align)
+  result.h = vulkanImportHostBuffer(cast[pointer](cast[uint64](data) - uint64(result.offset)),
+    result.offset + bytes)
+  if result.h.buf == nil: result.offset = 0
+
 proc vulkanSessionUploadPrivate*(data: openArray[float32]): VulkanBufferHandle =
   uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil),
     uint64(data.len * sizeof(float32)))
@@ -1785,16 +1877,18 @@ proc vulkanSessionMatmulEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle
     dispatchGeneric("matmul", [a, b, c], addr pc[0], 12,
                     (uint32(N) + TILE - 1) div TILE, (uint32(M) + TILE - 1) div TILE, 1)
 
-proc vulkanSessionMatmulNTEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int): bool =
+proc vulkanSessionMatmulNTEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int;
+                               bOffsetElems = 0): bool =
   ## C(M x N) = A(M x K) @ B(N x K)^T - dung shader rieng matmul_nt.comp
   ## (doc B theo layout [N,K] tu nhien, khong transpose CPU truoc).
-  var pc = [int32(M), int32(K), int32(N)]
+  ## bOffsetElems: B starts that many floats into its buffer.
+  var pc = [int32(M), int32(K), int32(N), int32(bOffsetElems)]
   # THÊM: m==1 GEMV, xem giai thich o vulkanSessionMatmulEnc trên.
   if M == 1:
-    dispatchGeneric("matmul_nt_gemv", [a, b, c], addr pc[0], 12, uint32(N), 1, 1)
+    dispatchGeneric("matmul_nt_gemv", [a, b, c], addr pc[0], 16, uint32(N), 1, 1)
   else:
     const TILE = 16'u32
-    dispatchGeneric("matmul_nt", [a, b, c], addr pc[0], 12,
+    dispatchGeneric("matmul_nt", [a, b, c], addr pc[0], 16,
                     (uint32(N) + TILE - 1) div TILE, (uint32(M) + TILE - 1) div TILE, 1)
 
 include q4_autotune

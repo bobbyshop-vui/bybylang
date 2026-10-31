@@ -105,6 +105,12 @@ MetalBufferHandle metal_upload(const float* data, int n);
 // session has ended and the buffer has been freed. Falls back to a copied
 // Shared buffer when zero-copy is not supported for this address/length.
 MetalBufferHandle metal_upload_borrowed(const float* data, int n);
+// Zero-copy view of long-lived host memory (a read-only model mmap) for GPUs
+// that share system memory. `data` must be page-aligned and readable up to the
+// next page boundary after data+bytes; the caller keeps it mapped until the
+// buffer is freed. NULL means the caller should copy instead (discrete GPU,
+// misaligned region or longer than maxBufferLength).
+MetalBufferHandle metal_wrap_host_nocopy(const void* data, size_t bytes);
 MetalBufferHandle metal_upload_indices(const int* data, int n);
 // Cấp buffer output resident (kernel sẽ ghi đè), CHƯA init dữ liệu.
 MetalBufferHandle metal_alloc_scratch(int n);
@@ -145,6 +151,10 @@ int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle
 // C(m,n) = A(m,k) @ B(n,k)^T - B truyen vao GIU NGUYEN layout goc [n,k]
 // (khong transpose CPU truoc). Dung cho attention decode (K/V-cache).
 int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n);
+// metal_matmul_nt_enc with B starting bOffsetBytes (a multiple of 4) into its
+// buffer, e.g. a weight wrapped inside a model mmap.
+int metal_matmul_nt_off_enc(MetalBufferHandle a, MetalBufferHandle b, int bOffsetBytes,
+                            MetalBufferHandle c, int m, int k, int n);
 // Resident prefix GEMM. C may be a column tile of a wider row-major matrix.
 int metal_matmul_mps_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
                             int m, int k, int n, int cRowStride, int cColumnOffset);
@@ -153,7 +163,7 @@ int metal_mps_supported(void);
 int metal_is_apple_silicon(void);
 // Tune Q4 workgroup/kernel geometry outside an open inference session.
 int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scales,
-    MetalBufferHandle zeros, int k, int n, int groupSize, int groupsPerRow, int m);
+    MetalBufferHandle zeros, int k, int n, int groupSize, int groupsPerRow, int m, int wqOffset);
 // RoPE rotate_half in-place trong session đang mở. x: [T,Hn,D]. cosT/sinT: [T,D/2]
 // (đã cắt đúng đoạn cần dùng phía CPU trước khi upload). Không đọc CPU giữa chừng.
 int metal_rope_enc(MetalBufferHandle x, MetalBufferHandle cosT, MetalBufferHandle sinT,
@@ -213,9 +223,11 @@ MetalBufferHandle metal_upload_bytes_private(const unsigned char* data, int n);
 // KHÔNG memcpy lại mỗi lần gọi hàm này - chỉ activation `a` mới nhỏ/đổi mỗi
 // token. Encode vào session đang mở (giữa metal_session_begin/metal_session_end),
 // giống hệt metal_matmul_enc nhưng đọc thẳng int4 packed thay vì fp32.
+// wqOffset: byte position of the packed weights inside wq (any value; a
+// weight wrapped in place inside an unaligned .nimq mmap).
 int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                          MetalBufferHandle zeros, MetalBufferHandle c,
-                         int m, int k, int n, int groupSize, int nGroupsPerRow);
+                         int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset);
 // THÊM MỚI: matmul Q4 CÓ BATCH M THẬT, chỉ dùng cho M>1 (prefill). Kernel
 // đọc mỗi byte weight ĐÚNG 1 LẦN, dùng lại cho MBLOCK=4 hàng liên tiếp -
 // khác hẳn metal_matmul_q4_enc (dispatch Y=M, mỗi hàng đọc lại toàn bộ
@@ -223,7 +235,7 @@ int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHa
 // quả khi bị gọi với M>1). Xem matmul_q4_batched.metal.
 int metal_matmul_q4_batched_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                                  MetalBufferHandle zeros, MetalBufferHandle c,
-                                 int m, int k, int n, int groupSize, int nGroupsPerRow);
+                                 int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset);
 
 // FP4/FP8/quant 1-byte/weight: wq=uchar[N*K], lut=float[256] (buildDecodeLUT*scale).
 // Kernel: matmul_fp4_lut_kernel_ndst2_paired (vecop_matmul.metal). Session+TG nhu Q4.

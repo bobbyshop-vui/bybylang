@@ -13,6 +13,7 @@ kernel void matmul_q4_dynamic(
     constant int& M [[buffer(5)]], constant int& K [[buffer(6)]],
     constant int& N [[buffer(7)]], constant int& groupSize [[buffer(8)]],
     constant int& groupsPerRow [[buffer(9)]],
+    constant uint& wqShift [[buffer(10)]], // wq bound 0-3 bytes below the weights
     threadgroup float* partial [[threadgroup(0)]],
     uint2 gid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]]) {
@@ -27,7 +28,11 @@ kernel void matmul_q4_dynamic(
         for (uint r = 0; r < q4_dynamic_rows; ++r) {
             uint n = n0 + r;
             if (n >= uint(N)) continue;
-            const uint packed = *((device const uint*)(wq + n * uint(K / 2) + k / 2));
+            // Rows hold K/2 bytes (a multiple of 4), so every word shares
+            // the same 0-3 byte shift from an unaligned mapping.
+            device const uint* word = (device const uint*)(wq + n * uint(K / 2) + k / 2);
+            const uint packed = wqShift == 0 ? word[0] :
+                (word[0] >> (8 * wqShift)) | (word[1] << (32 - 8 * wqShift));
             const uint g = n * uint(groupsPerRow) + group;
             const float scale = scales[g], zero = zeros[g];
             for (uint t = 0; t < 8; ++t) {
