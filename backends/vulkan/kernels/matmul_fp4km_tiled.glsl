@@ -5,7 +5,8 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_control_flow_attributes : require
 
-// FP4-KM prefill GEMM y[M,N] = x[M,K] * W[N,K]^T, FP16 MMA, FP32 accumulate.
+// Prefill GEMM y[M,N] = x[M,K] * W[N,K]^T, FP16 MMA, FP32 accumulate.
+// WEIGHT_FORMAT 1 = packed FP4-KM group32, 0 = FP32 rows (Linear++ sidecar).
 // One workgroup = 4 subgroups of 32 = 64 output columns x 64 rows. Each 64-deep
 // K step decodes the packed weights once into shared FP16 (one thread per
 // column/group: one uvec4 + one scale) and reuses them for every active 16-row
@@ -16,8 +17,15 @@
 // buffer offset 0 with row strides K and N.
 layout(local_size_x_id = 0) in;
 layout(std430, binding = 0) readonly buffer Input { vec4 x4[]; };
+#ifndef WEIGHT_FORMAT
+#define WEIGHT_FORMAT 1
+#endif
+#if WEIGHT_FORMAT == 0
+layout(std430, binding = 1) readonly buffer Weight { vec4 wf4[]; };
+#else
 layout(std430, binding = 1) readonly buffer Weight { uvec4 w4[]; };
 layout(std430, binding = 1) readonly buffer WeightWords { uint w[]; };
+#endif
 layout(std430, binding = 2) writeonly buffer Output { float y[]; };
 layout(std430, binding = 3) readonly buffer Lut { float lut[]; };
 layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow; } p;
@@ -47,7 +55,9 @@ void main() {
     uint bHalf = lid & 1u;
     uint gCol = col0 + bCol;
 
+#if WEIGHT_FORMAT != 0
     if (lid < 16u) lutS[lid] = lut[lid];
+#endif
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4];
     [[unroll]] for (uint r = 0; r < 4u; ++r)
         acc[r] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
@@ -66,6 +76,20 @@ void main() {
             aTile[o + 2u] = float16_t(v.z);
             aTile[o + 3u] = float16_t(v.w);
         }
+#if WEIGHT_FORMAT == 0
+        // FP32 weights: 64 columns x 16 vec4, coalesced along K.
+        for (uint i = lid; i < BN * (BK / 4u); i += THREADS) {
+            uint c = i >> 4;
+            uint q = i & 15u;
+            uint col = col0 + c;
+            vec4 v = col < p.N ? wf4[col * kVec + (base >> 2) + q] : vec4(0.0);
+            uint o = c * LDS + q * 4u;
+            bTile[o] = float16_t(v.x);
+            bTile[o + 1u] = float16_t(v.y);
+            bTile[o + 2u] = float16_t(v.z);
+            bTile[o + 3u] = float16_t(v.w);
+        }
+#else
         // Weights: byte i of a 32-value group holds k=i (low) and k=16+i (high).
         uint g = (base >> 5) + bHalf;
         uvec4 packed = uvec4(0u);
@@ -84,6 +108,7 @@ void main() {
                 bTile[ob + 16u + 4u * j + b] = float16_t(lutS[byteV >> 4] * scale);
             }
         }
+#endif
         barrier();
         if (sg < 4u) {
             [[unroll]] for (uint kk = 0; kk < BK; kk += 16u) {

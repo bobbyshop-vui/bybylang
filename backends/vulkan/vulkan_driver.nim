@@ -1602,15 +1602,22 @@ proc coopMatmulShader(weightFormat: int): tuple[name, source: string] =
 const Fp4KmFp8Shader = (name: "coop_matmul_fp4km_fp8_e4m3",
   source: staticRead("kernels/matmul_fp4km_fp8.glsl"))
 
-const Fp4KmTiledShader = (name: "coop_matmul_fp4km_tiled",
-  source: staticRead("kernels/matmul_fp4km_tiled.glsl"))
+proc tiledMatmulShader(weightFormat: int): tuple[name, source: string] =
+  ## matmul_fp4km_tiled.glsl: format 1 = packed FP4-KM, 0 = FP32 rows.
+  const templateSrc = staticRead("kernels/matmul_fp4km_tiled.glsl")
+  let name = if weightFormat == 1: "coop_matmul_fp4km_tiled" else: "coop_matmul_f32_tiled"
+  (name, "#version 450\n#define WEIGHT_FORMAT " & $weightFormat & "\n" &
+    templateSrc.replace("#version 450\n", ""))
 
-# Off until the caller has checked it against the generic cooperative kernel
-# on this device (vulkanSetFp4GemmTiled); MoltenVK cannot run either locally.
+# Off until the caller has checked them against the generic cooperative kernel
+# on this device (vulkanSet*GemmTiled); MoltenVK cannot run either locally.
 var gFp4TiledEnabled = false
 var gFp4TiledLogged = false
+var gF32TiledEnabled = false
+var gF32TiledLogged = false
 
 proc vulkanSetFp4GemmTiled*(enabled: bool) = gFp4TiledEnabled = enabled
+proc vulkanSetF32GemmTiled*(enabled: bool) = gF32TiledEnabled = enabled
 
 proc vulkanCooperativeGemmEnabled*(): bool =
   ## True when prefill GEMMs will take a cooperative-matrix route, so packed
@@ -1627,7 +1634,8 @@ proc vulkanCoopPrewarmJobs*(): seq[tuple[name, source: string]] =
     result.add coopMatmulShader(0)
     result.add coopMatmulShader(1)
     if gDeviceCaps.subgroupSize == 32 and gDeviceCaps.maxThreads >= 128:
-      result.add Fp4KmTiledShader
+      result.add tiledMatmulShader(1)
+      result.add tiledMatmulShader(0)
 
 proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
                          M, K, N, weightFormat: int; groupSize = 0;
@@ -1683,28 +1691,39 @@ proc tryFp4KmFp8Cooperative(a, w, c, lut: VulkanBufferHandle;
     uint32((N + 15) div 16), uint32((M + 15) div 16), 1,
     gDeviceCaps.subgroupSize, spv)
 
-proc vulkanSessionFp4GemmTiledEnc*(a, w, lut: VulkanBufferHandle;
-                                   c: var VulkanBufferHandle; M, K, N: int): bool =
-  ## matmul_fp4km_tiled: decodes each FP4 weight once per 64 rows instead of
+proc tryTiledCooperative(a, w, c, lut: VulkanBufferHandle; M, K, N, weightFormat: int): bool =
+  ## matmul_fp4km_tiled: weights converted once per 64 output rows instead of
   ## once per 16x16 tile. False when the device/shape does not fit its contract.
   if not gCoopEnabled or not gDeviceCaps.cooperativeMatrix or not gSessionActive or
       gDeviceCaps.subgroupSize != 32 or gDeviceCaps.maxThreads < 128 or
       M < 8 or K mod 64 != 0 or N < 16: return false
-  if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
   if a.buf == nil or w.buf == nil or c.buf == nil or lut.buf == nil: return false
-  if w.sizeBytes < uint64(N * (K div 2) + N * (K div 32)) or
-      a.sizeBytes < uint64(M * K * 4) or c.sizeBytes < uint64(M * N * 4) or
-      lut.sizeBytes < 272'u64 * 4: return false
+  let weightBytes = if weightFormat == 1: N * (K div 2) + N * (K div 32) else: N * K * 4
+  if w.sizeBytes < uint64(weightBytes) or a.sizeBytes < uint64(M * K * 4) or
+      c.sizeBytes < uint64(M * N * 4) or
+      (weightFormat == 1 and lut.sizeBytes < 272'u64 * 4): return false
+  let (kn, source) = tiledMatmulShader(weightFormat)
   var spv: string
   try:
-    spv = compileVulkanJitShader(Fp4KmTiledShader.name, Fp4KmTiledShader.source)
+    spv = compileVulkanJitShader(kn, source)
   except CatchableError as e:
-    gFp4TiledEnabled = false
-    stderr.writeLine "[vulkan] tiled FP4 cooperative shader unavailable: " & e.msg
+    if weightFormat == 1: gFp4TiledEnabled = false else: gF32TiledEnabled = false
+    stderr.writeLine "[vulkan] tiled cooperative shader unavailable: " & e.msg
     return false
   var pc = [uint32(M), uint32(K), uint32(N), 0'u32, 0'u32]
-  dispatchGeneric(Fp4KmTiledShader.name, [a, w, c, lut], addr pc[0], 20,
+  dispatchGeneric(kn, [a, w, c, lut], addr pc[0], 20,
     uint32((N + 63) div 64), uint32((M + 63) div 64), 1, 128, spv)
+
+proc vulkanSessionFp4GemmTiledEnc*(a, w, lut: VulkanBufferHandle;
+                                   c: var VulkanBufferHandle; M, K, N: int): bool =
+  if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
+  tryTiledCooperative(a, w, c, lut, M, K, N, 1)
+
+proc vulkanSessionMatmulNTTiledEnc*(a, w: VulkanBufferHandle;
+                                    c: var VulkanBufferHandle; M, K, N: int): bool =
+  ## FP32 weights [N,K], FP16 MMA with FP32 accumulation (inference only).
+  if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
+  tryTiledCooperative(a, w, c, w, M, K, N, 0)
 
 proc vulkanSessionFp4GemmEnc*(a, w, lut: VulkanBufferHandle;
                               c: var VulkanBufferHandle; M, K, N: int): bool =
@@ -1728,6 +1747,11 @@ proc vulkanSessionFp4GemmEnc*(a, w, lut: VulkanBufferHandle;
 proc vulkanSessionMatmulNTAcceleratedEnc*(a, w: VulkanBufferHandle;
     c: var VulkanBufferHandle; M, K, N: int): bool =
   ## Return false when unsupported, so the caller retains exact FP32 GEMM.
+  if gF32TiledEnabled and tryTiledCooperative(a, w, c, w, M, K, N, 0):
+    if not gF32TiledLogged:
+      stderr.writeLine "[vulkan] FP32 prefill GEMM route=tiled FP16 (64x64/workgroup) + FP32 accumulation"
+      gF32TiledLogged = true
+    return true
   tryCooperativeMatmul(a, w, c, w, w, M, K, N, 0)
 
 proc vulkanSessionRopeEnc*(x: var VulkanBufferHandle, cosT, sinT: VulkanBufferHandle, Hn, D, T: int): bool =

@@ -1289,6 +1289,17 @@ proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
   vulkanSessionFp4GemmTiledEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
     c.vulkanHandle, M, K, N)
 
+proc sessionMatmulNTTiledEnc*(backend: GpuBackend, a, w: SessionHandle,
+    c: var SessionHandle; M, K, N: int): bool =
+  ## Only the tiled FP32-weight cooperative kernel (for parity checks).
+  if normalizeBackend(backend) != gbVulkan: return false
+  if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
+  vulkanSessionMatmulNTTiledEnc(a.vulkanHandle, w.vulkanHandle, c.vulkanHandle, M, K, N)
+
+proc sessionSetF32GemmTiled*(backend: GpuBackend; enabled: bool) =
+  ## Let sessionMatmulNTAccelerated / sessionMatmulNTFp16Coop prefer the tiled kernel.
+  if normalizeBackend(backend) == gbVulkan: vulkanSetF32GemmTiled(enabled)
+
 proc sessionSetFp4GemmTiled*(backend: GpuBackend; enabled: bool) =
   ## Let sessionFp4GemmTensorCore prefer the tiled kernel (after a parity check).
   if normalizeBackend(backend) == gbVulkan: vulkanSetFp4GemmTiled(enabled)
