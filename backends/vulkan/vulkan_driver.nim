@@ -291,6 +291,9 @@ const
   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: uint32 = 0x00000001
   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: uint32 = 0x00000002
   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: uint32 = 0x00000004
+  VK_MEMORY_PROPERTY_HOST_CACHED_BIT: uint32 = 0x00000008
+  VK_PIPELINE_STAGE_HOST_BIT: uint32 = 0x00004000
+  VK_ACCESS_HOST_READ_BIT: uint32 = 0x00002000
   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: uint32 = 7
   VK_PIPELINE_BIND_POINT_COMPUTE: uint32 = 1
   VK_COMMAND_BUFFER_LEVEL_PRIMARY: uint32 = 0
@@ -369,6 +372,12 @@ type
     buf*: VkBuffer
     mem*: VkDeviceMemory
     sizeBytes*: uint64
+    ## deviceOnly: VRAM without a host mapping (dGPU); reads and uploads go
+    ## through a staging copy. pooled: returned to the buffer pool on free.
+    deviceOnly*: bool
+    pooled*: bool
+    allocBytes*: uint64
+    mapped*: pointer   ## persistent host mapping of a pooled staging buffer
 
 proc gpuCheck(cond: bool, msg: string) =
   ## Giống hệt pattern trong cuda_driver.nim - raise CatchableError (không
@@ -404,6 +413,9 @@ var gCoopEnabled = false
 var gFp8CoopEnabled = false
 var gFp8Fp4Logged = false
 var gHostImportEnabled = false
+## Session scratch/upload buffers in VRAM (dGPU). Host-visible system memory
+## there means every kernel reads its activations across PCIe.
+var gScratchDeviceLocal = false
 var vkGetMemoryHostPointerPropertiesEXT: proc(dev: VkDevice; handleType: uint32;
   host: pointer; props: pointer): VkResult {.cdecl.}
 var gFp16Fp4Logged = false
@@ -656,9 +668,14 @@ proc ensureInit() =
   let weightMemory = if useDeviceLocalWeights(gDeviceCaps.properties.deviceType,
       getEnv("BYBY_VULKAN_DEVICE_LOCAL", "auto")): "device-local/VRAM"
     else: "host-visible/shared"
+  # BYBY_VULKAN_SCRATCH: auto (VRAM on a dGPU), device (always), host (never).
+  let scratchMode = getEnv("BYBY_VULKAN_SCRATCH", "auto")
+  gScratchDeviceLocal = scratchMode == "device" or
+    (scratchMode == "auto" and gDeviceCaps.properties.deviceType == 2'u32)
   stderr.writeLine "[vulkan] device=" & gDeviceCaps.deviceName &
     " type=" & deviceClass(gDeviceCaps.properties.deviceType) &
     " residentWeights=" & weightMemory &
+    " scratch=" & (if gScratchDeviceLocal: "device-local/VRAM" else: "host-visible") &
     " subgroup=" & $gDeviceCaps.subgroupSize & " maxThreads=" & $gDeviceCaps.maxThreads &
     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
     " mmapImport=" & (if gHostImportEnabled: $gDeviceCaps.hostImportAlignment else: "off") &
@@ -677,6 +694,15 @@ proc vulkanTensorCoreAvailable*(): bool =
 proc findMemoryType(typeFilter: uint32, properties: uint32): uint32 =
   var memProps: VkPhysicalDeviceMemoryProperties
   lib.vkGetPhysicalDeviceMemoryProperties(gPhysicalDevice, addr memProps)
+  # Plain VRAM requests skip the small host-visible BAR heap (256 MB without
+  # resizable BAR) when the driver lists it before ordinary device memory.
+  if properties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT:
+    for i in 0 ..< int(memProps.memoryTypeCount):
+      let flags = memProps.memoryTypes[i].propertyFlags
+      if (typeFilter and (1'u32 shl uint32(i))) != 0 and
+         (flags and properties) == properties and
+         (flags and VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0:
+        return uint32(i)
   for i in 0 ..< int(memProps.memoryTypeCount):
     if (typeFilter and (1'u32 shl uint32(i))) != 0 and
        (memProps.memoryTypes[i].propertyFlags and properties) == properties:
@@ -1074,6 +1100,185 @@ var gSessionInternalBufs: seq[VulkanBufferHandle] = @[]
 var gSessionDeferredFree: seq[VulkanBufferHandle] = @[]
 var gVkLastError: string = ""   ## mo ta loi cua lan vulkanSessionEnd gan nhat that bai
 
+# ---- Buffer pool (dGPU scratch) ----
+# A decode step allocates the same few hundred scratch buffers every token.
+# vkAllocateMemory/vkFreeMemory per buffer costs far more than the kernels on
+# a dGPU, so freed buffers wait here (keyed by kind and rounded size) until
+# the next allocation of that size. Buffers freed inside a session reach the
+# pool only after its fence, like gSessionDeferredFree.
+type PoolKind = enum pkDevice, pkUpload, pkReadback
+
+var gBufferPool = initTable[(PoolKind, uint64), seq[VulkanBufferHandle]]()
+var gPoolBytes = 0'u64
+proc poolLimitMb(): int =
+  try: max(0, parseInt(getEnv("BYBY_VULKAN_POOL_MB", "2048")))
+  except ValueError: 2048
+let gPoolLimitBytes = uint64(poolLimitMb()) * 1024 * 1024
+## Upload staging recorded into the open session; released after its fence.
+var gSessionStaging: seq[VulkanBufferHandle] = @[]
+## Transfer hazards since the last transfer barrier: copies recorded back to
+## back share one barrier unless one touches a buffer another copy wrote/read.
+var gXferWritten = initHashSet[VkBuffer]()
+var gXferRead = initHashSet[VkBuffer]()
+var gXferPending = false
+
+proc poolBucket(bytes: uint64): uint64 =
+  ## Power-of-two buckets up to 1 MiB, then whole MiB: prefill-sized buffers
+  ## of nearby lengths reuse each other.
+  result = 256
+  if bytes <= 1024 * 1024:
+    while result < bytes: result = result shl 1
+  else:
+    result = (bytes + 1024 * 1024 - 1) and not (1024 * 1024 - 1'u64)
+
+proc destroyBuffer(h: VulkanBufferHandle) =
+  if h.buf != nil: lib.vkDestroyBuffer(gDevice, h.buf, nil)
+  if h.mem != nil: lib.vkFreeMemory(gDevice, h.mem, nil)
+
+var gPoolKinds = initTable[VkBuffer, PoolKind]()
+
+proc acquirePooled(kind: PoolKind; bytes: uint64): VulkanBufferHandle =
+  let alloc = poolBucket(bytes)
+  let key = (kind, alloc)
+  if gBufferPool.hasKey(key) and gBufferPool[key].len > 0:
+    result = gBufferPool[key].pop()
+    gPoolBytes -= alloc
+  else:
+    case kind
+    of pkDevice:
+      var created: tuple[buf: VkBuffer, mem: VkDeviceMemory]
+      try:
+        created = createHostVisibleBuffer(alloc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+      except CatchableError:
+        # Out of VRAM: give the idle pooled buffers back and retry once.
+        for bufs in gBufferPool.values:
+          for h in bufs:
+            gPoolKinds.del(h.buf)
+            destroyBuffer(h)
+        gBufferPool.clear()
+        gPoolBytes = 0
+        created = createHostVisibleBuffer(alloc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+      result = VulkanBufferHandle(buf: created.buf, mem: created.mem, deviceOnly: true)
+    of pkUpload, pkReadback:
+      let coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+      var created: tuple[buf: VkBuffer, mem: VkDeviceMemory]
+      if kind == pkReadback:
+        # CPU reads of uncached memory are slow; prefer HOST_CACHED.
+        try:
+          created = createHostVisibleBuffer(alloc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            coherent or VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+        except CatchableError:
+          created = createHostVisibleBuffer(alloc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, coherent)
+      else:
+        created = createHostVisibleBuffer(alloc, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, coherent)
+      result = VulkanBufferHandle(buf: created.buf, mem: created.mem)
+      gpuCheck(lib.vkMapMemory(gDevice, created.mem, 0, alloc, 0, addr result.mapped) == VK_SUCCESS,
+        "vkMapMemory (staging) that bai")
+    result.pooled = true
+    result.allocBytes = alloc
+    gPoolKinds[result.buf] = kind
+  result.sizeBytes = bytes
+
+proc releaseBuffer(h: VulkanBufferHandle) =
+  ## Return a pooled buffer for reuse, or destroy it. Callers guarantee no
+  ## queued GPU work still refers to it.
+  if h.buf == nil and h.mem == nil: return
+  if h.pooled and gPoolKinds.hasKey(h.buf) and gPoolBytes + h.allocBytes <= gPoolLimitBytes:
+    gBufferPool.mgetOrPut((gPoolKinds[h.buf], h.allocBytes), @[]).add h
+    gPoolBytes += h.allocBytes
+  else:
+    if h.pooled: gPoolKinds.del(h.buf)
+    destroyBuffer(h)
+
+proc immediateCopy(src, dst: VkBuffer; srcOff, dstOff, bytes: uint64) =
+  ## One-shot transfer with its own command buffer and fence, independent of
+  ## an open session (reads after sessionEnd, uploads outside a session).
+  var cb: VkCommandBuffer
+  var allocInfo = VkCommandBufferAllocateInfo(
+    sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, pNext: nil,
+    commandPool: gCommandPool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount: 1)
+  gpuCheck(lib.vkAllocateCommandBuffers(gDevice, addr allocInfo, addr cb) == VK_SUCCESS,
+    "vkAllocateCommandBuffers (copy) that bai")
+  var beginInfo = VkCommandBufferBeginInfo(
+    sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, pNext: nil,
+    flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, pInheritanceInfo: nil)
+  var fence: VkFence
+  try:
+    gpuCheck(lib.vkBeginCommandBuffer(cb, addr beginInfo) == VK_SUCCESS, "vkBeginCommandBuffer (copy) that bai")
+    var pre = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
+      srcAccessMask: VK_ACCESS_SHADER_WRITE_BIT or VK_ACCESS_TRANSFER_WRITE_BIT,
+      dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT)
+    lib.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, addr pre, 0, nil, 0, nil)
+    var region = VkBufferCopy(srcOffset: srcOff, dstOffset: dstOff, size: bytes)
+    lib.vkCmdCopyBuffer(cb, src, dst, 1, addr region)
+    var post = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
+      srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT,
+      dstAccessMask: VK_ACCESS_HOST_READ_BIT or VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT)
+    lib.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT or VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, addr post, 0, nil, 0, nil)
+    gpuCheck(lib.vkEndCommandBuffer(cb) == VK_SUCCESS, "vkEndCommandBuffer (copy) that bai")
+    var fenceInfo = VkFenceCreateInfo(sType: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, pNext: nil, flags: 0)
+    gpuCheck(lib.vkCreateFence(gDevice, addr fenceInfo, nil, addr fence) == VK_SUCCESS, "vkCreateFence (copy) that bai")
+    var cbVar = cb
+    var submitInfo = VkSubmitInfo(sType: VK_STRUCTURE_TYPE_SUBMIT_INFO, pNext: nil,
+      waitSemaphoreCount: 0, pWaitSemaphores: nil, pWaitDstStageMask: nil,
+      commandBufferCount: 1, pCommandBuffers: addr cbVar,
+      signalSemaphoreCount: 0, pSignalSemaphores: nil)
+    gpuCheck(lib.vkQueueSubmit(gQueue, 1, addr submitInfo, fence) == VK_SUCCESS, "vkQueueSubmit (copy) that bai")
+    gpuCheck(lib.vkWaitForFences(gDevice, 1, addr fence, 1, high(uint64)) == VK_SUCCESS,
+      "vkWaitForFences (copy) that bai")
+  finally:
+    if fence != nil: lib.vkDestroyFence(gDevice, fence, nil)
+    lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cb)
+
+proc recordTransferBarrierIfNeeded(src, dst: VkBuffer) =
+  ## Copy after copy needs a barrier only for RAW/WAW/WAR between the two.
+  if src in gXferWritten or dst in gXferWritten or dst in gXferRead:
+    var b = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
+      srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT,
+      dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT)
+    lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, addr b, 0, nil, 0, nil)
+    gXferWritten.clear()
+    gXferRead.clear()
+
+proc recordSessionCopy(src, dst: VkBuffer; srcOff, dstOff, bytes: uint64) =
+  ## Earlier dispatches end with a compute->compute|transfer barrier; the
+  ## next dispatch emits the transfer->compute barrier (gXferPending).
+  recordTransferBarrierIfNeeded(src, dst)
+  var region = VkBufferCopy(srcOffset: srcOff, dstOffset: dstOff, size: bytes)
+  lib.vkCmdCopyBuffer(gSessionCmdBuf, src, dst, 1, addr region)
+  gXferWritten.incl dst
+  gXferRead.incl src
+  gXferPending = true
+
+proc stagedUpload(dst: VulkanBufferHandle; data: pointer; bytes: uint64) =
+  ## Host data into a device-only buffer: inside a session the copy is
+  ## recorded in order with the session's dispatches.
+  if bytes == 0: return
+  var stage = acquirePooled(pkUpload, bytes)
+  copyMem(stage.mapped, data, int(bytes))
+  if gSessionActive:
+    recordSessionCopy(stage.buf, dst.buf, 0, 0, bytes)
+    gSessionStaging.add stage
+  else:
+    try:
+      immediateCopy(stage.buf, dst.buf, 0, 0, bytes)
+    finally:
+      releaseBuffer(stage)
+
+proc stagedRead(src: VulkanBufferHandle; data: pointer; bytes: uint64) =
+  if bytes == 0: return
+  var rb = acquirePooled(pkReadback, bytes)
+  try:
+    immediateCopy(src.buf, rb.buf, 0, 0, bytes)
+    copyMem(data, rb.mapped, int(bytes))
+  finally:
+    releaseBuffer(rb)
+
 proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: uint32,
                          localSizeX = 0, spirvPathOverride = "", sharedFloats = 0): PipelineEntry =
   ## Cache pipeline theo tên shader + numBindings + localSizeX.
@@ -1231,6 +1436,9 @@ proc vulkanSessionBegin*(): bool =
     return false
   gSessionCleanupPools.setLen(0)
   gSessionInternalBufs.setLen(0)
+  gXferWritten.clear()
+  gXferRead.clear()
+  gXferPending = false
   # A failed sessionEnd() can leave the live descriptor pool behind; nothing
   # was submitted in that case, so drop it before the handle is reused.
   if gDSetPool != nil:
@@ -1272,19 +1480,13 @@ proc vulkanSessionEnd*(): bool =
     lib.vkDestroyDescriptorPool(gDevice, p, nil)
   gSessionCleanupPools.setLen(0)
   # Free multiBuf internal dummies only (not caller-owned AllocScratch).
-  for i in 0 ..< gSessionInternalBufs.len:
-    let h = gSessionInternalBufs[i]
-    if h.buf != nil:
-      lib.vkDestroyBuffer(gDevice, h.buf, nil)
-    if h.mem != nil:
-      lib.vkFreeMemory(gDevice, h.mem, nil)
+  for h in gSessionInternalBufs: releaseBuffer(h)
   gSessionInternalBufs.setLen(0)
   # Huy cac buffer bi sessionFree() giua session (an toan vi da wait fence xong).
-  for i in 0 ..< gSessionDeferredFree.len:
-    let h = gSessionDeferredFree[i]
-    if h.buf != nil: lib.vkDestroyBuffer(gDevice, h.buf, nil)
-    if h.mem != nil: lib.vkFreeMemory(gDevice, h.mem, nil)
+  for h in gSessionDeferredFree: releaseBuffer(h)
   gSessionDeferredFree.setLen(0)
+  for h in gSessionStaging: releaseBuffer(h)
+  gSessionStaging.setLen(0)
   result = waitOk
 
 proc vulkanGetLastError*(): string = gVkLastError
@@ -1311,21 +1513,21 @@ proc vulkanRecoverQueue*(): bool =
     for p in gSessionCleanupPools:
       lib.vkDestroyDescriptorPool(gDevice, p, nil)
     gSessionCleanupPools.setLen(0)
-    for i in 0 ..< gSessionInternalBufs.len:
-      let h = gSessionInternalBufs[i]
-      if h.buf != nil: lib.vkDestroyBuffer(gDevice, h.buf, nil)
-      if h.mem != nil: lib.vkFreeMemory(gDevice, h.mem, nil)
+    for h in gSessionInternalBufs: releaseBuffer(h)
     gSessionInternalBufs.setLen(0)
-    for i in 0 ..< gSessionDeferredFree.len:
-      let h = gSessionDeferredFree[i]
-      if h.buf != nil: lib.vkDestroyBuffer(gDevice, h.buf, nil)
-      if h.mem != nil: lib.vkFreeMemory(gDevice, h.mem, nil)
+    for h in gSessionDeferredFree: releaseBuffer(h)
     gSessionDeferredFree.setLen(0)
+    for h in gSessionStaging: releaseBuffer(h)
+    gSessionStaging.setLen(0)
   result = true
 
 proc vulkanSessionUpload*(data: seq[float32]): VulkanBufferHandle =
   ensureInit()
   let bytes = uint64(data.len * sizeof(float32))
+  if gScratchDeviceLocal:
+    result = acquirePooled(pkDevice, bytes)
+    if data.len > 0: stagedUpload(result, unsafeAddr data[0], bytes)
+    return
   let (buf, mem) = createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
   if data.len > 0:
     var dataVar = data
@@ -1339,6 +1541,8 @@ proc vulkanSessionAllocScratch*(n: int): VulkanBufferHandle =
   if n < 0:
     raise newException(CatchableError, "vulkanSessionAllocScratch: n < 0")
   let bytes = uint64(max(n, 0) * sizeof(float32))
+  if gScratchDeviceLocal:
+    return acquirePooled(pkDevice, bytes)
   let (buf, mem) = createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
   result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: bytes)
 
@@ -1353,7 +1557,8 @@ proc vulkanSessionRead*(h: VulkanBufferHandle, n: int): seq[float32] =
   ## giữa chừng session chưa commit sẽ ra dữ liệu rác/cũ (bài học từ Metal).
   result = newSeq[float32](n)
   if n > 0:
-    readFromBuffer(h.mem, addr result[0], uint64(n * sizeof(float32)))
+    if h.deviceOnly: stagedRead(h, addr result[0], uint64(n * sizeof(float32)))
+    else: readFromBuffer(h.mem, addr result[0], uint64(n * sizeof(float32)))
 
 proc vulkanSessionFree*(h: var VulkanBufferHandle) =
   if gSessionActive and (h.buf != nil or h.mem != nil):
@@ -1361,36 +1566,17 @@ proc vulkanSessionFree*(h: var VulkanBufferHandle) =
     h.buf = nil
     h.mem = nil
     return
-  if h.buf != nil:
-    lib.vkDestroyBuffer(gDevice, h.buf, nil)
-  if h.mem != nil:
-    lib.vkFreeMemory(gDevice, h.mem, nil)
+  releaseBuffer(h)
   h.buf = nil
   h.mem = nil
 
 proc vulkanSessionCopyInto*(src: VulkanBufferHandle, dst: var VulkanBufferHandle,
                              srcOffsetElems, dstOffsetElems, n: int): bool =
   if not gSessionActive: return false
-  var region = VkBufferCopy(
-    srcOffset: uint64(srcOffsetElems * sizeof(float32)),
-    dstOffset: uint64(dstOffsetElems * sizeof(float32)),
-    size: uint64(n * sizeof(float32))
-  )
-  # Barrier: compute/transfer truoc -> transfer nay (src vua duoc shader ghi, dst vua duoc doc/ghi)
-  var b1 = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
-    srcAccessMask: VK_ACCESS_SHADER_WRITE_BIT or VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT,
-    dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT)
-  lib.vkCmdPipelineBarrier(gSessionCmdBuf,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT,
-    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, addr b1, 0, nil, 0, nil)
-  lib.vkCmdCopyBuffer(gSessionCmdBuf, src.buf, dst.buf, 1, addr region)
-  # Barrier: transfer -> compute / transfer ke tiep
-  var b2 = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
-    srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT,
-    dstAccessMask: VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT or
-                   VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT)
-  lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, addr b2, 0, nil, 0, nil)
+  # Barriers are recorded lazily: a KV append is 4*HKV copies per layer, and
+  # a barrier pair around each one stalled the GPU thousands of times a token.
+  recordSessionCopy(src.buf, dst.buf, uint64(srcOffsetElems * sizeof(float32)),
+    uint64(dstOffsetElems * sizeof(float32)), uint64(n * sizeof(float32)))
   result = true
 
 proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
@@ -1401,7 +1587,7 @@ proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
   let flags = if deviceLocal: VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
               else: VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
   let (buf, mem) = createHostVisibleBuffer(allocBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, flags)
-  result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: nBytes)
+  result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: nBytes, deviceOnly: deviceLocal)
   if nBytes == 0: return
   if not deviceLocal:
     uploadToBuffer(mem, data, nBytes)
@@ -1517,6 +1703,16 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
     localSizeX, spirvPathOverride, sharedFloats)
   let (pool, dset) = makeDescriptorSet(entry, buffers, bufferOffsets)
   discard pool  # owned by the session pool, retired at sessionEnd
+  if gXferPending:
+    # Copies recorded since the last dispatch (uploads, KV appends).
+    var xfer = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
+      srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT,
+      dstAccessMask: VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT)
+    lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, addr xfer, 0, nil, 0, nil)
+    gXferPending = false
+    gXferWritten.clear()
+    gXferRead.clear()
   lib.vkCmdBindPipeline(gSessionCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, entry.pipeline)
   var dsetVar = dset
   lib.vkCmdBindDescriptorSets(gSessionCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, entry.layout, 0, 1, addr dsetVar, 0, nil)
@@ -1525,11 +1721,14 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
   lib.vkCmdDispatch(gSessionCmdBuf, groupX, groupY, groupZ)
   # Metal's command encoder orders compute dispatches with a buffer barrier;
   # Vulkan requires an explicit memory dependency for write->read visibility.
+  # Also covers a copy recorded next (KV append, readback source).
   var barrier = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER,
     pNext: nil, srcAccessMask: VK_ACCESS_SHADER_WRITE_BIT,
-    dstAccessMask: VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT)
+    dstAccessMask: VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT or
+                   VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT)
   lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, addr barrier, 0, nil, 0, nil)
+    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT,
+    0, 1, addr barrier, 0, nil, 0, nil)
   result = true
 
 proc vulkanSessionMicroVmEnc*(code: VulkanBufferHandle, mem: VulkanBufferHandle,
@@ -1653,7 +1852,9 @@ proc compileVulkanJitShader(kernelName, source: string): string =
       stderr.writeLine "════ [vulkan_jit] GLSL source kernel=" & kernelName & " ════"
       stderr.writeLine source
       stderr.writeLine "════ [vulkan_jit] het source " & kernelName & " ════"
-    let target = if source.contains("GL_KHR_cooperative_matrix"): " --target-env=vulkan1.3" else: ""
+    let target = if source.contains("GL_KHR_cooperative_matrix"): " --target-env=vulkan1.3"
+                 elif source.contains("GL_KHR_shader_subgroup"): " --target-env=vulkan1.1"
+                 else: ""
     let cmd = quoteShell(compiler) & target & " -fshader-stage=compute " &
       quoteShell(srcPath) & " -o " & quoteShell(spvPath)
     let compiled = execCmdEx(cmd)
@@ -1965,6 +2166,10 @@ proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle =
   ## cho weight int4 da pack (wq), mirror openclSessionUploadBytes.
   ensureInit()
   let bytes = uint64(data.len)
+  if gScratchDeviceLocal:
+    result = acquirePooled(pkDevice, bytes)
+    if data.len > 0: stagedUpload(result, unsafeAddr data[0], bytes)
+    return
   let (buf, mem) = createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
   if data.len > 0:
     var dataVar = data

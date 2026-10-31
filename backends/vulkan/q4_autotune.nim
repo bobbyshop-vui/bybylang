@@ -1,9 +1,9 @@
 ## Included by vulkan_driver: Q4 plans share its device/session/pipeline cache.
 type
-  VkQ4PlanKind = enum q4Reference, q4Wide, q4Cooperative
+  VkQ4PlanKind = enum q4Reference, q4Wide, q4Cooperative, q4Subgroup
   VkQ4Plan = object
     kind: VkQ4PlanKind
-    tg, rows, batch: int
+    tg, rows, batch, vec: int
     name, spv: string
 
 var gVkQ4Plans = initTable[string, VkQ4Plan]()
@@ -33,6 +33,14 @@ proc q4Encode(plan: VkQ4Plan; a, w, scales, zeros, c: VulkanBufferHandle;
       uint32((N + plan.rows - 1) div plan.rows),
       uint32((M + plan.batch - 1) div plan.batch), 1, plan.tg, plan.spv)
     if result and countDispatch: inc gVkQ4WideDispatches
+  of q4Subgroup:
+    # Rows per workgroup: one subgroup per plan.rows rows.
+    let rowsPerGroup = plan.rows * plan.batch
+    if wqOffset mod (4 * plan.vec) != 0: return false
+    var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups), int32(wqOffset)]
+    result = dispatchGeneric(plan.name, [a, w, scales, zeros, c], addr pc[0], 24,
+      uint32((N + rowsPerGroup - 1) div rowsPerGroup), uint32(M), 1, plan.tg, plan.spv)
+    if result and countDispatch: inc gVkQ4WideDispatches
 
 proc q4Compile(tg, rows, batch: int): VkQ4Plan =
   const sourceTemplate = staticRead("kernels/matmul_q4_dynamic.glsl")
@@ -43,6 +51,20 @@ proc q4Compile(tg, rows, batch: int): VkQ4Plan =
     sourceTemplate.replace("#version 450\n", "")
   result.spv = compileVulkanJitShader(result.name, source)
   # Create the PSO before timing or opening an inference command buffer.
+  discard getOrCreatePipeline(result.name, 5, 24, tg, result.spv)
+
+proc q4CompileSubgroup(tg, rows, vec: int; sharedReduce: bool): VkQ4Plan =
+  const sourceTemplate = staticRead("kernels/matmul_q4_sg.glsl")
+  # batch holds the subgroups per workgroup the grid assumes (SG_HINT).
+  let sg = gDeviceCaps.subgroupSize
+  result = VkQ4Plan(kind: q4Subgroup, tg: tg, rows: rows, batch: tg div sg, vec: vec,
+    name: "q4_sg_r" & $rows & "_v" & $vec & "_tg" & $tg & "_s" & $sg &
+      (if sharedReduce: "_shm" else: ""))
+  let source = "#version 450\n#define WG_SIZE " & $tg & "\n#define ROWS " & $rows &
+    "\n#define VEC " & $vec & "\n#define SG_HINT " & $sg &
+    "\n#define SHARED_REDUCE " & $int(sharedReduce) & "\n" &
+    sourceTemplate.replace("#version 450\n", "")
+  result.spv = compileVulkanJitShader(result.name, source)
   discard getOrCreatePipeline(result.name, 5, 24, tg, result.spv)
 
 proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
@@ -74,6 +96,26 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
         plans.add q4Compile(tg, rows, batch)
       except CatchableError as e:
         stderr.writeLine "[q4-tune:vulkan] skip candidate: " & e.msg
+  # Decode GEMV: lanes stream each weight row with coalesced uint/uvec4 loads
+  # and sum through subgroupAdd where the driver reports subgroup arithmetic
+  # (T4), else through shared memory; both variants are timed where both run.
+  # MoltenVK on Intel reports the builtins without arithmetic and gets them
+  # wrong there, which parity rejects (BYBY_Q4_SUBGROUP=force still tries).
+  let sg = gDeviceCaps.subgroupSize
+  let sgMode = getEnv("BYBY_Q4_SUBGROUP", "1")
+  var reduceModes = @[true]
+  if sgMode == "force" or gDeviceCaps.subgroupArithmetic: reduceModes.add false
+  if M == 1 and sg > 0 and sgMode != "0":
+    for sharedReduce in reduceModes:
+      for vec in [1, 4]:
+        if K mod (8 * vec) != 0 or (group > 0 and group mod (8 * vec) != 0): continue
+        for rows in [1, 2, 4]:
+          for tg in [64, 128, 256]:
+            if tg < sg or tg mod sg != 0 or tg > gDeviceCaps.maxThreads: continue
+            try:
+              plans.add q4CompileSubgroup(tg, rows, vec, sharedReduce)
+            except CatchableError as e:
+              stderr.writeLine "[q4-tune:vulkan] skip candidate: " & e.msg
   if coopCandidate:
     plans.add VkQ4Plan(kind: q4Cooperative, name: "KHR-cooperative-matrix")
   if plans.len == 1: return false
@@ -83,17 +125,24 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
   var output = vulkanSessionAllocScratch(M * N)
   defer:
     vulkanSessionFree(input); vulkanSessionFree(output)
-  proc run(plan: VkQ4Plan): tuple[ok: bool, ms: float] =
+  proc run(plan: VkQ4Plan; reps = 1): tuple[ok: bool, ms: float] =
+    ## reps dispatches in one submit: one submit + fence wait (~1 ms on a
+    ## dGPU) otherwise swamps a GEMV of a few tens of microseconds and every
+    ## candidate times the same.
     let start = getMonoTime()
     if not vulkanSessionBegin(): return (false, 0.0)
-    var encoded = false
+    var encoded = true
     try:
-      encoded = q4Encode(plan, input, w, scales, zeros, output, M, K, N, group, groups, wqOffset)
+      for i in 0 ..< reps:
+        encoded = encoded and q4Encode(plan, input, w, scales, zeros, output,
+          M, K, N, group, groups, wqOffset)
+        if not encoded: break
     except CatchableError as e:
+      encoded = false
       stderr.writeLine "[q4-tune:vulkan] reject " & plan.name & ": " & e.msg
     if not vulkanSessionEnd():
       raise newException(CatchableError, "Q4 tuning GPU failed: " & vulkanGetLastError())
-    (encoded, float((getMonoTime() - start).inNanoseconds) / 1e6)
+    (encoded, float((getMonoTime() - start).inNanoseconds) / 1e6 / float(reps))
   var reference: seq[float32]
   var valid: seq[VkQ4Plan]
   for i, plan in plans:
@@ -114,11 +163,15 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
         err = max(err, abs(v - reference[j])); mag = max(mag, abs(reference[j]))
       let tolerance = if plan.kind == q4Cooperative: 3e-3'f32 else: 1e-4'f32
       if finite and err <= max(1e-5'f32, mag * tolerance): valid.add plan
+      elif getEnv("BYBY_Q4_TUNE_VERBOSE", "0") == "1":
+        stderr.writeLine "[q4-tune:vulkan] parity reject " & plan.name & ": err=" & $err &
+          " max=" & $mag & " finite=" & $finite
   var samples = newSeq[seq[float]](valid.len)
+  let reps = if M == 1: 32 else: 4
   for round in 0 ..< 3:
     for j in 0 ..< valid.len:
       let i = if round mod 2 == 0: j else: valid.high - j
-      let measured = run(valid[i])
+      let measured = run(valid[i], reps)
       if not measured.ok: raise newException(CatchableError, "Q4 timed dispatch failed")
       samples[i].add measured.ms
   for times in samples.mitems: times.sort()

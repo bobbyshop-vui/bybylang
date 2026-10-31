@@ -168,6 +168,7 @@ type
     properties*: VkPhysicalDeviceProperties
     extensions*: HashSet[string]
     subgroupSize*: int
+    subgroupArithmetic*: bool   ## subgroupAdd & co. in compute shaders
     float16*, int8*, storage8*, memoryModel*, cooperativeMatrix*: bool
     float8E4M3CooperativeMatrix*: bool
     tileM*, tileN*, tileK*: int
@@ -212,7 +213,9 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
     var props = VkPhysicalDeviceProperties2(sType: 1000059001,
       pNext: (if hasHostImport: pointer(addr hostProps) else: pointer(addr subgroup)))
     getProps2(device, addr props)
-    if (subgroup.supportedStages and 0x20) != 0: result.subgroupSize = int(subgroup.subgroupSize)
+    if (subgroup.supportedStages and 0x20) != 0:
+      result.subgroupSize = int(subgroup.subgroupSize)
+      result.subgroupArithmetic = (subgroup.supportedOperations and 0x4) != 0
     if hasHostImport: result.hostImportAlignment = hostProps.minImportedHostPointerAlignment
     if hasCoop and (coopProps.supportedStages and 0x20) == 0: return
   let getFeatures2 = cast[proc(d: pointer; p: ptr VkFeatures2) {.cdecl.}](
