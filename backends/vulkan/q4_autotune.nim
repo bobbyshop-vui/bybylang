@@ -57,7 +57,12 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
      wqOffset < 0 or w.sizeBytes < uint64(wqOffset) + uint64(N) * uint64(K div 2) or
      scales.sizeBytes < uint64(N) * uint64(groups) * 4 or
      zeros.sizeBytes < uint64(N) * uint64(groups) * 4: return false
-  let M = if mode == 1: 1 else: 8
+  # Every M>1 shares the "m8" plan. With tensor cores, time the candidates at
+  # a prompt-sized M: the cooperative kernel's 16x16 tiles are mostly idle at
+  # M=8 and would lose to the scalar kernels that prefill then outgrows.
+  let coopCandidate = mode != 1 and gCoopEnabled and gDeviceCaps.cooperativeMatrix and
+    K >= 64 and N >= 16 and wqOffset == 0
+  let M = if mode == 1: 1 elif coopCandidate: 64 else: 8
   let key = q4Key(K, N, group, groups, M)
   if key in gVkQ4Plans: return true
   var plans = @[VkQ4Plan(kind: q4Reference, name: "reference-tg128")]
@@ -69,7 +74,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
         plans.add q4Compile(tg, rows, batch)
       except CatchableError as e:
         stderr.writeLine "[q4-tune:vulkan] skip candidate: " & e.msg
-  if M > 1 and gCoopEnabled and K >= 64 and N >= 16 and wqOffset == 0:
+  if coopCandidate:
     plans.add VkQ4Plan(kind: q4Cooperative, name: "KHR-cooperative-matrix")
   if plans.len == 1: return false
   var data = newSeq[float32](M * K)
