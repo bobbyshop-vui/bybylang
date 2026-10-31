@@ -974,6 +974,16 @@ proc sessionJitPrewarm*(backend: GpuBackend;
   if chosen == gbVulkan:
     vulkanJitPrewarm(jobs)
 
+proc sessionCooperativeGemmJobs*(backend: GpuBackend):
+    seq[tuple[name, source: string]] =
+  ## Shaders behind sessionFp4GemmTensorCore / sessionMatmulNTAccelerated, for
+  ## sessionJitPrewarm. Empty when no cooperative route is available.
+  if normalizeBackend(backend) == gbVulkan: vulkanCoopPrewarmJobs() else: @[]
+
+proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool =
+  ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
+  normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
+
 proc sessionJitMicroVmEnc*(backend: GpuBackend, kernelName, source: string,
                            mem: SessionHandle, nThreads, tgSize: int; tgFloats = 1024): bool =
   var chosen = backend
@@ -1269,6 +1279,19 @@ proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
   if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
   vulkanSessionFp4GemmEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
     c.vulkanHandle, M, K, N)
+
+proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
+    c: var SessionHandle; M, K, N: int): bool =
+  ## Only the tiled FP4 cooperative kernel (for parity checks); false if it
+  ## cannot run on this device/shape.
+  if normalizeBackend(backend) != gbVulkan: return false
+  if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
+  vulkanSessionFp4GemmTiledEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
+    c.vulkanHandle, M, K, N)
+
+proc sessionSetFp4GemmTiled*(backend: GpuBackend; enabled: bool) =
+  ## Let sessionFp4GemmTensorCore prefer the tiled kernel (after a parity check).
+  if normalizeBackend(backend) == gbVulkan: vulkanSetFp4GemmTiled(enabled)
 
 proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, rows, cols: int): bool =
   var chosen = backend
