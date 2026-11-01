@@ -132,6 +132,21 @@ type
     sType: uint32
     pNext: pointer
     minImportedHostPointerAlignment: uint64
+  VkSmBuiltinsPropertiesNV = object     ## VK_NV_shader_sm_builtins
+    sType: uint32
+    pNext: pointer
+    shaderSMCount, shaderWarpsPerSM: uint32
+  VkShaderCorePropertiesAMD = object    ## VK_AMD_shader_core_properties
+    sType: uint32
+    pNext: pointer
+    shaderEngineCount, shaderArraysPerEngineCount, computeUnitsPerShaderArray,
+      simdPerComputeUnit, wavefrontsPerSimd, wavefrontSize,
+      sgprsPerSimd, minSgprAllocation, maxSgprAllocation, sgprAllocationGranularity,
+      vgprsPerSimd, minVgprAllocation, maxVgprAllocation, vgprAllocationGranularity: uint32
+  VkShaderCoreProperties2AMD = object   ## VK_AMD_shader_core_properties2
+    sType: uint32
+    pNext: pointer
+    shaderCoreFeatures, activeComputeUnitCount: uint32
   VkFeatures2 = object
     sType: uint32
     pNext: pointer
@@ -175,6 +190,12 @@ type
     maxThreads*, maxSharedBytes*: int
     minStorageAlignment*: uint64
     hostImportAlignment*: uint64   ## 0 without VK_EXT_external_memory_host
+    ## Streaming multiprocessors (NVIDIA) or compute units (AMD): the matrix
+    ## units sit inside them, so a GEMM grid keeps all of them busy only with
+    ## enough workgroups per SM/CU. 0 when the driver does not report it.
+    computeUnits*: int
+    warpsPerComputeUnit*: int      ## resident subgroups per SM/CU (0: unknown)
+    computeUnitSource*: string     ## which extension reported computeUnits
 
 const
   Float16Int8Type* = 1000082000'u32
@@ -210,9 +231,32 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
       pNext: (if hasCoop: addr coopProps else: nil))
     let hasHostImport = "VK_EXT_external_memory_host" in result.extensions
     var hostProps = VkExternalMemoryHostProperties(sType: 1000178002, pNext: addr subgroup)
-    var props = VkPhysicalDeviceProperties2(sType: 1000059001,
-      pNext: (if hasHostImport: pointer(addr hostProps) else: pointer(addr subgroup)))
+    # SM / CU counts. Property structs only need the extension to be present.
+    var smProps = VkSmBuiltinsPropertiesNV(sType: 1000154001'u32)
+    var amdCore = VkShaderCorePropertiesAMD(sType: 1000185000'u32)
+    var amdCore2 = VkShaderCoreProperties2AMD(sType: 1000227000'u32)
+    var chain: pointer = addr subgroup
+    if hasHostImport: chain = addr hostProps
+    if "VK_NV_shader_sm_builtins" in result.extensions:
+      smProps.pNext = chain; chain = addr smProps
+    if "VK_AMD_shader_core_properties" in result.extensions:
+      amdCore.pNext = chain; chain = addr amdCore
+    if "VK_AMD_shader_core_properties2" in result.extensions:
+      amdCore2.pNext = chain; chain = addr amdCore2
+    var props = VkPhysicalDeviceProperties2(sType: 1000059001, pNext: chain)
     getProps2(device, addr props)
+    if smProps.shaderSMCount > 0:
+      result.computeUnits = int(smProps.shaderSMCount)
+      result.warpsPerComputeUnit = int(smProps.shaderWarpsPerSM)
+      result.computeUnitSource = "NV_shader_sm_builtins"
+    elif amdCore2.activeComputeUnitCount > 0 or amdCore.computeUnitsPerShaderArray > 0:
+      result.computeUnits = if amdCore2.activeComputeUnitCount > 0:
+          int(amdCore2.activeComputeUnitCount)
+        else:
+          int(amdCore.shaderEngineCount * amdCore.shaderArraysPerEngineCount *
+            amdCore.computeUnitsPerShaderArray)
+      result.warpsPerComputeUnit = int(amdCore.simdPerComputeUnit * amdCore.wavefrontsPerSimd)
+      result.computeUnitSource = "AMD_shader_core_properties"
     if (subgroup.supportedStages and 0x20) != 0:
       result.subgroupSize = int(subgroup.subgroupSize)
       result.subgroupArithmetic = (subgroup.supportedOperations and 0x4) != 0

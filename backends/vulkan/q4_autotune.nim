@@ -123,8 +123,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
             except CatchableError as e:
               stderr.writeLine "[q4-tune:vulkan] skip candidate: " & e.msg
   if coopCandidate:
-    if gDeviceCaps.subgroupSize == 32 and gDeviceCaps.maxThreads >= 128 and
-        K mod 64 == 0 and group mod 2 == 0 and wqOffset mod 16 == 0:
+    if tiledCoopSupported() and K mod 64 == 0 and group mod 2 == 0 and wqOffset mod 16 == 0:
       plans.add VkQ4Plan(kind: q4CoopTiled, name: "KHR-cooperative-matrix-tiled64")
     plans.add VkQ4Plan(kind: q4Cooperative, name: "KHR-cooperative-matrix")
   if plans.len == 1: return false

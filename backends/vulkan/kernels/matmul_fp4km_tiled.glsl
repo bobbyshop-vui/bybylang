@@ -10,15 +10,20 @@
 // 2 = asymmetric Q4 (DeepSeek/Llama): byte i of a row holds k=2i (low nibble)
 // and k=2i+1 (high), value = (q - zero[g]) * scale[g] with
 // g = col * groupsPerRow + k / groupSize (groupSize 0: one group per row).
-// One workgroup = 4 subgroups of 32 = 64 output columns x 64 rows. Each 64-deep
+// One workgroup = 4 subgroups = 64 output columns x 64 rows. Each 64-deep
 // K step decodes the packed weights once into shared FP16 (one thread per
 // column/group: one uvec4 + one scale) and reuses them for every active 16-row
 // tile. matmul_coop.glsl instead re-decodes per 16x16 tile and per 16-deep K
 // step, so a 17-token prompt decoded every weight twice. Row tiles at or past M
 // skip both their activation loads and their MMAs.
-// Host contract: local size 128, subgroup size 32, K % 64 == 0, x and y at
-// buffer offset 0 with row strides K and N; format 2 also wOffset % 16 == 0
-// and groupSize even.
+// Split-K: workgroup z covers k in [z * kPerSlice, (z + 1) * kPerSlice) and
+// writes its partial sums to y + z * M * N (the host sums the slices); with
+// one slice (kPerSlice 0 or K) it writes the result directly. It keeps every
+// SM/CU busy when M and N alone give too few workgroups (short prompts).
+// Host contract: local size WG_THREADS = 4 subgroups (128 for subgroup 32,
+// 256 for AMD wave64), K % 64 == 0, kPerSlice % 64 == 0, x and y at buffer
+// offset 0 with row strides K and N; format 2 also wOffset % 16 == 0 and
+// groupSize even.
 layout(local_size_x_id = 0) in;
 layout(std430, binding = 0) readonly buffer Input { vec4 x4[]; };
 #ifndef WEIGHT_FORMAT
@@ -35,13 +40,18 @@ layout(std430, binding = 3) readonly buffer Lut { float lut[]; };
 #if WEIGHT_FORMAT == 2
 layout(std430, binding = 4) readonly buffer Zero { float zero[]; };
 #endif
-layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow, wOffset; } p;
+layout(push_constant) uniform Params {
+    uint M, K, N, groupSize, groupsPerRow, wOffset, kPerSlice;
+} p;
 
 const uint BM = 64;
 const uint BN = 64;
 const uint BK = 64;
 const uint LDS = BK + 8;   // padded row (halves): 144 bytes, 16-byte aligned
-const uint THREADS = 128;
+#ifndef WG_THREADS
+#define WG_THREADS 128
+#endif
+const uint THREADS = WG_THREADS;
 
 shared float16_t aTile[BM * LDS];
 shared float16_t bTile[BN * LDS];
@@ -70,7 +80,10 @@ void main() {
         acc[r] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     barrier();
 
-    for (uint base = 0; base < p.K; base += BK) {
+    uint kPer = p.kPerSlice > 0u ? p.kPerSlice : p.K;
+    uint kBegin = gl_WorkGroupID.z * kPer;
+    uint kEnd = min(p.K, kBegin + kPer);
+    for (uint base = kBegin; base < kEnd; base += BK) {
         // Activations: only active row tiles, 16 vec4 per row.
         for (uint i = lid; i < rowTiles * 16u * (BK / 4u); i += THREADS) {
             uint r = i >> 4;
@@ -99,6 +112,8 @@ void main() {
 #elif WEIGHT_FORMAT == 2
         // One uvec4 = 32 consecutive k of one column; the group changes at
         // most every groupSize (even) values, so scale/zero load per byte pair.
+        // Threads past 2 * BN (wave64 workgroups) have no column half.
+        if (lid < 2u * BN) {
         uint kb = base + bHalf * 32u;
         uvec4 packed = uvec4(0u);
         if (gCol < p.N) packed = w4[(p.wOffset + gCol * (p.K >> 1) + (kb >> 1)) >> 4];
@@ -121,8 +136,10 @@ void main() {
                 bTile[ob + 8u * j + 2u * b + 1u] = float16_t((float(byteV >> 4) - zr) * sc);
             }
         }
+        }
 #else
         // Weights: byte i of a 32-value group holds k=i (low) and k=16+i (high).
+        if (lid < 2u * BN) {
         uint g = (base >> 5) + bHalf;
         uvec4 packed = uvec4(0u);
         float scale = 0.0;
@@ -139,6 +156,7 @@ void main() {
                 bTile[ob + 4u * j + b] = float16_t(lutS[byteV & 15u] * scale);
                 bTile[ob + 16u + 4u * j + b] = float16_t(lutS[byteV >> 4] * scale);
             }
+        }
         }
 #endif
         barrier();
@@ -171,7 +189,8 @@ void main() {
                 for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
                     uint row = row0 + r * 16u + (e >> 4);
                     uint col = col0 + sg * 16u + (e & 15u);
-                    if (row < p.M && col < p.N) y[row * p.N + col] = cStage[sg * 256u + e];
+                    if (row < p.M && col < p.N)
+                        y[(gl_WorkGroupID.z * p.M + row) * p.N + col] = cStage[sg * 256u + e];
                 }
                 subgroupBarrier();
             }

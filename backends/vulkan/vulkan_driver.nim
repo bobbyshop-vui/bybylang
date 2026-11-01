@@ -691,7 +691,11 @@ proc ensureInit() =
     " mmapImport=" & (if gHostImportEnabled: $gDeviceCaps.hostImportAlignment else: "off") &
     " matrix=" & (if gFp8CoopEnabled: "KHR_cooperative_matrix FP8-E4M3/FP32 + FP16/FP32"
       elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar") &
-    (if gCoopRequired: " prefill=tensor-cores-only" else: "")
+    (if gCoopRequired: " prefill=tensor-cores-only" else: "") &
+    " units=" & (if gDeviceCaps.computeUnits > 0:
+        $gDeviceCaps.computeUnits & " (" & gDeviceCaps.computeUnitSource &
+        ", " & $gDeviceCaps.warpsPerComputeUnit & " subgroups/unit)"
+      else: "unknown")
   stderr.writeLine "[vulkan] Initialised: instance+device+queue+commandPool ready (queueFamily=" & $gQueueFamilyIndex & ")"
 
 proc vulkanDeviceCaps*(): VulkanCaps =
@@ -1924,8 +1928,54 @@ proc tiledMatmulShader(weightFormat: int): tuple[name, source: string] =
     of 1: "coop_matmul_fp4km_tiled"
     of 2: "coop_matmul_q4_tiled"
     else: "coop_matmul_f32_tiled"
-  (name, "#version 450\n#define WEIGHT_FORMAT " & $weightFormat & "\n" &
+  (name, "#version 450\n#define WEIGHT_FORMAT " & $weightFormat &
+    "\n#define WG_THREADS " & $(4 * gDeviceCaps.subgroupSize) & "\n" &
     templateSrc.replace("#version 450\n", ""))
+
+proc tiledCoopSupported(): bool =
+  ## The tiled kernel runs four subgroups per workgroup: 32-wide (NVIDIA,
+  ## Intel, AMD wave32) or 64-wide (AMD wave64).
+  gCoopEnabled and gDeviceCaps.cooperativeMatrix and
+    gDeviceCaps.subgroupSize in [32, 64] and
+    gDeviceCaps.maxThreads >= 4 * gDeviceCaps.subgroupSize and
+    gDeviceCaps.maxSharedBytes >= 24 * 1024
+
+const SplitKReduceShader = (name: "coop_splitk_reduce", source: """#version 450
+// Sums the split-K partial results of matmul_fp4km_tiled: y[i] = sum_z part[z][i].
+layout(local_size_x_id = 0) in;
+layout(std430, binding = 0) readonly buffer Part { float part[]; };
+layout(std430, binding = 1) writeonly buffer Out { float y[]; };
+layout(push_constant) uniform Params { uint count, slices; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.count) return;
+    float s = 0.0;
+    for (uint z = 0u; z < p.slices; ++z) s += part[z * p.count + i];
+    y[i] = s;
+}
+""")
+
+var gSplitKScratch: VulkanBufferHandle   ## partial sums, reused (barriers order it)
+var gSplitKLogged = initTable[string, bool]()
+
+proc tiledSplitK(M, K, N: int): int =
+  ## K slices for the tiled kernel. Its grid is ceil(N/64) x ceil(M/64)
+  ## workgroups; a short prompt gives too few to keep every SM/CU (and the
+  ## matrix units inside it) busy, so split K until the grid reaches about
+  ## four workgroups per SM/CU. Each slice keeps at least 256 values of K.
+  ## BYBY_VULKAN_SPLIT_K=<n> fixes the slice count (1 = off).
+  let mode = getEnv("BYBY_VULKAN_SPLIT_K", "auto")
+  if mode != "auto":
+    try: result = parseInt(mode)
+    except ValueError: result = 1
+  else:
+    let units = if gDeviceCaps.computeUnits > 0: gDeviceCaps.computeUnits else: 16
+    let grid = ((N + 63) div 64) * ((M + 63) div 64)
+    result = 1
+    while grid * result < 4 * units and K div (64 * result * 2) >= 4 and result < 16:
+      result *= 2
+  result = max(1, min(result, min(16, K div 64)))
+
 
 # Off until the caller has checked them against the generic cooperative kernel
 # on this device (vulkanSet*GemmTiled); MoltenVK cannot run either locally.
@@ -1951,10 +2001,11 @@ proc vulkanCoopPrewarmJobs*(): seq[tuple[name, source: string]] =
   if gCoopEnabled and gDeviceCaps.cooperativeMatrix:
     result.add coopMatmulShader(0)
     result.add coopMatmulShader(1)
-    if gDeviceCaps.subgroupSize == 32 and gDeviceCaps.maxThreads >= 128:
+    if tiledCoopSupported():
       result.add tiledMatmulShader(1)
       result.add tiledMatmulShader(0)
       result.add tiledMatmulShader(2)
+      result.add SplitKReduceShader
     result.add coopMatmulShader(2)
 
 proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
@@ -2020,8 +2071,7 @@ proc tryTiledCooperative(a, w, c, lut: VulkanBufferHandle; M, K, N, weightFormat
   ## matmul_fp4km_tiled: weights converted once per 64 output rows instead of
   ## once per 16x16 tile. False when the device/shape does not fit its contract.
   ## Format 2 (asymmetric Q4): lut = scales, zeros, [N, groupsPerRow] each.
-  if not gCoopEnabled or not gDeviceCaps.cooperativeMatrix or not gSessionActive or
-      gDeviceCaps.subgroupSize != 32 or gDeviceCaps.maxThreads < 128 or
+  if not tiledCoopSupported() or not gSessionActive or
       M < coopMinRows() or K mod 64 != 0 or N < 16: return false
   if a.buf == nil or w.buf == nil or c.buf == nil or lut.buf == nil: return false
   let weightBytes = case weightFormat
@@ -2046,14 +2096,47 @@ proc tryTiledCooperative(a, w, c, lut: VulkanBufferHandle; M, K, N, weightFormat
     else: discard   # Q4: its autotune drops the plan
     stderr.writeLine "[vulkan] tiled cooperative shader unavailable: " & e.msg
     return false
+  # Split K across workgroup z when M x N alone leaves SMs/CUs idle; the
+  # slices write partial sums that one reduce pass adds into c.
+  let split = tiledSplitK(M, K, N)
+  let kPer = ((K div 64 + split - 1) div split) * 64
+  let slices = (K + kPer - 1) div kPer
+  var dst = c
+  var reduceSpv: string
+  if slices > 1:
+    try:
+      reduceSpv = compileVulkanJitShader(SplitKReduceShader.name, SplitKReduceShader.source)
+    except CatchableError as e:
+      stderr.writeLine "[vulkan] split-K reduce shader unavailable: " & e.msg
+      return false
+    let need = uint64(slices * M * N) * 4
+    if gSplitKScratch.buf == nil or gSplitKScratch.sizeBytes < need:
+      vulkanSessionFree(gSplitKScratch)   # deferred while this session still uses it
+      gSplitKScratch = vulkanSessionAllocScratch(slices * M * N * 3 div 2)
+    dst = gSplitKScratch
+  let threads = 4 * gDeviceCaps.subgroupSize
+  let gridX = uint32((N + 63) div 64)
+  let gridY = uint32((M + 63) div 64)
+  let logKey = $weightFormat & "_" & $K & "x" & $N & "_m" & $M
+  if logKey notin gSplitKLogged:
+    gSplitKLogged[logKey] = true
+    if getEnv("BYBY_VULKAN_SPLIT_K_VERBOSE", "0") == "1" or gSplitKLogged.len <= 8:
+      stderr.writeLine "[vulkan] tiled tensor-core GEMM " & $K & "x" & $N & " M=" & $M &
+        ": " & $(gridX * gridY) & " workgroups x split-K " & $slices & " = " &
+        $(int(gridX * gridY) * slices) & " on " &
+        (if gDeviceCaps.computeUnits > 0: $gDeviceCaps.computeUnits else: "?") & " SM/CU"
   var pc = [uint32(M), uint32(K), uint32(N), uint32(groupSize), uint32(groupsPerRow),
-    uint32(wOffset)]
-  if weightFormat == 2:
-    dispatchGeneric(kn, [a, w, c, lut, zeros], addr pc[0], 24,
-      uint32((N + 63) div 64), uint32((M + 63) div 64), 1, 128, spv)
-  else:
-    dispatchGeneric(kn, [a, w, c, lut], addr pc[0], 24,
-      uint32((N + 63) div 64), uint32((M + 63) div 64), 1, 128, spv)
+    uint32(wOffset), uint32(if slices > 1: kPer else: 0)]
+  result = if weightFormat == 2:
+      dispatchGeneric(kn, [a, w, dst, lut, zeros], addr pc[0], 28,
+        gridX, gridY, uint32(slices), threads, spv)
+    else:
+      dispatchGeneric(kn, [a, w, dst, lut], addr pc[0], 28,
+        gridX, gridY, uint32(slices), threads, spv)
+  if result and slices > 1:
+    var rp = [uint32(M * N), uint32(slices)]
+    result = dispatchGeneric(SplitKReduceShader.name, [gSplitKScratch, c], addr rp[0], 8,
+      uint32((M * N + 255) div 256), 1, 1, 256, reduceSpv)
 
 proc vulkanSessionFp4GemmTiledEnc*(a, w, lut: VulkanBufferHandle;
                                    c: var VulkanBufferHandle; M, K, N: int): bool =
