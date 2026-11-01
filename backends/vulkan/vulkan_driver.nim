@@ -689,6 +689,7 @@ proc ensureInit() =
     " subgroup=" & $gDeviceCaps.subgroupSize & " maxThreads=" & $gDeviceCaps.maxThreads &
     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
     " mmapImport=" & (if gHostImportEnabled: $gDeviceCaps.hostImportAlignment else: "off") &
+    " shaderFloat16=" & $gDeviceCaps.float16 &
     " matrix=" & (if gFp8CoopEnabled: "KHR_cooperative_matrix FP8-E4M3/FP32 + FP16/FP32"
       elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar") &
     (if gCoopRequired: " prefill=tensor-cores-only" else: "") &
@@ -2308,6 +2309,7 @@ void main() {
 """)
 
 const flashScalarGlsl = staticRead("kernels/attention_prefill_flash.glsl")
+const flashFp16Glsl = staticRead("kernels/attention_prefill_flash_fp16.glsl")
 const flashCoopGlsl = staticRead("kernels/attention_prefill_flash_coop.glsl")
 const FlashScalarMaxD = 128
 const FlashScalarSharedBytes = (16 * 128 + 16 * 129 + 16 * 128 + 16 * 17) * 4
@@ -2355,6 +2357,10 @@ proc encodeFlash(kind: string; q, kAll, vAll, o: VulkanBufferHandle;
     let spv = compileVulkanJitShader(name, source)
     dispatchGeneric(name, [q, kAll, vAll, o], addr pc[0], 28, groupsX, uint32(H), 1,
       gDeviceCaps.subgroupSize, spv)
+  elif kind == "fp16":
+    let spv = compileVulkanJitShader("attention_prefill_flash_fp16", flashFp16Glsl)
+    dispatchGeneric("attention_prefill_flash_fp16", [q, kAll, vAll, o], addr pc[0], 28,
+      groupsX, uint32(H), 1, 0, spv)
   else:
     let spv = compileVulkanJitShader("attention_prefill_flash", flashScalarGlsl)
     dispatchGeneric("attention_prefill_flash", [q, kAll, vAll, o], addr pc[0], 28,
@@ -2428,7 +2434,7 @@ proc flashParity(kind: string; D: int): tuple[ok: bool, err: float] =
     for i in 0 ..< got.len:
       let e = abs(float(got[i]) - float(expected[i]))
       if e != e or e > result.err: result.err = (if e != e: Inf else: e)
-    let tol = if kind == "coop": 2e-2 else: 1e-4
+    let tol = if kind == "coop": 2e-2 elif kind == "fp16": 3e-3 else: 1e-4
     result.ok = result.err <= tol
   else:
     result = (false, Inf)
@@ -2437,15 +2443,20 @@ proc flashParity(kind: string; D: int): tuple[ok: bool, err: float] =
 proc vulkanFlashAttentionPrepare*(D: int): string =
   ## Picks and checks the prefill flash-attention kernel for head dim D, outside
   ## any session: "coop" (tensor cores), "scalar", or "" (none passed parity;
-  ## the caller keeps its old attention path). BYBY_FLASH_ATTENTION=scalar
-  ## skips the tensor-core kernel, =0 turns both off.
+  ## the caller keeps its old attention path). The order is tensor core, scalar
+  ## FP16, then scalar FP32; BYBY_FLASH_ATTENTION=scalar forces the FP32 path.
   ensureInit()
   if D in gFlashKind: return gFlashKind[D]
   let mode = getEnv("BYBY_FLASH_ATTENTION", "auto")
   result = ""
+  if mode == "fp16" and not gDeviceCaps.float16:
+    stderr.writeLine "[vulkan] FP16 flash attention unavailable: Vulkan shaderFloat16 feature is not exposed; using FP32"
   if mode != "0" and not gSessionActive:
     var candidates: seq[string]
-    if mode != "scalar" and flashCoopSupported(D): candidates.add "coop"
+    if mode != "scalar" and mode != "fp16" and flashCoopSupported(D): candidates.add "coop"
+    if mode != "scalar" and gDeviceCaps.float16 and D > 0 and D <= FlashScalarMaxD and
+        gDeviceCaps.maxThreads >= 128 and gDeviceCaps.maxSharedBytes >= FlashScalarSharedBytes div 2:
+      candidates.add "fp16"
     if flashScalarSupported(D): candidates.add "scalar"
     for kind in candidates:
       let (ok, err) = flashParity(kind, D)
@@ -2458,6 +2469,7 @@ proc vulkanFlashAttentionPrepare*(D: int): string =
   if result.len > 0:
     stderr.writeLine "[vulkan] prefill flash attention D=" & $D & ": " &
       (if result == "coop": "tensor cores (KHR_cooperative_matrix FP16/FP32, lazy rescale)"
+       elif result == "fp16": "scalar FP16 operands with FP32 softmax/accumulation"
        else: "scalar FP32")
 
 proc vulkanSessionFlashAttentionPrefillEnc*(q, kAll, vAll: VulkanBufferHandle;

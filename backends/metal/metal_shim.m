@@ -1741,7 +1741,11 @@ int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAl
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_attention_prefill_flash_enc] metal_session_begin not called"); return 0; }
         if (T <= 0 || H <= 0 || HKV <= 0 || D <= 0 || D > 128 || pos < 0 || pos + T > maxSeqLen) return 0;
-        id<MTLComputePipelineState> pipeline = getPipeline(@"attention_prefill_flash_kernel");
+        const char *flashMode = getenv("BYBY_FLASH_ATTENTION");
+        id<MTLComputePipelineState> pipeline =
+            (flashMode && strcmp(flashMode, "scalar") == 0) ? nil :
+            getPipeline(@"attention_prefill_flash_fp16_kernel");
+        if (!pipeline) pipeline = getPipeline(@"attention_prefill_flash_kernel");
         if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
         MetalFlashParams params = { (uint32_t)T, (uint32_t)H, (uint32_t)HKV, (uint32_t)D,
                                     (uint32_t)pos, (uint32_t)maxSeqLen, scale * 1.4426950408889634f };
@@ -1757,6 +1761,12 @@ int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAl
         [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         return 1;
     }
+}
+
+int metal_attention_prefill_flash_fp16_supported(void) {
+    const char *flashMode = getenv("BYBY_FLASH_ATTENTION");
+    return !(flashMode && strcmp(flashMode, "scalar") == 0) &&
+        getPipeline(@"attention_prefill_flash_fp16_kernel") != nil;
 }
 
 int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, int HKV, int D,

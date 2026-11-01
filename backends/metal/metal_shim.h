@@ -206,6 +206,7 @@ int metal_attention_decode_all_heads_enc(MetalBufferHandle q, MetalBufferHandle 
 int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAll, MetalBufferHandle vAll,
                                       MetalBufferHandle o, int T, int H, int HKV, int D, int pos,
                                       int maxSeqLen, float scale);
+int metal_attention_prefill_flash_fp16_supported(void);
 // KV cache append: dst[h, pos + t, :] = src[t, h, :].
 int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, int HKV, int D,
                          int pos, int maxSeqLen);

@@ -12,6 +12,7 @@ when defined(macosx):
   const kMetalKernelSrc = staticRead(metalDir / "kernels" / "vecop_matmul.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_decode_all_heads.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash.metal") &
+    "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash_fp16.metal") &
     "\n" & staticRead(metalDir / "kernels" / "matmul_q4_batched.metal") &
     "\n" & staticRead(metalDir / "kernels" / "matmul_q4_gemm.metal") &
     "\n" & staticRead(metalDir / "kernels" / "micro_vm.metal") &
@@ -500,6 +501,8 @@ when defined(macosx):
   proc metal_attention_prefill_flash_enc_c(q, kAll, vAll, o: MetalBufferHandle,
                                             T, H, HKV, D, pos, maxSeqLen: cint, scale: cfloat): cint
     {.importc: "metal_attention_prefill_flash_enc", header: "metal_shim.h".}
+  proc metal_attention_prefill_flash_fp16_supported_c(): cint
+    {.importc: "metal_attention_prefill_flash_fp16_supported", header: "metal_shim.h".}
   proc metal_kv_scatter_enc_c(src, dst: MetalBufferHandle, T, HKV, D, pos, maxSeqLen: cint): cint
     {.importc: "metal_kv_scatter_enc", header: "metal_shim.h".}
   proc metal_session_end_c(): cint {.importc: "metal_session_end", header: "metal_shim.h".}
@@ -715,6 +718,12 @@ when defined(macosx):
     ## Causal prefill flash attention (attention_prefill_flash.metal), D <= 128.
     metal_attention_prefill_flash_enc_c(q, kAll, vAll, o, cint(T), cint(H), cint(HKV), cint(D),
                                         cint(pos), cint(maxSeqLen), cfloat(scale)) != 0
+
+  proc metalSessionFlashAttentionPrepare*(D: int): string =
+    if D > 0 and D <= 128 and metal_attention_prefill_flash_fp16_supported_c() != 0:
+      "scalar FP16"
+    elif D > 0 and D <= 128: "scalar FP32"
+    else: ""
 
   proc metalSessionKvScatterEnc*(src, dst: MetalBufferHandle; T, HKV, D, pos, maxSeqLen: int): bool =
     metal_kv_scatter_enc_c(src, dst, cint(T), cint(HKV), cint(D), cint(pos), cint(maxSeqLen)) != 0

@@ -1,6 +1,6 @@
 ## Included by vulkan_driver: Q4 plans share its device/session/pipeline cache.
 type
-  VkQ4PlanKind = enum q4Reference, q4Wide, q4Cooperative, q4Subgroup, q4CoopTiled
+  VkQ4PlanKind = enum q4Reference, q4Wide, q4Cooperative, q4Subgroup, q4CoopTiled, q4Gemm
   VkQ4Plan = object
     kind: VkQ4PlanKind
     tg, rows, batch, vec: int
@@ -10,7 +10,7 @@ var gVkQ4Plans = initTable[string, VkQ4Plan]()
 var gVkQ4WideDispatches = 0
 
 proc q4Key(K, N, group, groups, M: int): string =
-  $K & "_" & $N & "_g" & $group & "_" & $groups & "_m" & $(if M == 1: 1 else: 8)
+  $K & "_" & $N & "_g" & $group & "_" & $groups & "_m" & $(if M == 1: 1 else: 64)
 
 proc q4ReferenceEnc(a, w, scales, zeros, c: VulkanBufferHandle;
                     M, K, N, group, groups, wqOffset: int): bool =
@@ -29,6 +29,11 @@ proc q4Encode(plan: VkQ4Plan; a, w, scales, zeros, c: VulkanBufferHandle;
   of q4CoopTiled:
     result = tryTiledCooperative(a, w, c, scales, M, K, N, 2, zeros, group, groups,
       wqOffset)
+  of q4Gemm:
+    var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups), int32(wqOffset)]
+    result = dispatchGeneric(plan.name, [a, w, scales, zeros, c], addr pc[0], 24,
+      uint32((N + plan.rows - 1) div plan.rows),
+      uint32((M + plan.batch - 1) div plan.batch), 1, 128, plan.spv)
   of q4Wide:
     var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups), int32(wqOffset)]
     result = dispatchGeneric(plan.name, [a, w, scales, zeros, c], addr pc[0], 24,
@@ -69,6 +74,16 @@ proc q4CompileSubgroup(tg, rows, vec: int; sharedReduce: bool): VkQ4Plan =
   result.spv = compileVulkanJitShader(result.name, source)
   discard getOrCreatePipeline(result.name, 5, 24, tg, result.spv)
 
+proc q4CompileGemm(bm, bn, tm, tn: int): VkQ4Plan =
+  const sourceTemplate = staticRead("kernels/matmul_q4_gemm.glsl")
+  result = VkQ4Plan(kind: q4Gemm, rows: bn, batch: bm,
+    name: "q4_gemm_" & $bm & "x" & $bn)
+  let source = "#version 450\n#define BM " & $bm & "\n#define BN " & $bn &
+    "\n#define TM " & $tm & "\n#define TN " & $tn & "\n" &
+    sourceTemplate.replace("#version 450\n", "")
+  result.spv = compileVulkanJitShader(result.name, source)
+  discard getOrCreatePipeline(result.name, 5, 24, 128, result.spv)
+
 proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
                            K, N, group, groups, mode: int; wqOffset = 0): bool =
   ensureInit()
@@ -81,16 +96,16 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
      wqOffset < 0 or w.sizeBytes < uint64(wqOffset) + uint64(N) * uint64(K div 2) or
      scales.sizeBytes < uint64(N) * uint64(groups) * 4 or
      zeros.sizeBytes < uint64(N) * uint64(groups) * 4: return false
-  # Every M>1 shares the "m8" plan. With tensor cores, time the candidates at
-  # a prompt-sized M: the cooperative kernel's 16x16 tiles are mostly idle at
-  # M=8 and would lose to the scalar kernels that prefill then outgrows.
+  # Every prefill M>1 shares one plan. Tune it at M=64: the flash-prefill path
+  # processes 64-row chunks, and tiled Q4 GEMM needs a representative tile to
+  # compete with the reference. Tuning at M=8 systematically penalized it.
   let coopCandidate = mode != 1 and gCoopEnabled and gDeviceCaps.cooperativeMatrix and
     K >= 64 and N >= 16
   # Tensor cores required (dGPU): prefill only chooses between tensor-core
   # kernels. The reference stays first as the parity baseline and is used
   # only if no tensor-core kernel passes parity.
   let coopOnly = coopCandidate and gCoopRequired
-  let M = if mode == 1: 1 elif coopCandidate: 64 else: 8
+  let M = if mode == 1: 1 else: 64
   let key = q4Key(K, N, group, groups, M)
   if key in gVkQ4Plans: return true
   var plans = @[VkQ4Plan(kind: q4Reference, name: "reference-tg128")]
@@ -126,6 +141,18 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
     if tiledCoopSupported() and K mod 64 == 0 and group mod 2 == 0 and wqOffset mod 16 == 0:
       plans.add VkQ4Plan(kind: q4CoopTiled, name: "KHR-cooperative-matrix-tiled64")
     plans.add VkQ4Plan(kind: q4Cooperative, name: "KHR-cooperative-matrix")
+  # Match Metal's four tiled GEMM geometries for prefill. The 64x128 tile is
+  # the default there; autotuning can select a smaller tile for constrained GPUs.
+  if M > 1 and K mod 32 == 0 and (group == 0 or group mod 32 == 0) and
+      wqOffset >= 0:
+    for (bm, bn, tm, tn) in [(32, 64, 4, 4), (64, 64, 8, 4),
+                              (32, 128, 4, 8), (64, 128, 8, 8)]:
+      let sharedBytes = 4 * (32 * (bm + 4) + 32 * (bn + 4))
+      if 128 <= gDeviceCaps.maxThreads and sharedBytes <= gDeviceCaps.maxSharedBytes:
+        try:
+          plans.add q4CompileGemm(bm, bn, tm, tn)
+        except CatchableError as e:
+          stderr.writeLine "[q4-tune:vulkan] skip Q4 GEMM candidate: " & e.msg
   if plans.len == 1: return false
   var data = newSeq[float32](M * K)
   for i in 0 ..< data.len: data[i] = float32((i * 17 mod 101) - 50) / 64

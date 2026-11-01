@@ -1585,7 +1585,8 @@ proc sessionFlashAttentionPrepare*(backend: GpuBackend, D: int): string =
   ## session (Vulkan checks its kernels against a reference first). Returns
   ## "coop" (Vulkan tensor cores), "scalar" (Vulkan/Metal FP32), "cpu", or ""
   ## when there is none - the caller then keeps its old attention path.
-  ## BYBY_FLASH_ATTENTION=0 turns it off, =scalar skips the tensor cores.
+  ## BYBY_FLASH_ATTENTION=0 turns it off; =fp16 prefers scalar FP16;
+  ## =scalar forces scalar FP32.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -1594,7 +1595,7 @@ proc sessionFlashAttentionPrepare*(backend: GpuBackend, D: int): string =
   case chosen
   of gbMetal:
     when defined(macosx):
-      return (if D > 0 and D <= 128: "scalar" else: "")
+      return metalSessionFlashAttentionPrepare(D)
     else:
       return ""
   of gbVulkan:
