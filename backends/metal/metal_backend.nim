@@ -11,7 +11,9 @@ when defined(macosx):
 
   const kMetalKernelSrc = staticRead(metalDir / "kernels" / "vecop_matmul.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_decode_all_heads.metal") &
+    "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash.metal") &
     "\n" & staticRead(metalDir / "kernels" / "matmul_q4_batched.metal") &
+    "\n" & staticRead(metalDir / "kernels" / "matmul_q4_gemm.metal") &
     "\n" & staticRead(metalDir / "kernels" / "micro_vm.metal") &
     "\n" & staticRead(metalDir / "kernels" / "q4_dynamic.metal")
     ## real batch-M kernel for prefill (matmul_q4_batched_m4_kernel) - see
@@ -19,6 +21,8 @@ when defined(macosx):
     ## all weights for EVERY row when called with M>1).
 
   proc metal_available_c(): cint {.importc: "metal_available", header: "metal_shim.h".}
+  proc metal_is_apple_gpu_c(): cint {.importc: "metal_is_apple_gpu", header: "metal_shim.h".}
+  proc metalIsAppleGpu*(): bool = metal_is_apple_gpu_c() != 0
   proc metal_vecop_c(kernelSrc: cstring, op: cint, a, b: ptr float32, c: ptr float32, n: cint, error_out: ptr cstring): cint
     {.importc: "metal_vecop", header: "metal_shim.h".}
   proc metal_matmul_c(kernelSrc: cstring, a, b: ptr float32, c: ptr float32, m, k, n: cint, error_out: ptr cstring): cint
@@ -493,6 +497,11 @@ when defined(macosx):
   proc metal_attention_decode_all_heads_enc_c(q, kAll, vAll, o: MetalBufferHandle,
                                                H, HKV, D, S, maxSeqLen: cint): cint
     {.importc: "metal_attention_decode_all_heads_enc", header: "metal_shim.h".}
+  proc metal_attention_prefill_flash_enc_c(q, kAll, vAll, o: MetalBufferHandle,
+                                            T, H, HKV, D, pos, maxSeqLen: cint, scale: cfloat): cint
+    {.importc: "metal_attention_prefill_flash_enc", header: "metal_shim.h".}
+  proc metal_kv_scatter_enc_c(src, dst: MetalBufferHandle, T, HKV, D, pos, maxSeqLen: cint): cint
+    {.importc: "metal_kv_scatter_enc", header: "metal_shim.h".}
   proc metal_session_end_c(): cint {.importc: "metal_session_end", header: "metal_shim.h".}
   proc metal_get_last_session_error_c(): cstring {.importc: "metal_get_last_session_error", header: "metal_shim.h".}
   proc metal_session_commit_continue_c(): cint {.importc: "metal_session_commit_continue", header: "metal_shim.h".}
@@ -701,6 +710,15 @@ when defined(macosx):
     metal_attention_decode_all_heads_enc_c(q, kAll, vAll, o, cint(H), cint(HKV), cint(D),
                                             cint(S), cint(maxSeqLen)) != 0
 
+  proc metalSessionFlashAttentionPrefillEnc*(q, kAll, vAll, o: MetalBufferHandle;
+                                             T, H, HKV, D, pos, maxSeqLen: int; scale: float32): bool =
+    ## Causal prefill flash attention (attention_prefill_flash.metal), D <= 128.
+    metal_attention_prefill_flash_enc_c(q, kAll, vAll, o, cint(T), cint(H), cint(HKV), cint(D),
+                                        cint(pos), cint(maxSeqLen), cfloat(scale)) != 0
+
+  proc metalSessionKvScatterEnc*(src, dst: MetalBufferHandle; T, HKV, D, pos, maxSeqLen: int): bool =
+    metal_kv_scatter_enc_c(src, dst, cint(T), cint(HKV), cint(D), cint(pos), cint(maxSeqLen)) != 0
+
   proc metalSessionActivationPEnc*(op: int, x, y: MetalBufferHandle, n: int, p: float32): bool =
     metal_activation_enc_p_c(cint(op), x, y, cint(n), cfloat(p)) != 0
 
@@ -805,6 +823,9 @@ when not defined(macosx):
   proc metalSessionAttentionDecodeGqaEnc*(q, k, v, o, scores: MetalBufferHandle, H, S, D: int, scale: float32): bool = false
   proc metalSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll, o: MetalBufferHandle,
                                                 H, HKV, D, S, maxSeqLen: int): bool = false
+  proc metalSessionFlashAttentionPrefillEnc*(q, kAll, vAll, o: MetalBufferHandle;
+                                             T, H, HKV, D, pos, maxSeqLen: int; scale: float32): bool = false
+  proc metalSessionKvScatterEnc*(src, dst: MetalBufferHandle; T, HKV, D, pos, maxSeqLen: int): bool = false
   proc metalSessionActivationPEnc*(op: int, x, y: MetalBufferHandle, n: int, p: float32): bool = false
   proc metalSessionScaleEnc*(x: MetalBufferHandle, scalar: float32, n: int): bool = false
   proc metalSessionActivationBackwardEnc*(op: int, x, dy, dx: MetalBufferHandle, n: int): bool = false
@@ -828,6 +849,7 @@ when not defined(macosx):
   proc metalSessionFree*(h: MetalBufferHandle) = discard
 
   proc metalAvailable*(): bool = false
+  proc metalIsAppleGpu*(): bool = false
   proc metalVecOp*(op: string, a, b: seq[float32]): seq[float32] =
     raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =

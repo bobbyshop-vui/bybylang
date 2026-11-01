@@ -8,6 +8,8 @@ extern "C" {
 
 // Returns 1 if the machine has a Metal-capable GPU, 0 otherwise.
 int metal_available(void);
+// 1 when the Metal GPU is an Apple GPU (Apple Silicon), 0 for Intel/AMD.
+int metal_is_apple_gpu(void);
 
 // kernel_src: Metal Shading Language source (read from kernels/vecop_matmul.metal
 // at Nim compile time through staticRead, NO longer hardcoded in the .m file).
@@ -198,6 +200,15 @@ int metal_attention_decode_gqa_enc(MetalBufferHandle q, MetalBufferHandle k, Met
 int metal_attention_decode_all_heads_enc(MetalBufferHandle q, MetalBufferHandle kAll, MetalBufferHandle vAll,
                                           MetalBufferHandle o,
                                           int H, int HKV, int D, int S, int maxSeqLen);
+// Prefill flash attention: o[T, H, D] = causal softmax(q K^T * scale) V over the
+// cache positions 0 .. pos + T - 1 (q position-major [T, H, D], K/V
+// [HKV, maxSeqLen, D]). D <= 128. See attention_prefill_flash.metal.
+int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAll, MetalBufferHandle vAll,
+                                      MetalBufferHandle o, int T, int H, int HKV, int D, int pos,
+                                      int maxSeqLen, float scale);
+// KV cache append: dst[h, pos + t, :] = src[t, h, :].
+int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, int HKV, int D,
+                         int pos, int maxSeqLen);
 // Uploads raw bytes (packed int4 weights) -> a resident MTLBuffer, for
 // metal_matmul_q4_enc below. The handle lives until metal_buffer_free -
 // UPLOAD ONCE when loading the model and keep the handle for the process lifetime, do NOT

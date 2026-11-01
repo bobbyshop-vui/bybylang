@@ -2283,6 +2283,203 @@ proc vulkanSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll: VulkanBufferHandle,
   result = dispatchGeneric("attention_decode_all_heads", [q, kAll, vAll, o], addr pc[0], 20,
                            uint32(H), 1, 1, 0, gAttnAllHeadsSpv)
 
+# ---- Prefill flash attention -------------------------------------------------
+# attention_prefill_flash.glsl (scalar FP32) and attention_prefill_flash_coop.glsl
+# (cooperative matrix): causal GQA attention of T new rows over the resident KV
+# cache in one dispatch, with an online softmax, instead of reading Q/K/V back to
+# the CPU, expanding K/V per head and running attention_fused.
+
+const KvScatterShader = (name: "kv_cache_scatter", source: """#version 450
+// src [T, HKV, D] (the K or V projection) -> dst [HKV, maxSeqLen, D] at pos.
+layout(local_size_x_id = 0) in;
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) buffer Dst { float dst[]; };
+layout(push_constant) uniform Params { uint T, HKV, D, pos, maxSeqLen; } p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint total = p.T * p.HKV * p.D;
+    if (i >= total) return;
+    uint d = i % p.D;
+    uint th = i / p.D;
+    uint h = th % p.HKV;
+    uint t = th / p.HKV;
+    dst[(h * p.maxSeqLen + p.pos + t) * p.D + d] = src[i];
+}
+""")
+
+const flashScalarGlsl = staticRead("kernels/attention_prefill_flash.glsl")
+const flashCoopGlsl = staticRead("kernels/attention_prefill_flash_coop.glsl")
+const FlashScalarMaxD = 128
+const FlashScalarSharedBytes = (16 * 128 + 16 * 129 + 16 * 128 + 16 * 17) * 4
+
+var gFlashKind = initTable[int, string]()   ## head dim -> "coop" / "scalar" / ""
+
+proc flashCoopShader(D: int): tuple[name, source: string] =
+  ("attention_prefill_flash_coop_d" & $D,
+   "#version 450\n#define HEAD_DIM " & $D & "\n" & flashCoopGlsl.replace("#version 450\n", ""))
+
+proc flashCoopSupported(D: int): bool =
+  gCoopEnabled and gDeviceCaps.cooperativeMatrix and D mod 16 == 0 and D <= 128 and
+    gDeviceCaps.subgroupSize >= 16 and gDeviceCaps.maxSharedBytes >= 16 * 1024
+
+proc flashScalarSupported(D: int): bool =
+  D > 0 and D <= FlashScalarMaxD and gDeviceCaps.maxThreads >= 128 and
+    gDeviceCaps.maxSharedBytes >= FlashScalarSharedBytes
+
+proc vulkanSessionKvScatterEnc*(src, dst: VulkanBufferHandle; T, HKV, D, pos, maxSeqLen: int): bool =
+  ## dst[h, pos + t, :] = src[t, h, :] for the T new positions (KV cache append).
+  if not gSessionActive or src.buf == nil or dst.buf == nil: return false
+  if T <= 0 or pos < 0 or pos + T > maxSeqLen: return false
+  if dst.sizeBytes < uint64(HKV * maxSeqLen * D) * 4: return false
+  var spv: string
+  try:
+    spv = compileVulkanJitShader(KvScatterShader.name, KvScatterShader.source)
+  except CatchableError as e:
+    stderr.writeLine "[vulkan] kv_cache_scatter unavailable: " & e.msg.splitLines()[0]
+    return false
+  var pc = [uint32(T), uint32(HKV), uint32(D), uint32(pos), uint32(maxSeqLen)]
+  let total = T * HKV * D
+  dispatchGeneric(KvScatterShader.name, [src, dst], addr pc[0], 20,
+    uint32((total + 255) div 256), 1, 1, 256, spv)
+
+proc encodeFlash(kind: string; q, kAll, vAll, o: VulkanBufferHandle;
+                 T, H, HKV, D, pos, maxSeqLen: int; scale: float32): bool =
+  var pc: array[7, uint32]
+  pc[0] = uint32(T); pc[1] = uint32(H); pc[2] = uint32(HKV); pc[3] = uint32(D)
+  pc[4] = uint32(pos); pc[5] = uint32(maxSeqLen)
+  let scaleLog2 = scale * 1.4426950408889634'f32
+  copyMem(addr pc[6], unsafeAddr scaleLog2, 4)
+  let groupsX = uint32((T + 15) div 16)
+  if kind == "coop":
+    let (name, source) = flashCoopShader(D)
+    let spv = compileVulkanJitShader(name, source)
+    dispatchGeneric(name, [q, kAll, vAll, o], addr pc[0], 28, groupsX, uint32(H), 1,
+      gDeviceCaps.subgroupSize, spv)
+  else:
+    let spv = compileVulkanJitShader("attention_prefill_flash", flashScalarGlsl)
+    dispatchGeneric("attention_prefill_flash", [q, kAll, vAll, o], addr pc[0], 28,
+      groupsX, uint32(H), 1, 0, spv)
+
+proc flashReference(q, k, v: seq[float32]; T, H, HKV, D, pos, maxSeqLen: int;
+                    scale: float32): seq[float32] =
+  result = newSeq[float32](T * H * D)
+  let rep = max(1, H div HKV)
+  var sc = newSeq[float64](pos + T)
+  for t in 0 ..< T:
+    for h in 0 ..< H:
+      let hkv = min(h div rep, HKV - 1)
+      let n = pos + t + 1
+      var mx = -1e300
+      for key in 0 ..< n:
+        var s = 0.0
+        for d in 0 ..< D:
+          s += float64(q[(t * H + h) * D + d]) * float64(k[(hkv * maxSeqLen + key) * D + d])
+        sc[key] = s * float64(scale)
+        mx = max(mx, sc[key])
+      var total = 0.0
+      for key in 0 ..< n:
+        sc[key] = exp(sc[key] - mx)
+        total += sc[key]
+      for d in 0 ..< D:
+        var acc = 0.0
+        for key in 0 ..< n: acc += sc[key] * float64(v[(hkv * maxSeqLen + key) * D + d])
+        result[(t * H + h) * D + d] = float32(acc / total)
+
+proc flashParity(kind: string; D: int): tuple[ok: bool, err: float] =
+  ## Runs the kernel on random data (GQA, a continued prompt, NaN past the
+  ## filled cache to prove the mask) against an FP64 reference.
+  const T = 37
+  const H = 4
+  const HKV = 2
+  const pos = 11
+  const maxSeqLen = 64
+  var seed = 0x9E3779B9'u32
+  proc rnd(): float32 =
+    seed = seed xor (seed shl 13); seed = seed xor (seed shr 17); seed = seed xor (seed shl 5)
+    float32(seed and 0xFFFFFF) / float32(0x800000) - 1.0'f32
+  var q = newSeq[float32](T * H * D)
+  for i in 0 ..< q.len: q[i] = rnd() * 3.0'f32   # peaky rows exercise the rescale
+  var k = newSeq[float32](HKV * maxSeqLen * D)
+  var v = newSeq[float32](HKV * maxSeqLen * D)
+  for h in 0 ..< HKV:
+    for key in 0 ..< maxSeqLen:
+      for d in 0 ..< D:
+        let i = (h * maxSeqLen + key) * D + d
+        if key < pos + T:
+          k[i] = rnd(); v[i] = rnd()
+        else:
+          k[i] = NaN; v[i] = NaN
+  let scale = 1.0'f32 / sqrt(float32(D))
+  let expected = flashReference(q, k, v, T, H, HKV, D, pos, maxSeqLen, scale)
+  if not vulkanSessionBegin(): return (false, Inf)
+  var hq = vulkanSessionUpload(q)
+  var hk = vulkanSessionUpload(k)
+  var hv = vulkanSessionUpload(v)
+  var ho = vulkanSessionAllocScratch(T * H * D)
+  var dispatched = false
+  try:
+    dispatched = encodeFlash(kind, hq, hk, hv, ho, T, H, HKV, D, pos, maxSeqLen, scale)
+  except CatchableError as e:
+    stderr.writeLine "[vulkan] flash attention (" & kind & ") unavailable: " & e.msg.splitLines()[0]
+  let ended = vulkanSessionEnd()
+  if dispatched and ended:
+    let got = vulkanSessionRead(ho, T * H * D)
+    result = (true, 0.0)
+    for i in 0 ..< got.len:
+      let e = abs(float(got[i]) - float(expected[i]))
+      if e != e or e > result.err: result.err = (if e != e: Inf else: e)
+    let tol = if kind == "coop": 2e-2 else: 1e-4
+    result.ok = result.err <= tol
+  else:
+    result = (false, Inf)
+  vulkanSessionFree(hq); vulkanSessionFree(hk); vulkanSessionFree(hv); vulkanSessionFree(ho)
+
+proc vulkanFlashAttentionPrepare*(D: int): string =
+  ## Picks and checks the prefill flash-attention kernel for head dim D, outside
+  ## any session: "coop" (tensor cores), "scalar", or "" (none passed parity;
+  ## the caller keeps its old attention path). BYBY_FLASH_ATTENTION=scalar
+  ## skips the tensor-core kernel, =0 turns both off.
+  ensureInit()
+  if D in gFlashKind: return gFlashKind[D]
+  let mode = getEnv("BYBY_FLASH_ATTENTION", "auto")
+  result = ""
+  if mode != "0" and not gSessionActive:
+    var candidates: seq[string]
+    if mode != "scalar" and flashCoopSupported(D): candidates.add "coop"
+    if flashScalarSupported(D): candidates.add "scalar"
+    for kind in candidates:
+      let (ok, err) = flashParity(kind, D)
+      if ok:
+        result = kind
+        break
+      stderr.writeLine "[vulkan] flash attention (" & kind & ", D=" & $D &
+        ") failed parity (max err " & $err & "), skipping it"
+  gFlashKind[D] = result
+  if result.len > 0:
+    stderr.writeLine "[vulkan] prefill flash attention D=" & $D & ": " &
+      (if result == "coop": "tensor cores (KHR_cooperative_matrix FP16/FP32, lazy rescale)"
+       else: "scalar FP32")
+
+proc vulkanSessionFlashAttentionPrefillEnc*(q, kAll, vAll: VulkanBufferHandle;
+                                            o: var VulkanBufferHandle;
+                                            T, H, HKV, D, pos, maxSeqLen: int;
+                                            scale: float32): bool =
+  ## o[T, H, D] = causal softmax(q K^T * scale) V over cache positions
+  ## 0 .. pos + T - 1. vulkanFlashAttentionPrepare(D) must have picked a kernel.
+  if not gSessionActive: return false
+  let kind = gFlashKind.getOrDefault(D, "")
+  if kind.len == 0: return false
+  if q.buf == nil or kAll.buf == nil or vAll.buf == nil: return false
+  if T <= 0 or H <= 0 or HKV <= 0 or H mod HKV != 0 or pos < 0 or pos + T > maxSeqLen: return false
+  if q.sizeBytes < uint64(T * H * D) * 4 or kAll.sizeBytes < uint64(HKV * maxSeqLen * D) * 4 or
+      vAll.sizeBytes < uint64(HKV * maxSeqLen * D) * 4: return false
+  if o.buf == nil: o = vulkanSessionAllocScratch(T * H * D)
+  try:
+    result = encodeFlash(kind, q, kAll, vAll, o, T, H, HKV, D, pos, maxSeqLen, scale)
+  except CatchableError as e:
+    stderr.writeLine "[vulkan] flash attention dispatch failed: " & e.msg.splitLines()[0]
+    result = false
+
 proc vulkanAvailable*(): bool =
   ## Used by detectBackend() in gpubackend.nim - tries load+init and catches errors
   ## safely (does NOT raise) when the machine has no Vulkan/MoltenVK.

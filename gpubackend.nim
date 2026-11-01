@@ -11,6 +11,7 @@
 # If an explicitly chosen backend is unavailable or fails, it falls back
 # to the CPU so the program always gives a correct result instead of crashing.
 import std/[strutils, math]
+from std/os import getEnv
 import ./backends/cpu/cpu_backend as cpu
 import backends/metal/metal_backend
 import backends/vulkan/vulkan_driver
@@ -1556,6 +1557,128 @@ proc sessionAttentionDecodeAllHeadsEnc*(backend: GpuBackend, q, kAll, vAll: Sess
       let oh = cpuAttentionDecodeGqa(qv[h * D ..< (h + 1) * D], kv, vv, 1, S, D, scale)
       for d in 0 ..< D: outv[h * D + d] = oh[d]
     o.cpuData = outv
+    return true
+  else:
+    return false
+
+proc sessionPacesCommandBuffers*(backend: GpuBackend): bool =
+  ## True when long GPU work should be split into time-bounded command buffers
+  ## (the macOS watchdog kills one that runs for seconds on an Intel/AMD Mac,
+  ## and Vulkan drivers have timeouts too). False on Apple Silicon, whose
+  ## command buffers stay whole, and on the CPU.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return not metalIsAppleGpu()
+    else:
+      return false
+  of gbVulkan:
+    return true
+  else:
+    return false
+
+proc sessionFlashAttentionPrepare*(backend: GpuBackend, D: int): string =
+  ## Picks the prefill flash-attention kernel for head dim D; call it OUTSIDE a
+  ## session (Vulkan checks its kernels against a reference first). Returns
+  ## "coop" (Vulkan tensor cores), "scalar" (Vulkan/Metal FP32), "cpu", or ""
+  ## when there is none - the caller then keeps its old attention path.
+  ## BYBY_FLASH_ATTENTION=0 turns it off, =scalar skips the tensor cores.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  let mode = getEnv("BYBY_FLASH_ATTENTION", "auto")
+  if mode == "0": return ""
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return (if D > 0 and D <= 128: "scalar" else: "")
+    else:
+      return ""
+  of gbVulkan:
+    return vulkanFlashAttentionPrepare(D)
+  of gbCpu:
+    return "cpu"
+  else:
+    return ""
+
+proc sessionFlashAttentionPrefillEnc*(backend: GpuBackend, q, kAll, vAll: SessionHandle,
+                                      o: var SessionHandle, T, H, HKV, D, pos, maxSeqLen: int,
+                                      scale: float32): bool =
+  ## Causal prefill flash attention in one dispatch: o[T, H, D] =
+  ## softmax(q K^T * scale) V with row t attending cache positions 0 .. pos + t.
+  ## q/o position-major [T, H, D]; kAll/vAll [HKV, maxSeqLen, D] already hold
+  ## positions 0 .. pos + T - 1 (sessionKvScatterEnc). False = not available,
+  ## the caller falls back (sessionFlashAttentionPrepare must have run).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      if o.metalHandle == nil:
+        o.metalHandle = metalSessionAllocScratch(T * H * D)
+      return metalSessionFlashAttentionPrefillEnc(q.metalHandle, kAll.metalHandle, vAll.metalHandle,
+                                                  o.metalHandle, T, H, HKV, D, pos, maxSeqLen, scale)
+    else:
+      return false
+  of gbVulkan:
+    return vulkanSessionFlashAttentionPrefillEnc(q.vulkanHandle, kAll.vulkanHandle, vAll.vulkanHandle,
+                                                 o.vulkanHandle, T, H, HKV, D, pos, maxSeqLen, scale)
+  of gbCpu:
+    let rep = max(1, H div max(1, HKV))
+    let qv = cpuTake(q, T * H * D)
+    let kv = cpuTake(kAll, HKV * maxSeqLen * D)
+    let vv = cpuTake(vAll, HKV * maxSeqLen * D)
+    var outv = newSeq[float32](T * H * D)
+    var sc = newSeq[float32](pos + T)
+    for t in 0 ..< T:
+      for h in 0 ..< H:
+        let base = min(h div rep, HKV - 1) * maxSeqLen * D
+        let n = pos + t + 1
+        var mx = -Inf.float32
+        for key in 0 ..< n:
+          var s = 0.0'f32
+          for d in 0 ..< D: s += qv[(t * H + h) * D + d] * kv[base + key * D + d]
+          sc[key] = s * scale
+          mx = max(mx, sc[key])
+        var total = 0.0'f32
+        for key in 0 ..< n:
+          sc[key] = exp(sc[key] - mx)
+          total += sc[key]
+        for d in 0 ..< D:
+          var acc = 0.0'f32
+          for key in 0 ..< n: acc += sc[key] * vv[base + key * D + d]
+          outv[(t * H + h) * D + d] = acc / total
+    o.cpuData = outv
+    return true
+  else:
+    return false
+
+proc sessionKvScatterEnc*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
+                          T, HKV, D, pos, maxSeqLen: int): bool =
+  ## KV cache append for T new positions: dst[h, pos + t, :] = src[t, h, :]
+  ## (src = the K or V projection [T, HKV, D], dst = [HKV, maxSeqLen, D]).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return metalSessionKvScatterEnc(src.metalHandle, dst.metalHandle, T, HKV, D, pos, maxSeqLen)
+    else:
+      return false
+  of gbVulkan:
+    return vulkanSessionKvScatterEnc(src.vulkanHandle, dst.vulkanHandle, T, HKV, D, pos, maxSeqLen)
+  of gbCpu:
+    if pos + T > maxSeqLen: return false
+    if dst.cpuData.len < HKV * maxSeqLen * D: dst.cpuData.setLen(HKV * maxSeqLen * D)
+    for t in 0 ..< T:
+      for h in 0 ..< HKV:
+        for d in 0 ..< D:
+          dst.cpuData[(h * maxSeqLen + pos + t) * D + d] = src.cpuData[(t * HKV + h) * D + d]
     return true
   else:
     return false

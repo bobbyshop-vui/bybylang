@@ -159,6 +159,16 @@ int metal_available(void) {
     }
 }
 
+// 1 when the Metal GPU is an Apple GPU (Apple Silicon), 0 for Intel/AMD.
+int metal_is_apple_gpu(void) {
+    @autoreleasepool {
+        id<MTLDevice> device = gDevice ? gDevice : pickMetalDevice();
+        if (!device) return 0;
+        if (@available(macOS 10.15, *)) return [device supportsFamily:MTLGPUFamilyApple1] ? 1 : 0;
+        return 0;
+    }
+}
+
 int metal_vecop(const char* kernel_src, int op, const float* a, const float* b, float* c, int n, char** error_out) {
     @autoreleasepool {
         if (!ensureMetalInit(kernel_src)) {
@@ -1206,11 +1216,62 @@ int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHa
 // NEW: Q4 matmul with a real batch M (weights read once, reused for MBLOCK=4
 // rows) - differs from metal_matmul_q4_enc ONLY in the kernel name + the grid Y computation (divided
 // by MBLOCK instead of = M). See matmul_q4_batched.metal.
+// Tiled prefill GEMM (matmul_q4_gemm.metal): a 64 x 128 output tile per
+// threadgroup by default, the weights decoded once per 64 rows into
+// threadgroup memory. BYBY_METAL_Q4_GEMM_TILE=0..2 picks a smaller tile.
+// Used for M >= BYBY_METAL_Q4_GEMM_MIN_M (default 8); BYBY_METAL_Q4_GEMM=0
+// keeps the batched/autotuned kernels.
+typedef struct { uint32_t M, K, N, groupSize, groupsPerRow, wqShift; } MetalQ4GemmParams;
+
+static int metal_matmul_q4_gemm_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
+                                    MetalBufferHandle zeros, MetalBufferHandle c,
+                                    int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset) {
+    static int enabled = -1, minM = 8;
+    if (enabled < 0) {
+        const char *v = getenv("BYBY_METAL_Q4_GEMM");
+        enabled = !(v && strcmp(v, "0") == 0);
+        const char *mm = getenv("BYBY_METAL_Q4_GEMM_MIN_M");
+        if (mm && atoi(mm) > 1) minM = atoi(mm);
+    }
+    if (!enabled || m < minM || k % 32 != 0 || (groupSize != 0 && groupSize % 32 != 0) ||
+        nGroupsPerRow <= 0 || wqOffset < 0) return 0;
+    static int variant = -1;
+    if (variant < 0) {
+        const char *v = getenv("BYBY_METAL_Q4_GEMM_TILE");
+        // 3 = 64 x 128 with an 8 x 8 register tile, the fastest on Intel Iris
+        // at every M from 32 to 256 (the others: 0 = 32x64, 1 = 64x64, 2 = 32x128).
+        variant = v ? atoi(v) : 3;
+        if (variant < 0 || variant > 3) variant = 3;
+    }
+    static NSString *names[4] = { @"matmul_q4_gemm_kernel", @"matmul_q4_gemm_64x64_kernel",
+                                  @"matmul_q4_gemm_32x128_kernel", @"matmul_q4_gemm_64x128_kernel" };
+    static const int tileM[4] = { 32, 64, 32, 64 };
+    static const int tileN[4] = { 64, 64, 128, 128 };
+    id<MTLComputePipelineState> pipeline = getPipeline(names[variant]);
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
+    MetalQ4GemmParams params = { (uint32_t)m, (uint32_t)k, (uint32_t)n, (uint32_t)groupSize,
+                                 (uint32_t)nGroupsPerRow, (uint32_t)(wqOffset & 3) };
+    [gSessionEncoder setComputePipelineState:pipeline];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
+    // 32-bit weight loads: bind 4-byte aligned, the kernel shifts the rest.
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)wq offset:(NSUInteger)(wqOffset & ~3) atIndex:1];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)scales offset:0 atIndex:2];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)zeros offset:0 atIndex:3];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)c offset:0 atIndex:4];
+    [gSessionEncoder setBytes:&params length:sizeof(params) atIndex:5];
+    MTLSize grid = MTLSizeMake((NSUInteger)((n + tileN[variant] - 1) / tileN[variant]),
+                               (NSUInteger)((m + tileM[variant] - 1) / tileM[variant]), 1);
+    [gSessionEncoder dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    return 1;
+}
+
 int metal_matmul_q4_batched_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                                  MetalBufferHandle zeros, MetalBufferHandle c,
                                  int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_q4_batched_enc] metal_session_begin not called"); return 0; }
+        if (metal_matmul_q4_gemm_enc(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
         if (q4EncodeSelected(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
         id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_q4_batched_m4_kernel");
         if (!pipeline) return 0;
@@ -1663,6 +1724,57 @@ int metal_attention_decode_all_heads_enc(MetalBufferHandle q, MetalBufferHandle 
         const NSUInteger TG = 128;
         MTLSize gridSize = MTLSizeMake((NSUInteger)H, 1, 1);
         MTLSize groupSize = MTLSizeMake(TG, 1, 1);
+        [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
+// Prefill flash attention (attention_prefill_flash.metal): causal GQA attention
+// of T new rows over the resident KV cache [HKV, maxSeqLen, D], one dispatch.
+typedef struct { uint32_t T, H, HKV, D, pos, maxSeqLen; float scaleLog2; } MetalFlashParams;
+typedef struct { uint32_t T, HKV, D, pos, maxSeqLen; } MetalKvScatterParams;
+
+int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAll, MetalBufferHandle vAll,
+                                      MetalBufferHandle o, int T, int H, int HKV, int D, int pos,
+                                      int maxSeqLen, float scale) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_attention_prefill_flash_enc] metal_session_begin not called"); return 0; }
+        if (T <= 0 || H <= 0 || HKV <= 0 || D <= 0 || D > 128 || pos < 0 || pos + T > maxSeqLen) return 0;
+        id<MTLComputePipelineState> pipeline = getPipeline(@"attention_prefill_flash_kernel");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
+        MetalFlashParams params = { (uint32_t)T, (uint32_t)H, (uint32_t)HKV, (uint32_t)D,
+                                    (uint32_t)pos, (uint32_t)maxSeqLen, scale * 1.4426950408889634f };
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)q offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)kAll offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)vAll offset:0 atIndex:2];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)o offset:0 atIndex:3];
+        [gSessionEncoder setBytes:&params length:sizeof(params) atIndex:4];
+        MTLSize gridSize = MTLSizeMake((NSUInteger)((T + 15) / 16), (NSUInteger)H, 1);
+        MTLSize groupSize = MTLSizeMake(128, 1, 1);
+        [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
+int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, int HKV, int D,
+                         int pos, int maxSeqLen) {
+    @autoreleasepool {
+        if (!gSessionEncoder) { NSLog(@"[metal_kv_scatter_enc] metal_session_begin not called"); return 0; }
+        if (T <= 0 || pos < 0 || pos + T > maxSeqLen) return 0;
+        id<MTLComputePipelineState> pipeline = getPipeline(@"kv_cache_scatter_kernel");
+        if (!pipeline) return 0;
+        MetalKvScatterParams params = { (uint32_t)T, (uint32_t)HKV, (uint32_t)D, (uint32_t)pos,
+                                        (uint32_t)maxSeqLen };
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)src offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)dst offset:0 atIndex:1];
+        [gSessionEncoder setBytes:&params length:sizeof(params) atIndex:2];
+        NSUInteger total = (NSUInteger)T * (NSUInteger)HKV * (NSUInteger)D;
+        MTLSize gridSize = MTLSizeMake((total + 255) / 256, 1, 1);
+        MTLSize groupSize = MTLSizeMake(256, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
         [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
         return 1;
