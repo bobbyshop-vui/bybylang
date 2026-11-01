@@ -411,6 +411,9 @@ var gPhysicalDevice: VkPhysicalDevice
 var gDeviceCaps: VulkanCaps
 var gCoopEnabled = false
 var gFp8CoopEnabled = false
+## Prefill (M > 1) GEMMs must stay on the tensor cores: set on a dGPU with
+## KHR_cooperative_matrix (see BYBY_VULKAN_TENSOR_CORES at device creation).
+var gCoopRequired = false
 var gFp8Fp4Logged = false
 var gHostImportEnabled = false
 ## Session scratch/upload buffers in VRAM (dGPU). Host-visible system memory
@@ -650,6 +653,13 @@ proc ensureInit() =
     rDev = lib.vkCreateDevice(gPhysicalDevice, addr devInfo, nil, addr dev)
   gpuCheck(rDev == VK_SUCCESS, "vkCreateDevice failed, VkResult=" & $rDev)
   gDevice = dev
+  # BYBY_VULKAN_TENSOR_CORES: 1 (default) uses them and, on a dGPU, never lets
+  # a prefill GEMM fall back to a scalar kernel while a tensor-core kernel
+  # passes parity; force does the same on any device that has them; tune
+  # times them against the scalar kernels (the fastest wins); 0 turns them off.
+  let tensorCoreMode = getEnv("BYBY_VULKAN_TENSOR_CORES", "1")
+  gCoopRequired = gCoopEnabled and tensorCoreMode != "tune" and
+    (tensorCoreMode == "force" or gDeviceCaps.properties.deviceType == 2'u32)
   if gHostImportEnabled:
     vkGetMemoryHostPointerPropertiesEXT = cast[typeof(vkGetMemoryHostPointerPropertiesEXT)](
       lib.vkGetInstanceProcAddr(gInstance, "vkGetMemoryHostPointerPropertiesEXT"))
@@ -680,7 +690,8 @@ proc ensureInit() =
     " sharedBytes=" & $gDeviceCaps.maxSharedBytes &
     " mmapImport=" & (if gHostImportEnabled: $gDeviceCaps.hostImportAlignment else: "off") &
     " matrix=" & (if gFp8CoopEnabled: "KHR_cooperative_matrix FP8-E4M3/FP32 + FP16/FP32"
-      elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
+      elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar") &
+    (if gCoopRequired: " prefill=tensor-cores-only" else: "")
   stderr.writeLine "[vulkan] Initialised: instance+device+queue+commandPool ready (queueFamily=" & $gQueueFamilyIndex & ")"
 
 proc vulkanDeviceCaps*(): VulkanCaps =
@@ -690,6 +701,16 @@ proc vulkanDeviceCaps*(): VulkanCaps =
 proc vulkanTensorCoreAvailable*(): bool =
   ensureInit()
   gCoopEnabled
+
+proc vulkanTensorCoreRequired*(): bool =
+  ## True when every prefill GEMM (M > 1) must run on the tensor cores.
+  ensureInit()
+  gCoopRequired
+
+proc coopMinRows(): int =
+  ## Smallest M a cooperative GEMM takes. Below 8 rows its 16x16 tiles are
+  ## mostly idle, which only loses to the scalar kernels where those may run.
+  if gCoopRequired: 2 else: 8
 
 proc findMemoryType(typeFilter: uint32, properties: uint32): uint32 =
   var memProps: VkPhysicalDeviceMemoryProperties
@@ -1896,9 +1917,13 @@ const Fp4KmFp8Shader = (name: "coop_matmul_fp4km_fp8_e4m3",
   source: staticRead("kernels/matmul_fp4km_fp8.glsl"))
 
 proc tiledMatmulShader(weightFormat: int): tuple[name, source: string] =
-  ## matmul_fp4km_tiled.glsl: format 1 = packed FP4-KM, 0 = FP32 rows.
+  ## matmul_fp4km_tiled.glsl: format 1 = packed FP4-KM, 0 = FP32 rows,
+  ## 2 = asymmetric Q4.
   const templateSrc = staticRead("kernels/matmul_fp4km_tiled.glsl")
-  let name = if weightFormat == 1: "coop_matmul_fp4km_tiled" else: "coop_matmul_f32_tiled"
+  let name = case weightFormat
+    of 1: "coop_matmul_fp4km_tiled"
+    of 2: "coop_matmul_q4_tiled"
+    else: "coop_matmul_f32_tiled"
   (name, "#version 450\n#define WEIGHT_FORMAT " & $weightFormat & "\n" &
     templateSrc.replace("#version 450\n", ""))
 
@@ -1929,13 +1954,17 @@ proc vulkanCoopPrewarmJobs*(): seq[tuple[name, source: string]] =
     if gDeviceCaps.subgroupSize == 32 and gDeviceCaps.maxThreads >= 128:
       result.add tiledMatmulShader(1)
       result.add tiledMatmulShader(0)
+      result.add tiledMatmulShader(2)
+    result.add coopMatmulShader(2)
 
 proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
                          M, K, N, weightFormat: int; groupSize = 0;
-                         groupsPerRow = 0): bool =
+                         groupsPerRow = 0; wOffset = 0): bool =
   ## Inference GEMM only. GEMV keeps its bandwidth-oriented scalar kernel.
+  ## wOffset: byte position of asymmetric Q4 weights (format 2) in w.
   if not gCoopEnabled or not gDeviceCaps.cooperativeMatrix or not gSessionActive or
-      M < 8 or K < 64 or N < 16: return false
+      M < coopMinRows() or K < 64 or N < 16: return false
+  if wOffset < 0 or (wOffset != 0 and weightFormat != 2): return false
   if a.buf == nil or w.buf == nil or c.buf == nil: return false
   if a.sizeBytes < uint64(M) * uint64(K) * 4 or c.sizeBytes < uint64(M) * uint64(N) * 4:
     return false
@@ -1943,7 +1972,7 @@ proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
     of 1: N * (K div 2) + N * (K div 32)
     of 2: N * ((K + 1) div 2)
     else: N * K * 4
-  if weightBytes mod 4 != 0 or w.sizeBytes < uint64(weightBytes): return false
+  if weightBytes mod 4 != 0 or w.sizeBytes < uint64(wOffset + weightBytes): return false
   if weightFormat == 1 and (K mod 32 != 0 or lut.sizeBytes < 272 * 4): return false
   if weightFormat == 2 and (groupsPerRow <= 0 or
       lut.sizeBytes < uint64(N * groupsPerRow * 4) or
@@ -1956,8 +1985,9 @@ proc tryCooperativeMatmul(a, w, c, lut, zeros: VulkanBufferHandle;
     gCoopEnabled = false
     stderr.writeLine "[vulkan] cooperative matrix compiler unavailable; scalar path: " & e.msg
     return false
-  var pc = [uint32(M), uint32(K), uint32(N), uint32(groupSize), uint32(groupsPerRow)]
-  dispatchGeneric(kn, [a, w, c, lut, zeros], addr pc[0], 20,
+  var pc = [uint32(M), uint32(K), uint32(N), uint32(groupSize), uint32(groupsPerRow),
+    uint32(wOffset)]
+  dispatchGeneric(kn, [a, w, c, lut, zeros], addr pc[0], 24,
     uint32((N + 15) div 16), uint32((M + 15) div 16), 1,
     gDeviceCaps.subgroupSize, spv)
 
@@ -1965,7 +1995,7 @@ proc tryFp4KmFp8Cooperative(a, w, c, lut: VulkanBufferHandle;
                             M, K, N: int): bool =
   ## Packed FP4-KM -> E4M3 is converted only for the current 16x16 MMA tile.
   ## No full-size dequantized weight buffer is created.
-  if not gFp8CoopEnabled or not gSessionActive or M < 8 or K < 64 or N < 16:
+  if not gFp8CoopEnabled or not gSessionActive or M < coopMinRows() or K < 64 or N < 16:
     return false
   if a.buf == nil or w.buf == nil or c.buf == nil or lut.buf == nil: return false
   if K mod 32 != 0 or w.sizeBytes < uint64(N * (K div 2) + N * (K div 32)) or
@@ -1984,28 +2014,46 @@ proc tryFp4KmFp8Cooperative(a, w, c, lut: VulkanBufferHandle;
     uint32((N + 15) div 16), uint32((M + 15) div 16), 1,
     gDeviceCaps.subgroupSize, spv)
 
-proc tryTiledCooperative(a, w, c, lut: VulkanBufferHandle; M, K, N, weightFormat: int): bool =
+proc tryTiledCooperative(a, w, c, lut: VulkanBufferHandle; M, K, N, weightFormat: int;
+                         zeros = VulkanBufferHandle(); groupSize = 0; groupsPerRow = 0;
+                         wOffset = 0): bool =
   ## matmul_fp4km_tiled: weights converted once per 64 output rows instead of
   ## once per 16x16 tile. False when the device/shape does not fit its contract.
+  ## Format 2 (asymmetric Q4): lut = scales, zeros, [N, groupsPerRow] each.
   if not gCoopEnabled or not gDeviceCaps.cooperativeMatrix or not gSessionActive or
       gDeviceCaps.subgroupSize != 32 or gDeviceCaps.maxThreads < 128 or
-      M < 8 or K mod 64 != 0 or N < 16: return false
+      M < coopMinRows() or K mod 64 != 0 or N < 16: return false
   if a.buf == nil or w.buf == nil or c.buf == nil or lut.buf == nil: return false
-  let weightBytes = if weightFormat == 1: N * (K div 2) + N * (K div 32) else: N * K * 4
-  if w.sizeBytes < uint64(weightBytes) or a.sizeBytes < uint64(M * K * 4) or
+  let weightBytes = case weightFormat
+    of 1: N * (K div 2) + N * (K div 32)
+    of 2: N * (K div 2)
+    else: N * K * 4
+  if wOffset < 0 or (wOffset != 0 and weightFormat != 2) or wOffset mod 16 != 0: return false
+  if w.sizeBytes < uint64(wOffset + weightBytes) or a.sizeBytes < uint64(M * K * 4) or
       c.sizeBytes < uint64(M * N * 4) or
       (weightFormat == 1 and lut.sizeBytes < 272'u64 * 4): return false
+  if weightFormat == 2 and (zeros.buf == nil or groupsPerRow <= 0 or groupSize mod 2 != 0 or
+      lut.sizeBytes < uint64(N * groupsPerRow * 4) or
+      zeros.sizeBytes < uint64(N * groupsPerRow * 4)): return false
   let (kn, source) = tiledMatmulShader(weightFormat)
   var spv: string
   try:
     spv = compileVulkanJitShader(kn, source)
   except CatchableError as e:
-    if weightFormat == 1: gFp4TiledEnabled = false else: gF32TiledEnabled = false
+    case weightFormat
+    of 1: gFp4TiledEnabled = false
+    of 0: gF32TiledEnabled = false
+    else: discard   # Q4: its autotune drops the plan
     stderr.writeLine "[vulkan] tiled cooperative shader unavailable: " & e.msg
     return false
-  var pc = [uint32(M), uint32(K), uint32(N), 0'u32, 0'u32]
-  dispatchGeneric(kn, [a, w, c, lut], addr pc[0], 20,
-    uint32((N + 63) div 64), uint32((M + 63) div 64), 1, 128, spv)
+  var pc = [uint32(M), uint32(K), uint32(N), uint32(groupSize), uint32(groupsPerRow),
+    uint32(wOffset)]
+  if weightFormat == 2:
+    dispatchGeneric(kn, [a, w, c, lut, zeros], addr pc[0], 24,
+      uint32((N + 63) div 64), uint32((M + 63) div 64), 1, 128, spv)
+  else:
+    dispatchGeneric(kn, [a, w, c, lut], addr pc[0], 24,
+      uint32((N + 63) div 64), uint32((M + 63) div 64), 1, 128, spv)
 
 proc vulkanSessionFp4GemmTiledEnc*(a, w, lut: VulkanBufferHandle;
                                    c: var VulkanBufferHandle; M, K, N: int): bool =

@@ -1,6 +1,6 @@
 ## Included by vulkan_driver: Q4 plans share its device/session/pipeline cache.
 type
-  VkQ4PlanKind = enum q4Reference, q4Wide, q4Cooperative, q4Subgroup
+  VkQ4PlanKind = enum q4Reference, q4Wide, q4Cooperative, q4Subgroup, q4CoopTiled
   VkQ4Plan = object
     kind: VkQ4PlanKind
     tg, rows, batch, vec: int
@@ -24,9 +24,11 @@ proc q4Encode(plan: VkQ4Plan; a, w, scales, zeros, c: VulkanBufferHandle;
   of q4Reference:
     result = q4ReferenceEnc(a, w, scales, zeros, c, M, K, N, group, groups, wqOffset)
   of q4Cooperative:
-    # The cooperative kernel reads weights from the start of the buffer.
-    result = wqOffset == 0 and
-      tryCooperativeMatmul(a, w, c, scales, zeros, M, K, N, 2, group, groups)
+    result = tryCooperativeMatmul(a, w, c, scales, zeros, M, K, N, 2, group, groups,
+      wqOffset)
+  of q4CoopTiled:
+    result = tryTiledCooperative(a, w, c, scales, M, K, N, 2, zeros, group, groups,
+      wqOffset)
   of q4Wide:
     var pc = [int32(M), int32(K), int32(N), int32(group), int32(groups), int32(wqOffset)]
     result = dispatchGeneric(plan.name, [a, w, scales, zeros, c], addr pc[0], 24,
@@ -83,12 +85,16 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
   # a prompt-sized M: the cooperative kernel's 16x16 tiles are mostly idle at
   # M=8 and would lose to the scalar kernels that prefill then outgrows.
   let coopCandidate = mode != 1 and gCoopEnabled and gDeviceCaps.cooperativeMatrix and
-    K >= 64 and N >= 16 and wqOffset == 0
+    K >= 64 and N >= 16
+  # Tensor cores required (dGPU): prefill only chooses between tensor-core
+  # kernels. The reference stays first as the parity baseline and is used
+  # only if no tensor-core kernel passes parity.
+  let coopOnly = coopCandidate and gCoopRequired
   let M = if mode == 1: 1 elif coopCandidate: 64 else: 8
   let key = q4Key(K, N, group, groups, M)
   if key in gVkQ4Plans: return true
   var plans = @[VkQ4Plan(kind: q4Reference, name: "reference-tg128")]
-  let geometries = if M == 1: @[(4, 1)] else: @[(1, 8), (2, 4)]
+  let geometries = if M == 1: @[(4, 1)] elif coopOnly: newSeq[(int, int)]() else: @[(1, 8), (2, 4)]
   for (rows, batch) in geometries:
     for tg in [32, 64, 128, 256, 512, 1024]:
       if tg > gDeviceCaps.maxThreads or rows * batch * tg * 4 > gDeviceCaps.maxSharedBytes: continue
@@ -117,6 +123,9 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
             except CatchableError as e:
               stderr.writeLine "[q4-tune:vulkan] skip candidate: " & e.msg
   if coopCandidate:
+    if gDeviceCaps.subgroupSize == 32 and gDeviceCaps.maxThreads >= 128 and
+        K mod 64 == 0 and group mod 2 == 0 and wqOffset mod 16 == 0:
+      plans.add VkQ4Plan(kind: q4CoopTiled, name: "KHR-cooperative-matrix-tiled64")
     plans.add VkQ4Plan(kind: q4Cooperative, name: "KHR-cooperative-matrix")
   if plans.len == 1: return false
   var data = newSeq[float32](M * K)
@@ -161,7 +170,7 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
       var err, mag: float32
       for j, v in values:
         err = max(err, abs(v - reference[j])); mag = max(mag, abs(reference[j]))
-      let tolerance = if plan.kind == q4Cooperative: 3e-3'f32 else: 1e-4'f32
+      let tolerance = if plan.kind in {q4Cooperative, q4CoopTiled}: 3e-3'f32 else: 1e-4'f32
       if finite and err <= max(1e-5'f32, mag * tolerance): valid.add plan
       elif getEnv("BYBY_Q4_TUNE_VERBOSE", "0") == "1":
         stderr.writeLine "[q4-tune:vulkan] parity reject " & plan.name & ": err=" & $err &
@@ -176,7 +185,16 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
       samples[i].add measured.ms
   for times in samples.mitems: times.sort()
   var best = 0
-  if getEnv("BYBY_Q4_TUNED", "1") == "wide":
+  if coopOnly:
+    best = -1
+    for i in 1 ..< valid.len:
+      if valid[i].kind in {q4Cooperative, q4CoopTiled} and
+          (best < 0 or samples[i][1] < samples[best][1]): best = i
+    if best < 0:
+      stderr.writeLine "[q4-tune:vulkan] WARNING " & $K & "x" & $N &
+        ": no tensor-core kernel passed parity, prefill falls back to the scalar reference"
+      best = 0
+  elif getEnv("BYBY_Q4_TUNED", "1") == "wide":
     for i in 1 ..< valid.len:
       if valid[i].kind == q4Wide and (best == 0 or samples[i][1] < samples[best][1]): best = i
   else:
@@ -201,6 +219,6 @@ proc vulkanSessionMatmulQ4Enc*(a: VulkanBufferHandle, wq, scales, zeros: VulkanB
     if key in gVkQ4Plans:
       if q4Encode(gVkQ4Plans[key], a, wq, scales, zeros, c,
           M, K, N, groupSize, nGroupsPerRow, wqOffset, countDispatch = true): return true
-    elif wqOffset == 0 and tryCooperativeMatmul(a, wq, c, scales, zeros, M, K, N, 2,
-        groupSize, nGroupsPerRow): return true
+    elif M > 1 and tryCooperativeMatmul(a, wq, c, scales, zeros, M, K, N, 2,
+        groupSize, nGroupsPerRow, wqOffset): return true
   q4ReferenceEnc(a, wq, scales, zeros, c, M, K, N, groupSize, nGroupsPerRow, wqOffset)

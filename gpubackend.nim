@@ -984,6 +984,11 @@ proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool =
   ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
   normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
 
+proc sessionTensorCoreRequired*(backend: GpuBackend): bool =
+  ## True when every prefill GEMM (M > 1) must run on the tensor cores
+  ## (Vulkan dGPU with KHR_cooperative_matrix, see BYBY_VULKAN_TENSOR_CORES).
+  normalizeBackend(backend) == gbVulkan and vulkanTensorCoreRequired()
+
 proc sessionJitMicroVmEnc*(backend: GpuBackend, kernelName, source: string,
                            mem: SessionHandle, nThreads, tgSize: int; tgFloats = 1024): bool =
   var chosen = backend

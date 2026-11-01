@@ -17,7 +17,8 @@ layout(std430, binding = 1) readonly buffer Weight { uint w[]; };
 layout(std430, binding = 2) writeonly buffer Output { float y[]; };
 layout(std430, binding = 3) readonly buffer LutScale { float lut[]; };
 layout(std430, binding = 4) readonly buffer Zero { float zero[]; };
-layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow; } p;
+// wOffset: byte position of the asymmetric Q4 weights inside their buffer.
+layout(push_constant) uniform Params { uint M, K, N, groupSize, groupsPerRow, wOffset; } p;
 shared float16_t aTile[16 * 16];
 shared float16_t bTile[16 * 16];
 shared float cTile[16 * 16];
@@ -36,7 +37,7 @@ float weightAt(uint col, uint k) {
     uint s = loadByte(p.N * (p.K / 2) + col * (p.K / 32) + g);
     return lut[q] * lut[16 + s];
 #else
-    uint b = loadByte(col * ((p.K + 1) / 2) + k / 2);
+    uint b = loadByte(p.wOffset + col * ((p.K + 1) / 2) + k / 2);
     uint q = (b >> ((k & 1) * 4)) & 15;
     uint g = col * p.groupsPerRow + (p.groupSize > 0 ? k / p.groupSize : 0);
     return (float(q) - zero[g]) * lut[g];
