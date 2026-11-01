@@ -2492,6 +2492,211 @@ proc vulkanSessionFlashAttentionPrefillEnc*(q, kAll, vAll: VulkanBufferHandle;
     stderr.writeLine "[vulkan] flash attention dispatch failed: " & e.msg.splitLines()[0]
     result = false
 
+# ---- Mamba2 SSD / FLA chunked prefill ----------------------------------------
+# mamba2_ssd_fla.glsl: five pipelines (cumsum, FLA intra-chunk, chunk states,
+# chunk-state combine, inter-chunk) replacing the sequential/Hillis-Steele SSM
+# scan with tensor-core matmuls for long prompts. Everything addresses one
+# arena buffer through push-constant offsets (the microVM prefill layout).
+
+const ssdFlaGlsl = staticRead("kernels/mamba2_ssd_fla.glsl")
+
+var gSsdKind = initTable[string, string]()   ## "N_D_Q" -> "coop" / "scalar" / ""
+
+proc ssdShader(kind: string; mode, N, D, Q: int): tuple[name, source: string] =
+  let scalar = kind == "scalar" and mode in [1, 2, 4]
+  ("mamba2_ssd_fla_" & (if scalar: "s" else: "c") & "_m" & $mode & "_n" & $N &
+     "_d" & $D & "_q" & $Q,
+   "#version 450\n#define SSD_MODE " & $mode & "\n#define SSD_SCALAR " &
+     (if scalar: "1" else: "0") & "\n#define SSD_N " & $N &
+     "\n#define SSD_D " & $D & "\n#define SSD_Q " & $Q & "\n" &
+     ssdFlaGlsl.replace("#version 450\n", ""))
+
+proc ssdCoopSupported(N, D, Q: int): bool =
+  gCoopEnabled and gDeviceCaps.cooperativeMatrix and
+    gDeviceCaps.subgroupSize >= 16 and gDeviceCaps.maxThreads >= 256 and
+    gDeviceCaps.maxSharedBytes >= 16 * 1024 and
+    N mod 16 == 0 and N in 16 .. 256 and D mod 16 == 0 and D in 16 .. 128 and
+    Q mod 16 == 0 and (Q and (Q - 1)) == 0 and Q in 16 .. 256
+
+proc ssdScalarSupported(N, D, Q: int): bool =
+  gDeviceCaps.maxThreads >= 256 and
+    gDeviceCaps.maxSharedBytes >= (2 * 16 * (N + 1) + 16 * D + 288) * 4 and
+    N mod 16 == 0 and N in 16 .. 256 and D mod 16 == 0 and D in 16 .. 128 and
+    Q mod 16 == 0 and (Q and (Q - 1)) == 0 and Q in 16 .. 256
+
+proc encodeSsdFla(kind: string; arena: VulkanBufferHandle;
+                  T, H, G, N, D, Q, nC, C, cDim: int;
+                  offConv, offDt, offCum, offALog, offDSkip,
+                  offYPre, offStates, offSloc: int; cont: bool): bool =
+  ## Encodes the five SSD dispatches; dispatchGeneric inserts the
+  ## write->read barrier each phase needs.
+  var pc: array[18, uint32]
+  pc[0] = uint32(T); pc[1] = uint32(H); pc[2] = uint32(G); pc[3] = uint32(N)
+  pc[4] = uint32(D); pc[5] = uint32(Q); pc[6] = uint32(nC); pc[7] = uint32(C)
+  pc[8] = uint32(cDim)
+  pc[9] = uint32(offConv); pc[10] = uint32(offDt); pc[11] = uint32(offCum)
+  pc[12] = uint32(offALog); pc[13] = uint32(offDSkip); pc[14] = uint32(offYPre)
+  pc[15] = uint32(offStates); pc[16] = uint32(offSloc)
+  pc[17] = uint32(cont)
+  # Cooperative modes run one subgroup per tile; scalar modes 256 lanes.
+  let sg = if kind == "coop": int(gDeviceCaps.subgroupSize) else: 256
+  let slabs = uint32(Q div 16)
+  for mode in [0, 1, 2, 3, 4]:
+    let (name, source) = ssdShader(kind, mode, N, D, Q)
+    let spv = compileVulkanJitShader(name, source)
+    let ok =
+      case mode
+      of 0: dispatchGeneric(name, [arena], addr pc[0], 72,
+              uint32(nC), uint32(H), 1, Q, spv)
+      of 1: dispatchGeneric(name, [arena], addr pc[0], 72,
+              uint32(nC) * slabs, uint32(H), 1, sg, spv)
+      of 2: dispatchGeneric(name, [arena], addr pc[0], 72,
+              uint32(nC) * uint32(N div 16), uint32(H), 1, sg, spv)
+      of 3: dispatchGeneric(name, [arena], addr pc[0], 72,
+              uint32(H), 1, 1, 256, spv)
+      else: dispatchGeneric(name, [arena], addr pc[0], 72,
+              uint32(nC) * slabs, uint32(H), 1, sg, spv)
+    if not ok: return false
+  true
+
+proc ssdReference(arena: var seq[float64];
+                  T, H, G, N, D, Q, C, cDim: int;
+                  offConv, offDt, offALog, offDSkip,
+                  offYPre, offStates: int; cont: bool) =
+  ## FP64 serial SSM recurrence writing yPre and the final state (states[T]).
+  for h in 0 ..< H:
+    let g = h div (H div G)
+    let A = -exp(arena[offALog + h])
+    let dsk = arena[offDSkip + h]
+    var s = newSeq[float64](N * D)
+    if cont:
+      for n in 0 ..< N:
+        for d in 0 ..< D:
+          s[n * D + d] = arena[offStates + (h * D + d) * N + n]
+    for t in 0 ..< T:
+      let row = offConv + t * cDim
+      let dt = arena[offDt + t * H + h]
+      let decay = exp(dt * A)
+      for n in 0 ..< N:
+        let b = arena[row + C + g * N + n] * dt
+        for d in 0 ..< D:
+          s[n * D + d] = decay * s[n * D + d] + b * arena[row + h * D + d]
+      for d in 0 ..< D:
+        var acc = dsk * arena[row + h * D + d]
+        for n in 0 ..< N:
+          acc += arena[row + C + G * N + g * N + n] * s[n * D + d]
+        arena[offYPre + t * C + h * D + d] = acc
+    for n in 0 ..< N:
+      for d in 0 ..< D:
+        arena[offStates + (C + h * D + d) * N + n] = s[n * D + d]
+
+proc ssdParity(kind: string; N, D, Q: int): tuple[ok: bool, err: float] =
+  ## Runs all five pipelines end to end on random data (a partial last chunk
+  ## and a carried initial state) against the FP64 recurrence.
+  let T = 2 * Q - 3
+  const H = 2
+  const G = 2
+  let C = H * D
+  let cDim = C + 2 * G * N
+  let nC = (T + Q - 1) div Q
+  var o = 0
+  template take(n: int): int =
+    let r = o; o += n; r
+  let offConv = take(T * cDim)
+  let offDt = take(T * H)
+  let offCum = take(T * H)
+  let offALog = take(H)
+  let offDSkip = take(H)
+  let offYPre = take(T * C)
+  let offStates = take(2 * C * N)
+  let offSloc = take(nC * H * N * D)
+  var seed = 0x51ED270B'u32
+  proc rnd(): float32 =
+    seed = seed xor (seed shl 13); seed = seed xor (seed shr 17); seed = seed xor (seed shl 5)
+    float32(seed and 0xFFFFFF) / float32(0x800000) - 1.0'f32
+  var arena = newSeq[float32](o)
+  for t in 0 ..< T:
+    for i in 0 ..< cDim: arena[offConv + t * cDim + i] = rnd()
+    for h in 0 ..< H: arena[offDt + t * H + h] = abs(rnd()) * 0.6'f32 + 0.05'f32
+  for h in 0 ..< H:
+    arena[offALog + h] = rnd() * 0.5'f32
+    arena[offDSkip + h] = rnd()
+  for i in 0 ..< C * N:
+    arena[offStates + i] = rnd()                      # carried initial state
+  var refArena = newSeq[float64](o)
+  for i in 0 ..< o: refArena[i] = float64(arena[i])
+  ssdReference(refArena, T, H, G, N, D, Q, C, cDim,
+    offConv, offDt, offALog, offDSkip, offYPre, offStates, true)
+  if not vulkanSessionBegin(): return (false, Inf)
+  var hArena = vulkanSessionUpload(arena)
+  var dispatched = false
+  try:
+    dispatched = encodeSsdFla(kind, hArena, T, H, G, N, D, Q, nC, C, cDim,
+      offConv, offDt, offCum, offALog, offDSkip, offYPre, offStates, offSloc, true)
+  except CatchableError as e:
+    stderr.writeLine "[vulkan] mamba2 SSD unavailable: " & e.msg.splitLines()[0]
+  let ended = vulkanSessionEnd()
+  if dispatched and ended:
+    let got = vulkanSessionRead(hArena, o)
+    result = (true, 0.0)
+    for t in 0 ..< T:
+      for i in 0 ..< C:
+        let e = abs(float(got[offYPre + t * C + i]) - refArena[offYPre + t * C + i])
+        if e != e or e > result.err: result.err = (if e != e: Inf else: e)
+    for i in 0 ..< C * N:
+      let e = abs(float(got[offStates + C * N + i]) -
+                  refArena[offStates + C * N + i])
+      if e != e or e > result.err: result.err = (if e != e: Inf else: e)
+    result.ok = result.err <= (if kind == "coop": 5e-2 else: 1e-3)
+  else:
+    result = (false, Inf)
+  vulkanSessionFree(hArena)
+
+proc vulkanMamba2SsdPrepare*(N, D, Q: int): string =
+  ## Picks and parity-checks the SSD pipelines for (d_state, head dim, chunk)
+  ## outside any session: "coop" (tensor cores), "scalar" (FP32 FMA tiles) or
+  ## "" (unavailable; the caller keeps its scan path). BYBY_SSD=0 disables it,
+  ## BYBY_SSD=scalar skips the tensor-core kernels.
+  ensureInit()
+  let key = $N & "_" & $D & "_" & $Q
+  if key in gSsdKind: return gSsdKind[key]
+  result = ""
+  let mode = getEnv("BYBY_SSD", "auto")
+  if mode != "0" and not gSessionActive:
+    var candidates: seq[string]
+    if mode != "scalar" and ssdCoopSupported(N, D, Q): candidates.add "coop"
+    if ssdScalarSupported(N, D, Q): candidates.add "scalar"
+    for kind in candidates:
+      let (ok, err) = ssdParity(kind, N, D, Q)
+      if ok:
+        result = kind
+        stderr.writeLine "[vulkan] mamba2 SSD prefill N=" & $N & " D=" & $D &
+          " Q=" & $Q & ": " &
+          (if kind == "coop": "tensor cores (KHR_cooperative_matrix FP16/FP32, "
+           else: "scalar FP32 (") & "max err " & $err & ")"
+        break
+      stderr.writeLine "[vulkan] mamba2 SSD (" & kind & ", N=" & $N & ", D=" & $D &
+        ", Q=" & $Q & ") failed parity (max err " & $err & "), skipping it"
+  gSsdKind[key] = result
+
+proc vulkanSessionMamba2SsdPrefillEnc*(arena: VulkanBufferHandle;
+    T, H, G, N, D, Q, C, cDim: int;
+    offConv, offDt, offCum, offALog, offDSkip,
+    offYPre, offStates, offSloc: int; cont: bool): bool =
+  ## Encodes the whole chunked SSD pass (five dispatches) into the open
+  ## session. vulkanMamba2SsdPrepare(N, D, Q) must have picked a kernel.
+  if not gSessionActive or arena.buf == nil: return false
+  let kind = gSsdKind.getOrDefault($N & "_" & $D & "_" & $Q, "")
+  if kind.len == 0: return false
+  let nC = (T + Q - 1) div Q
+  if T <= 0 or nC > 256 or H mod G != 0 or C != H * D: return false
+  try:
+    result = encodeSsdFla(kind, arena, T, H, G, N, D, Q, nC, C, cDim,
+      offConv, offDt, offCum, offALog, offDSkip, offYPre, offStates, offSloc, cont)
+  except CatchableError as e:
+    stderr.writeLine "[vulkan] mamba2 SSD dispatch failed: " & e.msg.splitLines()[0]
+    result = false
+
 proc vulkanAvailable*(): bool =
   ## Used by detectBackend() in gpubackend.nim - tries load+init and catches errors
   ## safely (does NOT raise) when the machine has no Vulkan/MoltenVK.

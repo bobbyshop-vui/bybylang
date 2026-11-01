@@ -1684,6 +1684,30 @@ proc sessionKvScatterEnc*(backend: GpuBackend, src: SessionHandle, dst: var Sess
   else:
     return false
 
+proc sessionMamba2SsdPrepare*(backend: GpuBackend, N, D, Q: int): string =
+  ## Picks and parity-checks the chunked Mamba2 SSD/FLA prefill pipelines for
+  ## (d_state N, head dim D, chunk length Q), outside any session. Returns
+  ## "coop" (tensor cores), "scalar" (FP32 tiles) or "" (unavailable; keep the
+  ## scan path). Vulkan only.
+  if normalizeBackend(backend) != gbVulkan: return ""
+  vulkanMamba2SsdPrepare(N, D, Q)
+
+proc sessionMamba2SsdPrefillEnc*(backend: GpuBackend, arena: SessionHandle,
+    T, H, G, N, D, Q, C, cDim: int,
+    offConv, offDt, offCum, offALog, offDSkip,
+    offYPre, offStates, offSloc: int, cont: bool): bool =
+  ## Encodes the whole chunked SSD pass (cumsum, FLA intra-chunk, chunk states,
+  ## combine, inter-chunk: five dispatches) over one float32 arena, replacing
+  ## the Mamba2 sequence scan for this layer. Offsets are float32 indices into
+  ## the arena; conv rows [t, cDim] = [x(C) | B(G*N) | C(G*N)], dt [t, H],
+  ## yPre [t, C], states [2, H*D, N] (slot 0 = carry in when cont, slot 1 =
+  ## final state out), cum [T, H] and Sloc [nC, H, N, D] are scratch. False =
+  ## not available (sessionMamba2SsdPrepare must have picked a kernel); the
+  ## caller falls back to its scan.
+  if normalizeBackend(backend) != gbVulkan: return false
+  vulkanSessionMamba2SsdPrefillEnc(arena.vulkanHandle, T, H, G, N, D, Q, C, cDim,
+    offConv, offDt, offCum, offALog, offDSkip, offYPre, offStates, offSloc, cont)
+
 proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var SessionHandle, n: int): bool =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
