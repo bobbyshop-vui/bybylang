@@ -187,6 +187,21 @@ sessionFree(backend, c)
 
 Core lifecycle calls: `sessionBegin`, `sessionUpload`/`sessionUploadBorrowed`/`sessionUploadPrivate`, `sessionAllocScratch`, `sessionEnd`, `sessionRead`, and `sessionFree`. Encode APIs cover vector/activation ops, matmul and Q4 matmul, softmax, layernorm/RMSNorm, RoPE, attention, copy/scale, gather/compare, dropout, slicing, and embedding where implemented by the chosen backend. `sessionCommitContinue` can commit queued work and continue encoding without an explicit CPU readback; `sessionRecoverQueue` is for recovery after a failed session. `sessionAllocHeap` is currently a Metal-only heap optimization and returns `nil` on unsupported backends; check it before suballocating.
 
+Prefill and long-running work:
+
+| Call | What it does |
+| --- | --- |
+| `sessionFlashAttentionPrepare(backend, D): string` | Picks the prefill flash-attention kernel for head dim `D` (call outside a session). Returns `"coop"` (Vulkan tensor cores), `"scalar"` (Metal, Vulkan without tensor cores), or `""` when there is none. Vulkan checks its kernels against a reference first and drops one that fails. |
+| `sessionFlashAttentionPrefillEnc(backend, q, kAll, vAll, o, T, H, HKV, D, pos, maxSeqLen, scale): bool` | Causal flash attention for `T` new rows. `q`/`o` are `[T, H, D]`; `kAll`/`vAll` are the cache `[HKV, maxSeqLen, D]` already holding positions `0 .. pos+T-1`; GQA maps head `h` to `h div (H div HKV)`. |
+| `sessionKvScatterEnc(backend, src, dst, T, HKV, D, pos, maxSeqLen): bool` | KV cache append: `dst[h, pos+t, :] = src[t, h, :]`. |
+| `sessionPacesCommandBuffers(backend): bool` | True when long GPU work should be split with `sessionCommitContinue` (Metal on Intel/AMD Macs, where the watchdog kills a command buffer that runs for seconds; Vulkan). False on Apple Silicon. |
+
+`sessionMatmulQ4` with `M > 1` takes the tiled prefill GEMM: on Metal a
+64x128 register-tiled kernel (`BYBY_METAL_Q4_GEMM=0` turns it off,
+`BYBY_METAL_Q4_GEMM_MIN_M` sets the smallest M, default 8; needs `K % 32 == 0`
+and a group size that is 0 or a multiple of 32); on a Vulkan GPU with
+`KHR_cooperative_matrix` a tensor-core GEMM split-K over every SM/CU.
+
 For quantized Q4 weights, upload once and reuse the returned resident handle across sessions:
 
 ```nim
