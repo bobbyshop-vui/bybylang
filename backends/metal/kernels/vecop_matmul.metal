@@ -18,14 +18,14 @@ kernel void vecop_kernel(
 }
 
 // ============================================================
-// COPY INTO (GPU-side concat) - THÊM MỚI: dst[dstOffset + id] = src[id],
-// dùng để ghép nhiều buffer con (vd outHeads của từng KV-head trong
-// attention decode) thành 1 buffer liên tục [H*D] NGAY TRÊN GPU, tránh
-// phải sessionRead() về CPU rồi sessionUpload() lại chỉ để nối mảng -
-// đây là điểm chặn cuối cùng khiến session attention-decode và session
-// oProj không gộp được làm 1. dstOffset tính bằng SỐ PHẦN TỬ (không phải
-// byte) - metal_copy_into_enc (metal_shim.m) tự nhân sizeof(float) khi
-// bind buffer offset.
+// COPY INTO (GPU-side concat) - NEW: dst[dstOffset + id] = src[id],
+// used to join several child buffers (e.g. the outHeads of each KV head in
+// attention decode) into one contiguous [H*D] buffer DIRECTLY ON THE GPU, instead of
+// sessionRead() to the CPU and sessionUpload() again just to concatenate -
+// that was the last blocker preventing the attention-decode session and the
+// oProj session from being merged. dstOffset is in ELEMENTS (not
+// bytes) - metal_copy_into_enc (metal_shim.m) multiplies by sizeof(float) when
+// binding the buffer offset.
 kernel void copy_into_kernel(
     device const float* src [[buffer(0)]],
     device float* dst [[buffer(1)]],
@@ -35,15 +35,15 @@ kernel void copy_into_kernel(
 }
 
 // ============================================================
-// SCALE (x *= scalar, in-place) - THÊM MỚI: dùng để nhân "scale" của
-// attention (1/sqrt(D)) vào TOÀN BỘ buffer Q [H*D] MỘT LẦN trên GPU, thay
-// vì đọc Q về CPU rồi nhân từng phần tử trong vòng for (xem qGroups ở
-// nim_inference.nim). Sau khi có scale_kernel, việc "gather theo group"
-// cho Q không cần kernel scatter riêng: vì layout Q là [H,D] với
-// h = hkv*nRep + r liên tục theo hkv, mỗi group hkv chỉ là 1 LÁT CẮT LIÊN
-// TỤC dài nRep*D bắt đầu tại offset hkv*nRep*D - dùng thẳng
-// copy_into_kernel (sessionCopyInto, đã có sẵn, tham số srcOffsetElems)
-// để trích ra, không cần kernel gather/scatter mới.
+// SCALE (x *= scalar, in-place) - NEW: applies the attention "scale"
+// (1/sqrt(D)) to the WHOLE Q buffer [H*D] ONCE on the GPU, instead
+// of reading Q back and multiplying each element in a for loop (see qGroups in
+// nim_inference.nim). With scale_kernel the per-group "gather"
+// of Q needs no scatter kernel: Q has layout [H,D] with
+// h = hkv*nRep + r contiguous in hkv, so each group hkv is just a CONTIGUOUS
+// SLICE of nRep*D starting at offset hkv*nRep*D - extracted directly with
+// copy_into_kernel (sessionCopyInto, existing, parameter srcOffsetElems),
+// no new gather/scatter kernel needed.
 kernel void scale_kernel(
     device float* x               [[buffer(0)]],
     device const float& scalar    [[buffer(1)]],
@@ -55,22 +55,22 @@ kernel void scale_kernel(
 // ============================================================
 // MATMUL TILED
 // ============================================================
-// SỬA (thay cho fix "hạ cứng BB_TILE=8 cho MỌI GPU" trước đây):
-// Root cause thật sự KHÔNG phải "tile 32 luôn nguy hiểm" mà là
-// metal_matmul()/metal_matmul_enc() dispatch groupSize=32x32=1024 threads
-// mà KHÔNG kiểm tra pipeline.maxTotalThreadsPerThreadgroup của GPU đang
-// chạy trước (khác metal_vecop cùng file đã làm đúng bằng MIN(...)). Hạ
-// tile về 8 cho MỌI GPU để né bug đó là đúng an toàn nhưng sai hiệu năng:
-// trên Apple Silicon / GPU rời mạnh, threadgroup 1024 threads hoàn toàn
-// hợp lệ và tile 32 nhanh hơn tile 8 nhiều lần (data reuse tốt hơn hẳn:
-// mỗi phần tử tileA/tileB được dùng lại 32 lần thay vì 8 lần trước khi
-// nạp lại từ device memory).
-// Fix ĐÚNG: build sẵn 3 biến thể kernel tile 8/16/32 (macro sinh code,
-// KHÔNG dùng function constant vì threadgroup array size cần literal rõ
-// ràng lúc build MSL, tránh rủi ro không tương thích driver cũ). Phía
-// metal_shim.m sẽ tự đo pipeline.maxTotalThreadsPerThreadgroup của TỪNG
-// pipeline sau khi tạo (không đoán trước theo tên GPU) rồi chọn variant
-// lớn nhất mà threadgroup thật sự cho phép, fallback dần xuống nếu không.
+// CHANGED (replacing the earlier "hard-code BB_TILE=8 for EVERY GPU" fix):
+// The real root cause was NOT "tile 32 is always dangerous" but that
+// metal_matmul()/metal_matmul_enc() dispatched groupSize=32x32=1024 threads
+// WITHOUT checking the pipeline.maxTotalThreadsPerThreadgroup of the running
+// GPU first (unlike metal_vecop in the same file, which correctly uses MIN(...)). Lowering
+// the tile to 8 for EVERY GPU avoided that bug safely but hurt performance:
+// on Apple Silicon / strong discrete GPUs a 1024-thread threadgroup is perfectly
+// valid and tile 32 is many times faster than tile 8 (much better data reuse:
+// each tileA/tileB element is reused 32 times instead of 8 before
+// reloading from device memory).
+// The RIGHT fix: build 3 kernel variants with tiles 8/16/32 (macro-generated,
+// NO function constants because the threadgroup array size needs a literal
+// when the MSL is built, avoiding incompatibility with old drivers). On the
+// metal_shim.m side, the pipeline.maxTotalThreadsPerThreadgroup of EACH
+// pipeline is measured after creation (not guessed from the GPU name) and the
+// largest variant the threadgroup really allows is chosen, falling back step by step otherwise.
 #define BB_MATMUL_VARIANT(TILE, KFUNC)                                       \
 kernel void KFUNC(                                                           \
     device const float* a [[buffer(0)]],                                    \
@@ -105,22 +105,22 @@ kernel void KFUNC(                                                           \
     }                                                                        \
 }
 
-// 3 biến thể - metal_shim.m chọn 1 trong 3 tuỳ pipeline.maxTotalThreadsPerThreadgroup
-// thật sự của GPU đang chạy (8x8=64, 16x16=256, 32x32=1024 threads/threadgroup).
+// 3 variants - metal_shim.m picks one from the real pipeline.maxTotalThreadsPerThreadgroup
+// of the running GPU (8x8=64, 16x16=256, 32x32=1024 threads/threadgroup).
 BB_MATMUL_VARIANT(8,  matmul_kernel_t8)
 BB_MATMUL_VARIANT(16, matmul_kernel_t16)
 BB_MATMUL_VARIANT(32, matmul_kernel_t32)
 
-// Giữ nguyên tên "matmul_kernel" = alias tile 8 để mọi chỗ gọi cũ (nếu còn
-// sót nơi nào không qua đường chọn-tile-động) vẫn compile được, KHÔNG BAO
-// GIỜ dispatch với groupSize > 8x8 cho tên này.
+// The name "matmul_kernel" stays as an alias of tile 8 so any old call site (if one
+// is left outside the dynamic tile choice) still compiles; this name is NEVER
+// dispatched with groupSize > 8x8.
 BB_MATMUL_VARIANT(8, matmul_kernel)
 
 // ============================================================
-// MATMUL TILED "NT" (C = A @ B^T, B lưu row-major [N,K] - KHÔNG transpose
-// vật lý). THÊM MỚI: dùng cho attention decode - K-cache/V-cache lưu tự
-// nhiên theo layout [S,D] (N=S, K=headDim) - loại bỏ hoàn toàn bước
-// transpose CPU O(S*D)/token trước đây phải làm để build kBlockT.
+// TILED "NT" MATMUL (C = A @ B^T, B stored row-major [N,K] - NO physical
+// transpose). NEW: for attention decode - the K-cache/V-cache are stored naturally
+// in [S,D] layout (N=S, K=headDim) - removes the O(S*D)/token CPU
+// transpose that was needed before to build kBlockT.
 // ============================================================
 #define BB_MATMUL_NT_VARIANT(TILE, KFUNC)                                    \
 kernel void KFUNC(                                                           \
@@ -144,7 +144,7 @@ kernel void KFUNC(                                                           \
     int numTiles = (k + TILE - 1) / TILE;                                   \
     for (int t = 0; t < numTiles; ++t) {                                    \
         int aK = t * TILE + tx;                                             \
-        int bCol = colBase + ty; /* doc lap voi 'col' - dung ty lam cot khi load B */ \
+        int bCol = colBase + ty; /* independent of 'col' - ty is the column when loading B */ \
         int bK = t * TILE + tx;                                             \
         tileA[ty][tx] = (row < m && aK < k) ? a[row * k + aK] : 0.0f;        \
         tileB[ty][tx] = (bCol < n && bK < k) ? b[bCol * k + bK] : 0.0f;      \
@@ -258,17 +258,17 @@ kernel void activation_backward_kernel(
 }
 
 // ============================================================
-// ROPE (rotate_half, in-place) - THÊM MỚI
+// ROPE (rotate_half, in-place) - NEW
 // ============================================================
-// Trước đây RoPE phải: đọc Q/K về CPU, tự build mảng cosFull/sinFull/rotHalf
-// kích thước [T,H,D] (lãng phí, lặp giá trị cos/sin H lần), upload lại, làm
-// 3 sessionVecOp (mul,mul,add), rồi lại đọc về CPU lần nữa để dùng cho
-// attention - tốn 1 session GPU + 2 lượt round-trip CPU RIÊNG chỉ cho RoPE.
-// Kernel này áp dụng rotate_half TRỰC TIẾP trong lúc Q/K còn nằm trên GPU
-// (ngay sau QKV matmul, TRONG CÙNG session), không cần build mảng lặp lại,
-// không cần đọc CPU giữa chừng. cosT/sinT là đoạn [T, D/2] đã cắt sẵn theo
-// posOffset ở phía CPU (bảng gốc rope.cosT/sinT không đổi giữa các
-// layer/token nên phần cắt cũng rất nhỏ so với Q/K).
+// Before, RoPE had to: read Q/K back to the CPU, build cosFull/sinFull/rotHalf arrays
+// of size [T,H,D] (wasteful, cos/sin repeated H times), upload again, run
+// 3 sessionVecOps (mul,mul,add), then read back to the CPU again for
+// attention - a SEPARATE GPU session + 2 CPU round trips just for RoPE.
+// This kernel applies rotate_half DIRECTLY while Q/K are still on the GPU
+// (right after the QKV matmul, IN THE SAME session), with no repeated arrays
+// and no CPU reads in between. cosT/sinT are the [T, D/2] slices cut by
+// posOffset on the CPU (the original rope.cosT/sinT tables do not change between
+// layers/tokens, so the slice is tiny compared to Q/K).
 kernel void rope_kernel(
     device float* x               [[buffer(0)]],   // [T, Hn, D] in-place
     device const float* cosT      [[buffer(1)]],   // [T, D/2]
@@ -296,24 +296,24 @@ kernel void rope_kernel(
 // ============================================================
 #define BB_WG 256
 
-// SUA (fix bug tinh toan sai nhat quan - xem bao cao debug): CA 3 kernel
-// duoi day (softmax/rmsnorm/layernorm) gia dinh CO DINH BB_WG=256 thread/
-// threadgroup cho ca kich thuoc mang reduction "red[]" LAN buoc nhay vong
-// lap - nhung phia dispatch (metal_shim.m) lai tinh threadsPerGroup =
-// MIN(pipeline.maxTotalThreadsPerThreadgroup, 256) O RUNTIME. Neu GPU/
-// pipeline nao co maxTotalThreadsPerThreadgroup < 256 (hoan toan co the
-// tren GPU yeu/cu nhu Iris 640 - da thay nhieu dau hieu bat thuong tren
-// GPU nay suot qua trinh debug), so thread THAT dispatch < 256, nghia la
-// cac o red[thread That..255] KHONG BAO GIO duoc thread nao ghi vao - la
-// threadgroup memory CHUA KHOI TAO. Buoc reduction van co dinh bat dau tu
-// BB_WG/2=128 nen se CONG NHAM cac o rac nay vao tong (sum-of-squares cho
-// rmsnorm, max/sum cho softmax) -> ket qua sai NHAT QUAN (deterministic,
-// vi rac trong threadgroup memory thuong on dinh giua cac lan goi tren
-// cung 1 tien trinh) cho MOI layer, MOI token dung kernel nay. Fix: dung
-// [[threads_per_threadgroup]] (Metal cap san, biet DUNG so thread that su
-// dang chay) de CHINH cac thread dang co chu dong zero not phan red[] con
-// lai (tu tgSize den BB_WG-1) TRUOC buoc reduction, dam bao KHONG con o
-// nao chua khoi tao du threadgroup dispatch nho hon BB_WG bao nhieu.
+// CHANGED (fix for a consistent miscalculation - see the debug report): ALL 3 kernels
+// below (softmax/rmsnorm/layernorm) assumed a FIXED BB_WG=256 threads per
+// threadgroup for both the size of the "red[]" reduction array AND the loop
+// step - but the dispatch side (metal_shim.m) computes threadsPerGroup =
+// MIN(pipeline.maxTotalThreadsPerThreadgroup, 256) AT RUNTIME. If a GPU/
+// pipeline has maxTotalThreadsPerThreadgroup < 256 (entirely possible
+// on weak/old GPUs like Iris 640 - many anomalies were seen on this
+// GPU while debugging), fewer than 256 threads are REALLY dispatched, so
+// red[realThreads..255] is NEVER written by any thread - it is
+// UNINITIALISED threadgroup memory. The reduction still starts at a fixed
+// BB_WG/2=128, so it ADDED that garbage into the total (sum of squares for
+// rmsnorm, max/sum for softmax) -> CONSISTENTLY wrong results (deterministic,
+// because the garbage in threadgroup memory is usually stable between calls in
+// the same process) for EVERY layer and EVERY token using these kernels. Fix: use
+// [[threads_per_threadgroup]] (provided by Metal, the REAL number of running
+// threads) so the existing threads themselves zero the rest of red[]
+// (from tgSize to BB_WG-1) BEFORE the reduction, so NO slot stays
+// uninitialised however much smaller than BB_WG the dispatched threadgroup is.
 
 kernel void softmax_kernel(
     device const float* x [[buffer(0)]],
@@ -327,7 +327,7 @@ kernel void softmax_kernel(
     uint off = row * cols;
 
     float m = -INFINITY;
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         m = max(m, x[off + c]);
     }
     red[tid] = m;
@@ -341,7 +341,7 @@ kernel void softmax_kernel(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float sum = 0.0f;
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         float e = exp(x[off + c] - maxVal);
         y[off + c] = e;
         sum += e;
@@ -356,17 +356,17 @@ kernel void softmax_kernel(
     float invSum = 1.0f / red[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         y[off + c] *= invSum;
     }
 }
 
 // ============================================================
-// RMSNORM FORWARD (mirror layernorm_kernel ở trên, bỏ mean-subtract + beta -
-// RMSNorm chỉ scale theo sqrt(mean(x^2)), không center theo mean, không có
-// bias). Cơ chế threadgroup-reduction giữ NGUYÊN VẸN từ layernorm_kernel đã
-// chạy thật (cùng BB_WG, cùng pattern tid += BB_WG, cùng thứ tự barrier) -
-// phần duy nhất khác là công thức elementwise cuối và bớt 1 buffer (beta).
+// RMSNORM FORWARD (mirror of layernorm_kernel above without the mean subtraction + beta -
+// RMSNorm only scales by sqrt(mean(x^2)), no centering on the mean, no
+// bias). The threadgroup reduction is kept INTACT from the proven layernorm_kernel
+// (same BB_WG, same tid += BB_WG pattern, same barrier order) -
+// only the final elementwise formula differs and one buffer (beta) is gone.
 // ============================================================
 kernel void rmsnorm_kernel(
     device const float* x [[buffer(0)]],
@@ -382,7 +382,7 @@ kernel void rmsnorm_kernel(
     uint off = row * cols;
 
     float sumSq = 0.0f;
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         float v = x[off + c];
         sumSq += v * v;
     }
@@ -397,7 +397,7 @@ kernel void rmsnorm_kernel(
     float invStd = 1.0f / sqrt(meanSq + eps);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         y[off + c] = x[off + c] * invStd * gamma[c];
     }
 }
@@ -420,7 +420,7 @@ kernel void layernorm_kernel(
     uint off = row * cols;
 
     float sum = 0.0f, sumSq = 0.0f;
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         float v = x[off + c];
         sum += v;
         sumSq += v * v;
@@ -447,7 +447,7 @@ kernel void layernorm_kernel(
     float invStd = 1.0f / sqrt(var + eps);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: buoc nhay = SO THREAD THAT (tgSize), khong phai BB_WG
+    for (int c = int(tid); c < cols; c += int(tgSize)) {   // FIX bug #10: step = REAL thread count (tgSize), not BB_WG
         y[off + c] = (x[off + c] - mean) * invStd * gamma[c] + beta[c];
     }
 }
@@ -519,8 +519,8 @@ kernel void layernorm_backward_kernel(
         for (int c = 0; c < cols; ++c) {
             float term1 = dy[off + c] * gamma[c] * invStd;
             float term2 = sum1 / float(cols);
-            // sum2 = -invStd^3 * mean(dy*gamma*(x-mean)) (da chia cols o tren): KHONG nhan them 2/cols
-            // (ban cu lam so hang hieu chinh phuong sai nho di cols/2 lan -> dx sai).
+            // sum2 = -invStd^3 * mean(dy*gamma*(x-mean)) (already divided by cols above): NO extra 2/cols
+            // (the old version made the variance correction term cols/2 times too small -> wrong dx).
             float term3 = (x[off + c] - mean) * sum2;
             dx[off + c] = term1 - term2 + term3;
         }
@@ -546,136 +546,136 @@ kernel void embedding_lookup_kernel(
 }
 
 // ============================================================
-// MATMUL TRUC TIEP TREN INT4 ASYMMETRIC (packed, per-group scale/zero_point)
+// MATMUL DIRECTLY ON ASYMMETRIC INT4 (packed, per-group scale/zero_point)
 // ============================================================
-// SUA (item 3 trong ghi chu hieu nang): TRUOC DAY moi lan Linear.forward()
-// phai dequantizeTensorTransposed() TOAN BO weight int4 ra 1 mang fp32 day
-// du tren CPU (vd 4096x11008 ~180MB fp32) roi UPLOAD ca mang fp32 do len
-// GPU chi de nhan 1 lan roi vut - dung y nhu llama.cpp KHONG lam (ho nhan
-// truc tiep tren du lieu quantized). Kernel nay nhan thang tren buffer
-// int4 da pack (2 gia tri/byte) + scale/zero_point theo group, KHONG can
-// dequant rieng tren CPU va KHONG can upload mang fp32 day du - giam bang
-// thong upload ~4-8 lan (dung tinh than "giam bang thong memory" cua
-// llama.cpp), giai phong luon phan CPU-time danh cho vong for dequant.
-// Layout phai khop CHINH XAC voi quant.nim (quantizeInt4Asymmetric /
+// CHANGED (item 3 of the performance notes): BEFORE, every Linear.forward()
+// had to dequantizeTensorTransposed() ALL int4 weights into a full fp32
+// array on the CPU (e.g. 4096x11008 ~180MB fp32) and UPLOAD that whole array to the
+// GPU just to multiply once and discard it - exactly what llama.cpp does NOT do (it multiplies
+// directly on the quantized data). This kernel multiplies directly on the
+// packed int4 buffer (2 values/byte) + per-group scale/zero_point, with NO
+// separate CPU dequant and NO full fp32 upload - about 4-8x less upload
+// bandwidth (the llama.cpp "reduce memory bandwidth" idea),
+// also freeing the CPU time of the dequant loop.
+// The layout must match quant.nim EXACTLY (quantizeInt4Asymmetric /
 // dequantizeTensorTransposed):
-//   - wq: [N, K] row-major, nibble-packed 2 gia tri/byte, byte thap = phan
-//     tu chan (k%2==0), byte cao = phan tu le (k%2==1).
-//   - scales/zeros: neu groupSize>0, moi hang N chia thanh
-//     ceil(K/groupSize) group, group[g] dung scales[n*nGroupsPerRow+g].
+//   - wq: [N, K] row-major, 2 nibbles/byte, low nibble = even
+//     element (k%2==0), high nibble = odd element (k%2==1).
+//   - scales/zeros: if groupSize>0, each row N is split into
+//     ceil(K/groupSize) groups, group[g] uses scales[n*nGroupsPerRow+g].
 //   - c[m,n] = sum_k a[m,k] * ((nibble(n,k) - zero(n,g)) * scale(n,g))
-//     -- dung 100% cong thuc trong dequantizeTensorTransposed() + beMatmul
-//     hien tai, chi khac la khong vat chat hoa wT ra fp32 truoc.
-// CHUA CHAY THU TREN GPU METAL THAT (moi truong sinh code la Linux, khong
-// co macOS/Metal that de bien dich+chay) - viet bam sat dung cong thuc
-// tham chieu CPU (quant.nim) nhung BAT BUOC phai tu build+test tren May
-// that truoc khi dung cho sinh token that. Neu ra token rac, day la nghi
-// ngo dau tien (sai offset nibble hoac sai thu tu group).
-// SUA (theo yêu cầu "sửa cách đi như llama.cpp" - kernel CŨ bên dưới đã đổi
-// tên còn matmul_q4_kernel_naive để tham khảo/rollback):
-// Kernel CŨ: 1 thread = 1 phần tử output, tự đọc & cộng dồn HẾT K phần tử
-// tuần tự (không SIMD reduction), dispatch threadgroup 16x1 = chỉ 16 thread/
-// group -> occupancy cực thấp trên GPU thật (Iris có hàng trăm ALU rảnh).
-// Kernel MỚI theo đúng chiến thuật kernel_mul_mv_q4_K của llama.cpp/ggml
+//     -- exactly the formula of dequantizeTensorTransposed() + the current beMatmul,
+//     only without materialising wT in fp32 first.
+// NOT YET RUN ON A REAL METAL GPU (generated on Linux, without
+// a real macOS/Metal to build+run) - follows the CPU
+// reference formula (quant.nim) closely but MUST be built+tested on a real
+// machine before generating real tokens. If tokens come out as garbage, this is the first
+// suspect (wrong nibble offset or wrong group order).
+// CHANGED ("work like llama.cpp" - the OLD kernel below was renamed
+// matmul_q4_kernel_naive for reference/rollback):
+// OLD kernel: 1 thread = 1 output element, reading & summing ALL K elements
+// sequentially (no SIMD reduction), 16x1 threadgroups = only 16 threads per
+// group -> very low occupancy on a real GPU (Iris has hundreds of idle ALUs).
+// The NEW kernel follows the strategy of kernel_mul_mv_q4_K in llama.cpp/ggml's
 // Metal backend:
-//   1. Mỗi threadgroup = ĐÚNG 1 simdgroup (32 thread), xử lý MMQ4_NDST=4
-//      hàng output (n) cùng lúc cho 1 hàng activation (m) - dispatch theo
+//   1. Each threadgroup = EXACTLY one simdgroup (32 threads), handling MMQ4_NDST=4
+//      output rows (n) at once for one activation row (m) - dispatched as
 //      (rowBlock = ceil(N/4), M).
-//   2. Activation a[m,:] (K phần tử) được 32 thread NẠP 1 LẦN vào threadgroup
-//      shared memory rồi DÙNG LẠI cho cả 4 hàng - trước đây mỗi hàng n tự
-//      đọc lại a[] từ device memory (băng thông lãng phí gấp N/4 lần).
-//   3. Mỗi hàng: 32 thread chia nhau K phần tử (k = lane, lane+32, ...),
-//      cộng dồn partial rồi simd_sum() reduce chỉ trong 1 lệnh phần cứng
-//      (thay vì 1 thread loop tuần tự K lần) - đây là phần tăng tốc chính.
-// Kết quả: số threadgroup dispatch ra nhiều hơn N/4 lần (đủ để lấp đầy toàn
-// bộ EU của GPU dù yếu), mỗi threadgroup làm việc song song thật (32-way)
-// thay vì 1 thread gánh hết K.
-// SUA BUG NGHIÊM TRỌNG (gây "GPU Timeout Error" thật trên máy Intel Iris):
-// Bản trước dùng threadgroup shared memory kích thước K*4 byte để cache cả
-// hàng activation - với K = intermediate_size (vd down_proj, K~11008+) thì
-// cần ~44KB, VƯỢT giới hạn shared-memory/threadgroup của Iris (thường chỉ
-// 16-32KB tuỳ gen). Metal không báo lỗi rõ ràng lúc setThreadgroupMemoryLength
-// trên GPU cũ kiểu này - nó treo hẳn GPU (timeout), không phải lỗi biên dịch.
-// SỬA: bỏ hẳn threadgroup memory. Đổi thứ tự vòng lặp: k làm vòng NGOÀI (mỗi
-// thread đọc a[m,k] từ device memory ĐÚNG 1 LẦN, giữ trong 1 register cục bộ
-// `aVal`), rr (MMQ4_NDST hàng) làm vòng TRONG dùng lại chính register đó -
-// vẫn đạt mục tiêu "không đọc lại activation N/4 lần" như bản shared-memory,
-// nhưng an toàn tuyệt đối vì không cần cấp phát shared memory nào cả.
-// SUA BUG NGHIEM TRONG (token rac tren Intel Iris Plus 640 that qua Metal):
-// Ban truoc dung simd_sum() + thread_index_in_simdgroup, GIA DINH 1
-// threadgroup 32-thread == DUNG 1 simdgroup phan cung (nhu comment cu ghi
-// "CHUA CHAY THU TREN GPU METAL THAT" - chua bao gio duoc kiem chung tren
-// may that). Tren GPU Intel (Gen9 va nhieu Intel GPU khac) qua Metal,
-// threads_per_simdgroup THUC TE co the la 8 hoac 16, KHONG dam bao 32 -
-// khi do 1 threadgroup 32 thread bi chia thanh NHIEU simdgroup phan cung
-// rieng biet, moi simdgroup co tiisg==0 RIENG -> NHIEU thread cung ghi de
-// c[m*N+n] (race condition, thread ghi sau cung thang) VA moi simd_sum()
-// chi cong duoc PHAN K ma simdgroup DO xu ly, khong phai tong ca K -> ket
-// qua SAI cho MOI phep Linear dung weight Q4 (gan nhu toan bo model luong
-// tu hoa) - day la nguyen nhan "token rac" tren Metal (dung y het bug da
-// tim thay va sua o ban Vulkan - matmul_q4.comp).
-// FIX: bo simd_sum/thread_index_in_simdgroup, dung threadgroup (shared)
-// memory + tree reduction theo DUNG thread_position_in_threadgroup (luon
-// la 0..31 duy nhat trong CA threadgroup, khong phu thuoc simdgroup phan
-// cung report bao nhieu) - dung nguyen tac da ap dung cho ban Vulkan.
+//   2. The activation a[m,:] (K elements) is LOADED ONCE by the 32 threads into threadgroup
+//      shared memory and REUSED for all 4 rows - before, each row n re-read
+//      a[] from device memory (N/4 times the bandwidth).
+//   3. Per row: the 32 threads split the K elements (k = lane, lane+32, ...),
+//      accumulate partials and reduce with simd_sum() in one hardware instruction
+//      (instead of one thread looping K times) - the main speedup.
+// Result: N/4 times more threadgroups dispatched (enough to fill all
+// EUs of even a weak GPU), each doing real parallel work (32-way)
+// instead of one thread doing all of K.
+// SEVERE BUG FIX (caused a real "GPU Timeout Error" on an Intel Iris machine):
+// The previous version cached the whole activation row in K*4 bytes of threadgroup shared memory
+// - with K = intermediate_size (e.g. down_proj, K~11008+) that needs
+// ~44KB, ABOVE the per-threadgroup shared-memory limit of Iris (usually only
+// 16-32KB depending on the generation). Metal gives no clear error at setThreadgroupMemoryLength
+// on such old GPUs - it hangs the GPU (timeout), not a compile error.
+// FIX: no threadgroup memory at all. Loop order swapped: k is the OUTER loop (each
+// thread reads a[m,k] from device memory EXACTLY ONCE into a local register
+// `aVal`), rr (the MMQ4_NDST rows) is the INNER loop reusing that register -
+// still "no N/4 re-reads of the activation" like the shared-memory version,
+// but absolutely safe because no shared memory is allocated.
+// SEVERE BUG FIX (garbage tokens on a real Intel Iris Plus 640 through Metal):
+// The previous version used simd_sum() + thread_index_in_simdgroup, ASSUMING a
+// 32-thread threadgroup == EXACTLY one hardware simdgroup (as the old comment said,
+// "NOT YET RUN ON A REAL METAL GPU" - never verified on a
+// real machine). On Intel GPUs (Gen9 and many others) through Metal,
+// the REAL threads_per_simdgroup can be 8 or 16, 32 is NOT guaranteed -
+// then a 32-thread threadgroup is split into SEVERAL separate hardware
+// simdgroups, each with its OWN tiisg==0 -> SEVERAL threads overwrote
+// c[m*N+n] (race condition, the last writer wins) AND each simd_sum()
+// summed only the PART of K handled by THAT simdgroup, not all of K -> WRONG
+// results for EVERY Linear with Q4 weights (almost the whole quantized
+// model) - the cause of the "garbage tokens" on Metal (exactly the bug
+// found and fixed in the Vulkan version - matmul_q4.comp).
+// FIX: no simd_sum/thread_index_in_simdgroup; threadgroup (shared)
+// memory + a tree reduction over thread_position_in_threadgroup (always
+// unique 0..31 within the WHOLE threadgroup, whatever simdgroup size the hardware
+// reports) - the same principle as the Vulkan version.
 #define MMQ4_NDST 8
-// SUA: tang tu 4 len 8 (dong bo voi Vulkan + const MMQ4_NDST trong
-// vulkan_driver.nim) - tang tai su dung moi lan doc a[k] tren 8 cot thay
-// vi 4, giam ~50% so threadgroup dispatch, cai thien ty le FLOPs/byte
-// doc tu buffer A. AN TOAN tang vi kernel nay dung threadgroup shared-
-// memory reduction (khong dua vao simd_sum/thread_index_in_simdgroup),
-// khong con phu thuoc gia dinh simdgroup phan cung nao ca.
+// CHANGED: raised from 4 to 8 (in sync with Vulkan + const MMQ4_NDST in
+// vulkan_driver.nim) - each a[k] read is reused for 8 columns instead
+// of 4, about 50% fewer threadgroups dispatched, a better FLOPs/byte ratio
+// for buffer A. SAFE to raise because this kernel uses a threadgroup shared-
+// memory reduction (no reliance on simd_sum/thread_index_in_simdgroup),
+// no hardware simdgroup assumption at all.
 #define MMQ4_LANES 32
-// SUA HIEU NANG (kernel nay CHAM hon ban simd_sum cu vi 2 ly do): (1) moi
-// threadgroup chi co 32 thread -> so threadgroup dispatch nhieu gap 4 lan
-// so voi ban cu (ban cu gom MMQ4_SG_PER_TG=4 simdgroup/threadgroup), (2)
-// 6 threadgroup_barrier/block (1 build tier2 + 5 tang tree-reduce) tren
-// GPU it thread song song hon vi threadgroup memory 9.7KB/threadgroup gioi
-// han occupancy. FIX: gom MMQ4_GROUPS_PER_TG=4 "logical group" 32-lane vao
-// CHUNG 1 threadgroup 128 thread - moi logical group tu xu ly 1 rowBlock
-// rieng, dung "lane = lid % 32" thay cho "lid" lam chi so trong nhom -
-// giam so threadgroup dispatch 4 lan (bang ban simd_sum cu) MA VAN giu
-// nguyen tac barrier + threadgroup memory (khong quay lai gia dinh
-// simdgroup phan cung = 32). tier2 (tach nibble) dung CHUNG ca 128 thread
-// (khong doi theo group). tier1 (dequant LUT) + curGroup gio la
-// threadgroup memory dung chung cho CA logical group (khong con rieng
-// tung lane) - AN TOAN vi gr=k/groupSize CHI phu thuoc k, ma k tai 1 vong
-// lap la GIONG HET nhau cho ca 128 thread (moi logical group deu lap
-// k=lane, lane+32,... voi lane=0..31 nhu nhau) => dieu kien "gr doi" la
-// UNIFORM tren toan bo threadgroup, threadgroup_barrier ben trong nhanh
-// re nay van HOP LE (khong bi thread nao di vao nhanh khac thread khac).
-// GIA DINH: groupSize % 32 == 0 (dung voi cac groupSize Q4 pho bien 32/
-// 64/128) de dam bao 32 gia tri k lien tiep trong 1 vong lap khong bao
-// gio bi cat ngang boi 1 ranh gioi group - neu groupSize khac boi so 32,
-// build lai tier1 co the xay ra tre 1 vong doi voi vai lane (van ĐÚNG ve
-// gia tri cuoi cung, chi mat bot loi ich cache, khong sai ket qua).
+// PERFORMANCE FIX (this kernel was SLOWER than the old simd_sum version for 2 reasons): (1) each
+// threadgroup had only 32 threads -> 4 times more threadgroups dispatched
+// than the old version (which grouped MMQ4_SG_PER_TG=4 simdgroups per threadgroup), (2)
+// 6 threadgroup_barriers per block (1 tier2 build + 5 tree-reduce levels) on
+// a GPU with less parallelism, because 9.7KB of threadgroup memory per threadgroup limited
+// occupancy. FIX: MMQ4_GROUPS_PER_TG=4 32-lane "logical groups" share
+// ONE 128-thread threadgroup - each logical group handles its own
+// rowBlock, using "lane = lid % 32" instead of "lid" as the index within the group -
+// 4 times fewer threadgroups dispatched (same as the old simd_sum version) WHILE keeping
+// the barrier + threadgroup-memory principle (no return to the assumption of a
+// 32-wide hardware simdgroup). tier2 (nibble split) is shared by all 128 threads
+// (not per group). tier1 (dequant LUT) + curGroup are now
+// threadgroup memory shared by the WHOLE logical group (no longer per
+// lane) - SAFE because gr=k/groupSize depends ONLY on k, and k in one iteration
+// is IDENTICAL for all 128 threads (every logical group loops
+// k=lane, lane+32,... with the same lane=0..31) => the "gr changed" condition is
+// UNIFORM across the threadgroup, so the threadgroup_barrier inside that branch
+// is VALID (no thread takes a different branch than another).
+// ASSUMPTION: groupSize % 32 == 0 (true for the usual Q4 groupSizes 32/
+// 64/128) so 32 consecutive k values in one iteration never
+// cross a group boundary - with a groupSize that is not a multiple of 32,
+// tier1 may be rebuilt one iteration late for some lanes (the final values are still CORRECT,
+// only some cache benefit is lost, the results are not wrong).
 #define MMQ4_GROUPS_PER_TG 4
 #define MMQ4_TG_SIZE (MMQ4_LANES * MMQ4_GROUPS_PER_TG)   // 128
 
 // ============================================================
-// SUA (muon Y TUONG tu llama.cpp/ggml Metal backend - kernel_mul_mv_q4_K_f32
-// - xem ggml-metal.metal, N_SIMDWIDTH=32 "assuming SIMD group size is 32"):
-// ggml GIA DINH CUNG simdgroup=32 tren MOI GPU Apple (ke ca Intel iGPU qua
-// Metal) va dung THANG simd_sum()/thread_index_in_simdgroup - DA XAC NHAN
-// CHAY DUNG + NHANH (3 tok/s) tren CHINH Intel Iris Plus 640 (bang chung
-// thuc te tu llama-cli chay that, khong phai suy doan). Dieu nay cho thay
-// noi lo truoc day cua kernel nay ("threads_per_simdgroup Intel Gen9 co the
-// la 8/16 khong dam bao 32" - xem lich su sua doi ban duoi threadgroup-
-// memory) la THUA/qua an toan tren driver Iris 640 hien tai - gay cham hon
-// can thiet (threadgroup shared-memory + nhieu barrier hon simd_sum that).
-// GIU NGUYEN layout du lieu rieng cua project (wq nibble-pack + scales/
-// zeros theo group, KHONG doi sang block_q4_K cua ggml - doi layout se can
-// viet lai ca quant.nim, rui ro bug bit-packing, khong dang de "tien").
-// CHI muon KY THUAT dispatch: 1 threadgroup = DUNG 1 simdgroup (32 thread,
-// dung y N_SIMDWIDTH cua ggml), MMQ4_NDST=8 hang output/threadgroup, dung
-// simd_sum() that thay vi threadgroup tree-reduce thu cong - bo HOAN TOAN
-// threadgroup memory (tier1Tg/tier2Lo/tier2Hi/sdata cua ban truoc), vi
-// simd_sum khong can shared memory nao ca.
-// AN TOAN ve dynamic-index-register (nguyen nhan Timeout THAT truoc day):
-// sc[]/zp[] la private array KICH THUOC CO DINH (MMQ4_NDST=8), CHI duoc
-// index bang #pragma unroll (compile-time constant rr), KHONG BAO GIO
-// index bang bien runtime (nibble/k) - khac han tier1[16] ban cu bi index
-// bang "nibble" (runtime) gay tran thanh ghi/scratch-memory-cham.
+// CHANGED (borrowing the IDEA of llama.cpp/ggml's Metal backend - kernel_mul_mv_q4_K_f32
+// - see ggml-metal.metal, N_SIMDWIDTH=32 "assuming SIMD group size is 32"):
+// ggml HARD-ASSUMES simdgroup=32 on EVERY Apple GPU (including Intel iGPUs through
+// Metal) and uses simd_sum()/thread_index_in_simdgroup DIRECTLY - CONFIRMED
+// CORRECT + FAST (3 tok/s) on this very Intel Iris Plus 640 (real
+// evidence from running llama-cli, not a guess). This shows the
+// earlier worry of this kernel ("threads_per_simdgroup on Intel Gen9 can
+// be 8/16, 32 not guaranteed" - see the history of the threadgroup-
+// memory version below) was EXCESSIVE/over-safe on the current Iris 640 driver - slower
+// than necessary (threadgroup shared memory + more barriers than a real simd_sum).
+// The project's OWN data layout is KEPT (nibble-packed wq + per-group scales/
+// zeros, NOT ggml's block_q4_K - changing the layout would mean
+// rewriting quant.nim too, with bit-packing bug risks, not worth it).
+// ONLY the dispatch TECHNIQUE is borrowed: 1 threadgroup = EXACTLY 1 simdgroup (32 threads,
+// like ggml's N_SIMDWIDTH), MMQ4_NDST=8 output rows per threadgroup, a
+// real simd_sum() instead of a hand-written threadgroup tree reduce - ALL
+// threadgroup memory is gone (tier1Tg/tier2Lo/tier2Hi/sdata of the previous version), because
+// simd_sum needs no shared memory.
+// SAFE regarding dynamic-index registers (the REAL cause of earlier timeouts):
+// sc[]/zp[] are FIXED-SIZE private arrays (MMQ4_NDST=8), indexed ONLY
+// through #pragma unroll (compile-time constant rr), NEVER
+// with a runtime variable (nibble/k) - unlike the old tier1[16], which was indexed
+// by "nibble" (runtime) and spilled registers into slow scratch memory.
 kernel void matmul_q4_kernel(
     device const float* a          [[buffer(0)]],   // [M,K]
     device const uchar* wq         [[buffer(1)]],   // [N, ceil(K/2)] packed int4
@@ -687,43 +687,43 @@ kernel void matmul_q4_kernel(
     device const int& N            [[buffer(7)]],
     device const int& groupSize    [[buffer(8)]],
     device const int& nGroupsPerRow [[buffer(9)]],
-    device const int& simdWidth    [[buffer(10)]],  // THEM MOI - xem giai thich duoi
+    device const int& simdWidth    [[buffer(10)]],  // NEW - see the explanation below
     uint3 tgpig [[threadgroup_position_in_grid]],   // (rowBlock, m, 0)
     uint3 tiisgv [[thread_position_in_threadgroup]] // .x = 0..simdWidth-1 - BAT BUOC dispatch threadgroup size = (simdWidth,1,1)
-    // uint3 (khong phai ushort/uint don) vi tron vector+scalar attribute
-    // cung argument list gay loi bien dich MSL (da gap va sua o cac kernel
-    // khac trong file nay - xem attention_fused_flash_kernel).
-    // SUA BUG NGHIEM TRONG (nguyen nhan THAT cua "token rac" sau khi doi
-    // sang simd_sum): ban truoc HARDCODE 32 lam ca stride vong lap LAN
-    // dieu kien ghi ket qua (tiisg==0), TU Y GIA DINH "threadgroup 32
-    // thread = DUNG 1 simdgroup phan cung". Day la gia dinh CHUA TUNG duoc
-    // kiem chung that (chi dua vao dong comment "assuming SIMD group size
-    // is 32" cua ggml - do la GIA DINH DINH CO DISPATCH cua ho, KHONG
-    // phai bang chung phan cung, va code ggml VAN DUNG du gia dinh do sai
-    // vi ho dung dung builtin [[thread_index_in_simdgroup]] + tu xu ly
-    // nhieu simdgroup/threadgroup qua sgitg - con ban truoc thi KHONG).
-    // Neu simdgroup phan cung THAT cua Iris 640 la 8 hoac 16 (rat co the
-    // - kien truc Gen9 Intel), threadgroup 32 thread se TU DONG bi chia
-    // thanh 2-4 simdgroup phan cung RIENG BIET - simd_sum() CHI cong
-    // trong PHAM VI 1 simdgroup phan cung do, va "tiisg==0" (vi tri 0
-    // TRONG THREADGROUP) chi la lane-0 cua simdgroup DAU TIEN - BO SOT
-    // hoan toan dong gop cua cac simdgroup con lai -> tong SAI -> token
-    // rac (khong crash vi day la tinh toan hop le nhung SAI, khong phai
-    // truy cap bo nho ngoai pham vi).
-    // FIX DUNG GOC: KHONG doan so 32 nua - phia host (metal_shim.m) doc
-    // THAT pipeline.threadExecutionWidth (Metal API chinh thuc, tra ve
-    // dung do rong simdgroup phan cung cua PIPELINE DO tren GPU DANG
-    // CHAY) roi dispatch CHINH XAC bang so do cho threadgroup - dam bao
-    // threadgroup LUON DUNG BANG 1 simdgroup phan cung THAT, bat ke phan
-    // cung la 8/16/32. Khi do "thread_position_in_threadgroup" va
-    // "thread_index_in_simdgroup" TRUNG NHAU (0..simdWidth-1) - tiisg==0
-    // luc nay moi DUNG la lane-0 DUY NHAT cua CA threadgroup.
+    // uint3 (not ushort/a plain uint) because mixing vector+scalar attributes
+    // in one argument list is an MSL compile error (hit and fixed in other
+    // kernels of this file - see attention_fused_flash_kernel).
+    // SEVERE BUG FIX (the REAL cause of the "garbage tokens" after switching
+    // to simd_sum): the previous version HARDCODED 32 as both the loop stride AND
+    // the condition for writing the result (tiisg==0), ARBITRARILY ASSUMING "a 32-thread
+    // threadgroup = EXACTLY one hardware simdgroup". That assumption was NEVER
+    // really verified (it relied only on ggml's comment "assuming SIMD group size
+    // is 32" - that is ggml's DISPATCH CHOICE, NOT
+    // hardware evidence, and ggml's code IS STILL CORRECT when the assumption is wrong
+    // because it uses the builtin [[thread_index_in_simdgroup]] and handles
+    // several simdgroups per threadgroup through sgitg - the previous version did NOT).
+    // If the REAL hardware simdgroup of Iris 640 is 8 or 16 (quite likely
+    // - Intel Gen9 architecture), a 32-thread threadgroup is AUTOMATICALLY split
+    // into 2-4 SEPARATE hardware simdgroups - simd_sum() ONLY adds
+    // WITHIN one hardware simdgroup, and "tiisg==0" (position 0
+    // IN THE THREADGROUP) is only lane 0 of the FIRST simdgroup - the
+    // contributions of the other simdgroups are LOST entirely -> WRONG sum -> garbage
+    // tokens (no crash, because this is valid but WRONG computation, not an
+    // out-of-bounds memory access).
+    // ROOT FIX: NO more guessing 32 - the host (metal_shim.m) reads the
+    // REAL pipeline.threadExecutionWidth (official Metal API, returning
+    // the actual hardware simdgroup width of THAT PIPELINE on the RUNNING
+    // GPU) and dispatches threadgroups of EXACTLY that size - guaranteeing a
+    // threadgroup ALWAYS EQUALS one REAL hardware simdgroup, whether the hardware
+    // is 8/16/32. Then "thread_position_in_threadgroup" and
+    // "thread_index_in_simdgroup" COINCIDE (0..simdWidth-1) - tiisg==0
+    // is then REALLY the ONLY lane 0 of the WHOLE threadgroup.
 ) {
     uint tiisg = tiisgv.x;   // 0..simdWidth-1
     int m = int(tgpig.y);
     if (m >= M) return;
 
-    #define MMQ4_NDST 8   // so hang output / threadgroup (= / simdgroup)
+    #define MMQ4_NDST 8   // output rows per threadgroup (= per simdgroup)
     int rowBlock = int(tgpig.x);
     int n0 = rowBlock * MMQ4_NDST;
     int bytesPerRow = (K + 1) / 2;
@@ -740,10 +740,10 @@ kernel void matmul_q4_kernel(
         float aVal = a[m * K + k];
         int gr = groupSize > 0 ? (k / groupSize) : 0;
 
-        // Cache scale/zero theo group HIEN TAI - CHI doc lai device memory
-        // khi group thuc su doi (dung y het tier1 ban cu, nhung gio la
-        // private array/thread thay vi threadgroup - AN TOAN vi index rr
-        // la compile-time qua #pragma unroll, KHONG phai runtime).
+        // Cache scale/zero for the CURRENT group - device memory is re-read ONLY
+        // when the group really changes (like tier1 in the old version, but now a
+        // private per-thread array instead of threadgroup memory - SAFE because the index rr
+        // is a compile-time constant through #pragma unroll, NOT runtime).
         if (gr != prevGr) {
             prevGr = gr;
             #pragma unroll
@@ -771,10 +771,10 @@ kernel void matmul_q4_kernel(
         }
     }
 
-    // simd_sum() THAT - dung y ggml kernel_mul_mv_q4_K_f32 (khong con
-    // threadgroup_barrier/tree-reduce thu cong nao ca). DUNG vi threadgroup
-    // = DUNG 1 simdgroup phan cung THAT (dispatch tu host bang chinh
-    // simdWidth nay), khong con gia dinh nao ca.
+    // A REAL simd_sum() - like ggml's kernel_mul_mv_q4_K_f32 (no
+    // threadgroup_barrier/hand-written tree reduce at all). CORRECT because the threadgroup
+    // = EXACTLY one REAL hardware simdgroup (the host dispatches with this
+    // simdWidth), no assumptions left.
     #pragma unroll
     for (int rr = 0; rr < MMQ4_NDST; ++rr) {
         float total = simd_sum(sum[rr]);
@@ -787,32 +787,32 @@ kernel void matmul_q4_kernel(
 }
 
 // ============================================================
-// BIEN THE THU NGHIEM - GIAM MMQ4_NDST (8 -> 2/4, theo dung
-// N_R0_Q4_K=2 cua ggml kernel_mul_mv_q4_K_f32_impl) + doc nibble
-// THEO CAP (k2,k2+1) bang 1 lan doc uchar + bitmask thuan, KHONG
-// nhanh runtime nao (dung y "diem khac biet #1" nguoi dung neu ra
-// khi doi chieu voi ggml).
+// EXPERIMENTAL VARIANT - SMALLER MMQ4_NDST (8 -> 2/4, following
+// N_R0_Q4_K=2 of ggml's kernel_mul_mv_q4_K_f32_impl) + nibbles read
+// IN PAIRS (k2,k2+1) with one uchar read + plain bitmasks, NO
+// runtime branches (the "difference #1" pointed out
+// when comparing with ggml).
 //
-// LICH SU: ban dau thu NDST=8 + pairing -> DO THAT tren may Intel
-// Iris Plus 640 CHAM HON ban goc (xem log nguoi dung gui: ~2-3x
-// cham hon o cung vi tri token). Nghi ngo goc: NDST=8 nghia la
-// MOI iteration phai giu song CUNG LUC 8 phan tu sum[]/sc[]/zp[]
-// CONG THEM aVal0/aVal1/nib0/nib1/hasK1 moi vong lap - Iris co
-// register file rat nho (da tung gay bug tran thanh ghi khac trong
-// chinh file nay - xem lich su sua doi tier1[]/acc[] o cac kernel
-// khac) => nhieu kha nang bi SPILL, mat het loi ich giam so lan
-// doc bo nho.
+// HISTORY: NDST=8 + pairing was tried first -> MEASURED on a real Intel
+// Iris Plus 640 as SLOWER than the original (from the user's log: ~2-3x
+// slower at the same token position). Suspected root cause: NDST=8 means
+// EVERY iteration keeps 8 sum[]/sc[]/zp[] elements alive AT ONCE
+// PLUS aVal0/aVal1/nib0/nib1/hasK1 every iteration - Iris has a
+// very small register file (other register-overflow bugs happened in
+// this very file - see the history of tier1[]/acc[] in other
+// kernels) => most likely SPILLED, losing all the benefit of fewer
+// memory reads.
 //
-// ggml chon N_R0_Q4_K CHI = 2 (khong phai 8) - it ap luc thanh ghi
-// hon HAN. Bien the nay lam DUNG y ggml: NDST nho (2 hoac 4) +
-// pairing, tach rieng thanh kernel MOI (KHONG dung ten
-// "matmul_q4_kernel" cu) de A/B test that tren may that, khong
-// ghi de len ban da duoc do la ON DINH (0.86 tok/s).
+// ggml picks N_R0_Q4_K = ONLY 2 (not 8) - much less register
+// pressure. This variant does what ggml does: a small NDST (2 or 4) +
+// pairing, as a NEW kernel (NOT the old
+// "matmul_q4_kernel" name) to A/B test on a real machine without
+// overwriting the version measured as STABLE (0.86 tok/s).
 //
-// CHUA CHAY THU TREN GPU METAL THAT - giong tinh trang ban dau cua
-// matmul_q4_kernel truoc day, BAT BUOC tu do lai tren may that
-// truoc khi dung cho sinh token that. Neu cham hon/sai, quay lai
-// "matmul_q4_kernel" (khong doi gi ca, van con nguyen ben tren).
+// NOT YET RUN ON A REAL METAL GPU - the same initial status as
+// matmul_q4_kernel had, it MUST be measured on a real machine
+// before generating real tokens. If slower/wrong, go back to
+// "matmul_q4_kernel" (unchanged, still above).
 #define BB_MATMUL_Q4_VARIANT(NDST_VAL, KFUNC)                                \
 kernel void KFUNC(                                                          \
     device const float* a          [[buffer(0)]],                          \
@@ -847,25 +847,25 @@ kernel void KFUNC(                                                          \
     float sc[NDST_VAL];                                                     \
     float zp[NDST_VAL];                                                     \
                                                                               \
-    /* SUA (tach zero-point ra khoi vong lap chinh - hoc tu cach ggml     \
-       xu ly q4_1 bang sumy): thay vi tru zp[rr] roi nhan sc[rr] MOI      \
-       phan tu MOI rr (1 tru + 2 nhan x NDST lan/phan tu), gio chi cong  \
-       don dot[rr] += aVal*nibble (1 nhan x NDST lan/phan tu) va mot     \
-       sumA (Sigma aVal) DUNG CHUNG cho moi rr trong CUNG 1 group. Khi   \
-       group doi (hoac cuoi vong lap), moi flush 1 lan:                  \
-       sum[rr] += sc[rr]*dot[rr] - zp[rr]*sc[rr]*sumA - toan hoc y het   \
-       cong thuc cu (phan phoi phep nhan), chi doi THU TU cong don de   \
-       giam ALU trong vong lap nong. An toan voi NDST=2/4 (register     \
-       them: dot[NDST_VAL] + 1 scalar sumA, nhe hon nhieu so luc NDST=8 \
-       gay spill - xem comment lich su o tren). */                      \
+    /* CHANGED (zero point moved out of the main loop - learned from how ggml     \
+       handles q4_1 with sumy): instead of subtracting zp[rr] and multiplying by sc[rr] for EVERY      \
+       element and EVERY rr (1 sub + 2 muls x NDST per element), now only  \
+       dot[rr] += aVal*nibble (1 mul x NDST per element) and one     \
+       sumA (Sigma aVal) SHARED by every rr in the SAME group. When the   \
+       group changes (or at the end of the loop), one flush:                  \
+       sum[rr] += sc[rr]*dot[rr] - zp[rr]*sc[rr]*sumA - mathematically identical to   \
+       the old formula (distributivity), only the accumulation ORDER changes to   \
+       cut ALU work in the hot loop. Safe with NDST=2/4 (extra     \
+       registers: dot[NDST_VAL] + one scalar sumA, much lighter than NDST=8 \
+       which spilled - see the history comment above). */                      \
     float dot[NDST_VAL];                                                    \
     _Pragma("unroll")                                                       \
     for (int rr = 0; rr < NDST_VAL; ++rr) dot[rr] = 0.0f;                   \
     float sumA = 0.0f;                                                      \
                                                                               \
-    /* groupSize duoc gia dinh CHAN (dung voi 32/64/128/256 pho bien)      \
-       de k2 va k2+1 luon cung 1 group - xem giai thich chi tiet o         \
-       phien ban NDST=8 da thu (comment o tren, cung logic). */            \
+    /* groupSize is assumed EVEN (true for the usual 32/64/128/256)      \
+       so k2 and k2+1 are always in the same group - see the details in         \
+       the NDST=8 version tried earlier (comment above, same logic). */            \
     for (int k2 = int(tiisg) * 2; k2 < K; k2 += int(simdWidth) * 2) {       \
         float aVal0 = a[m * K + k2];                                        \
         bool hasK1 = (k2 + 1) < K;                                          \
@@ -909,8 +909,8 @@ kernel void KFUNC(                                                          \
             if (hasK1) dot[rr] += aVal1 * float(nib1);                     \
         }                                                                    \
     }                                                                        \
-    /* flush group cuoi cung (vong lap ket thuc ma khong co lan doi group \
-       nao nua de trigger flush o tren). */                                \
+    /* flush the last group (the loop ended without another group change \
+       to trigger the flush above). */                                \
     if (prevGr != -1) {                                                     \
         _Pragma("unroll")                                                   \
         for (int rr = 0; rr < NDST_VAL; ++rr) {                             \
@@ -935,17 +935,17 @@ kernel void KFUNC(                                                          \
     } \
 }
 
-// 2 bien the de do that: NDST=2 (dung khop ggml N_R0_Q4_K), NDST=4
-// (trung gian). host (metal_shim.m) PHAI dung dung so nay khi tinh
-// rowBlocks (kMMQ4_NDST) cho DUNG ten kernel dang goi - xem comment
-// trong metal_shim.m cho huong dan doi ten kernel de test.
+// 2 variants to measure: NDST=2 (matches ggml's N_R0_Q4_K), NDST=4
+// (in between). The host (metal_shim.m) MUST use the right value when computing
+// rowBlocks (kMMQ4_NDST) for the kernel name being called - see the comment
+// in metal_shim.m on renaming the kernel for testing.
 BB_MATMUL_Q4_VARIANT(2, matmul_q4_kernel_ndst2_paired)
 BB_MATMUL_Q4_VARIANT(4, matmul_q4_kernel_ndst4_paired)
 #undef BB_MATMUL_Q4_VARIANT
 
-// Kernel gốc (naive) giữ lại để đối chiếu/rollback nếu kernel simd-reduction
-// phía trên ra kết quả sai trên máy thật (nghi ngờ đầu tiên: layout nibble
-// hoặc offset group sai - xem cùng công thức y hệt, chỉ khác cách reduce).
+// The original (naive) kernel is kept for comparison/rollback if the simd-reduction kernel
+// above gives wrong results on a real machine (first suspect: the nibble layout
+// or a wrong group offset - same formula, only the reduction differs).
 kernel void matmul_q4_kernel_naive(
     device const float* a          [[buffer(0)]],
     device const uchar* wq         [[buffer(1)]],
@@ -967,9 +967,9 @@ kernel void matmul_q4_kernel_naive(
     int rowByteOff = n * bytesPerRow;
     int rowGroupOff = n * nGroupsPerRow;
 
-    // TIER1 giong ban toi uu o tren (khong can TIER2 o day - kernel naive
-    // la 1 thread/row/col nen khong co gi de "dung chung giua threads" ca,
-    // tach bit bang shift/mask van re nhu tra bang cho 1 thread don le).
+    // TIER1 like the optimised version above (no TIER2 here - the naive kernel
+    // is 1 thread/row/col, so nothing is "shared between threads";
+    // splitting bits with shift/mask is as cheap as a table lookup for a single thread).
     float sum = 0.0f;
     int curGroup = -1;
     float tier1[16];
@@ -1026,11 +1026,11 @@ kernel void attention_fused_kernel(
         uint base_s = bh * S * S;
         uint row = base_s + ti * S;
 
-        // SUA: bo local array "float scores[256]" (tran bo nho neu S > 256,
-        // vi day la mang co dinh tren stack cua thread, khong lien quan gi
-        // toi kich thuoc thuc te cua S). Dung thang s_matrix (buffer global,
-        // da duoc cap phat dung S*S theo tung lan goi thuc te tu phia Nim)
-        // lam bo nho tam -> khong con gioi han cung nao ve S nua.
+        // CHANGED: removed the local array "float scores[256]" (overflowed when S > 256,
+        // because it was a fixed array on the thread stack, unrelated
+        // to the actual S). Uses s_matrix directly (a global buffer,
+        // allocated at S*S for each actual call from Nim)
+        // as scratch -> no hard limit on S any more.
         float mx = -1e30f;
         for (uint tj = 0; tj <= ti; ++tj) {
             float dot = 0.0f;
@@ -1067,47 +1067,47 @@ kernel void attention_fused_kernel(
 }
 
 // ============================================================
-// ATTENTION FUSED - FLASH (prefill, causal), MOI THEM.
-// attention_fused_kernel (ban tren) materialize toan bo ma tran s_matrix
-// [S,S] ra device memory - O(S^2) bo nho + 3 lan doc/ghi toan bo ma tran
-// (tinh score, exp, chia sum). Kernel nay thay bang online-softmax MOT
-// LAN duy nhat qua tj=0..ti (dung dinh nghia flash attention: giu running
-// max m_i, running sum l_i, va running output accumulator acc[d], moi
-// khi gap score moi lon hon max cu thi RESCALE acc/l theo he so
-// exp(m_cu - m_moi) thay vi tinh lai tu dau) - KHONG can buffer S*S nao,
-// chi 1 lan doc q/k/v, khong doc/ghi lai bat cu gia tri trung gian nao.
-// GIU NGUYEN dispatch pattern cu (1 thread / (bh,ti), khong dung
-// threadgroup) - CHI doi than kernel, khong doi cach goi.
-// KHONG dung lai attention_fused_kernel cu (van giu nguyen o tren) vi
-// attention_fused_backward_kernel (huan luyen) can s_matrix (xac suat
-// softmax da materialize) lam input - kernel flash nay CHI dung cho suy
-// luan (inference forward), khong co gradient.
-// GIOI HAN: D (head_dim) <= FLASH_MAX_D (128, du cho hau het kien truc
-// pho bien: Llama/Mistral D=128, nhieu model khac D=64/80/96). Neu D>128,
-// kernel tra ve som (khong ghi gi vao o[]) - fallback ve
-// attention_fused_kernel cu cho truong hop nay.
-// LY DO dung #pragma unroll cho vong lap d thay vi "for (int d=0;d<D;++d)"
-// binh thuong: acc[] la private array/thread - index BANG BIEN CHAY THOI
-// (runtime d) tren mang private se KHONG co dynamic-index register tren
-// Intel Iris (dung y het nguyen nhan "GPU Timeout" da gap voi tier1[] o
-// matmul_q4_kernel truoc day) -> BAT BUOC unroll ve compile-time index.
+// ATTENTION FUSED - FLASH (prefill, causal), NEW.
+// attention_fused_kernel (above) materialises the whole s_matrix
+// [S,S] in device memory - O(S^2) memory + 3 read/write passes over the matrix
+// (score, exp, divide by sum). This kernel uses an online softmax in ONE
+// pass over tj=0..ti (the flash-attention definition: keep a running
+// max m_i, running sum l_i and a running output accumulator acc[d]; whenever
+// a new score exceeds the old max, RESCALE acc/l by
+// exp(m_old - m_new) instead of recomputing) - NO S*S buffer,
+// q/k/v read once, no intermediate values read/written back.
+// SAME dispatch pattern as before (1 thread / (bh,ti), no
+// threadgroups) - ONLY the kernel body changes, not how it is called.
+// The old attention_fused_kernel is NOT replaced (still above) because
+// attention_fused_backward_kernel (training) needs s_matrix (the materialised
+// softmax probabilities) as input - this flash kernel is ONLY for
+// inference (forward), no gradients.
+// LIMIT: D (head_dim) <= FLASH_MAX_D (128, enough for most common
+// architectures: Llama/Mistral D=128, many others D=64/80/96). If D>128
+// the kernel returns early (writes nothing to o[]) - falls back to the old
+// attention_fused_kernel in that case.
+// WHY #pragma unroll for the d loop instead of a plain "for (int d=0;d<D;++d)":
+// acc[] is a private per-thread array - indexing it with a RUNTIME
+// variable (runtime d) gets NO dynamic-index registers on
+// Intel Iris (exactly the "GPU Timeout" cause hit with tier1[] in
+// matmul_q4_kernel before) -> it MUST be unrolled to compile-time indices.
 #define FLASH_MAX_D 128
 
-// SUA LAI HOAN TOAN (nguyen nhan that cua GPU treo/timeout): ban truoc
-// dung mang PRIVATE acc[FLASH_MAX_D] (128 float = 512 byte) SONG SUOT ca
-// vong lap tj (chay toi S lan) TRONG TUNG THREAD RIENG LE - Intel Iris co
-// register file rat nho, 512 byte/thread cho rieng acc[] (chua ke
-// dot/sc/m_i/l_i/aOld/p) chac chan TRAN REGISTER, driver phai spill xuong
-// bo nho rieng tung thread - DUNG Y HET lop bug da gap voi tier1[] o
-// matmul_q4_kernel (khac o cho tier1[] la LUT nho, con acc[] o day lon hon
-// va song lau hon nhieu). FIX THAT SU (khong phai roi ve non-flash): chia
-// D ra cho CA MOT THREADGROUP lam chung (giong cach attention_decode_gqa_
-// kernel da lam), acc[] chuyen vao THREADGROUP MEMORY (khong phai register
-// rieng tung thread nua - threadgroup memory KHONG co van de dynamic-index-
-// gay-tran-register, day la vung nho that su tren chip, khong phai
-// register file). Van la flash attention DUNG NGHIA: 1 lan duy nhat qua
-// tj=0..ti, running max/sum, KHONG materialize S*S, KHONG mang private
-// lon nao ca.
+// REWRITTEN (the real cause of the GPU hang/timeout): the previous version
+// used a PRIVATE array acc[FLASH_MAX_D] (128 floats = 512 bytes) ALIVE through the whole
+// tj loop (up to S iterations) IN EACH THREAD - Intel Iris has a
+// very small register file, 512 bytes/thread for acc[] alone (not counting
+// dot/sc/m_i/l_i/aOld/p) surely OVERFLOWS the registers, the driver has to spill to
+// per-thread memory - EXACTLY the class of bug hit with tier1[] in
+// matmul_q4_kernel (except tier1[] is a small LUT, while acc[] here is larger
+// and lives much longer). THE REAL FIX (not falling back to non-flash): split
+// D across A WHOLE THREADGROUP working together (as attention_decode_gqa_
+// kernel does), acc[] moved into THREADGROUP MEMORY (no longer per-thread
+// registers - threadgroup memory has NO dynamic-index register-overflow
+// problem, it is real on-chip memory, not the
+// register file). Still REAL flash attention: one pass over
+// tj=0..ti, running max/sum, NO S*S materialisation, NO large
+// private array.
 #define ATTN_FLASH_TG 64
 
 kernel void attention_fused_flash_kernel(
@@ -1120,31 +1120,31 @@ kernel void attention_fused_flash_kernel(
     device const int& S [[buffer(6)]],
     device const int& D [[buffer(7)]],
     device const float& scale [[buffer(8)]],
-    uint3 tgpigv [[threadgroup_position_in_grid]],   // .x = bh, .y = ti (uint3 - xem ly do o duoi)
+    uint3 tgpigv [[threadgroup_position_in_grid]],   // .x = bh, .y = ti (uint3 - see the reason below)
     uint3 tidv   [[thread_position_in_threadgroup]]  // .x = 0..ATTN_FLASH_TG-1 - BAT BUOC dispatch threadgroup size = (ATTN_FLASH_TG,1,1)
-    // SUA loi bien dich MSL (dung y het fix da ap dung cho matmul_q4_kernel):
+    // MSL compile fix (same fix as applied to matmul_q4_kernel):
     // "expecting input declarations with either all scalar types or all
-    // vector types with the same number of elements" - trinh bien dich
-    // Metal KHONG cho phep tron 1 tham so vector (uint2 tgpig) voi 1 tham
-    // so scalar (uint tid) cung co attribute vi tri thread trong CUNG
-    // argument list. Fix: khai ca 2 deu la uint3, roi lay .xy/.x tuong ung.
+    // vector types with the same number of elements" - the Metal compiler
+    // does NOT allow mixing a vector parameter (uint2 tgpig) with a scalar
+    // parameter (uint tid) that both have thread-position attributes in the SAME
+    // argument list. Fix: declare both as uint3 and take .xy/.x.
 ) {
     uint2 tgpig = tgpigv.xy;
     uint tid = tidv.x;
     uint bh = tgpig.x;
     uint ti = tgpig.y;
     if (bh >= (uint)(B * H) || ti >= (uint)S) return;
-    if (D > FLASH_MAX_D) return;   // xem GIOI HAN o dinh file (128, du cho hau het kien truc pho bien)
+    if (D > FLASH_MAX_D) return;   // see the LIMIT at the top of the file (128, enough for most common architectures)
 
-    // SUA (theo yeu cau: luu o "RAM nho cua moi thread" = thanh ghi/private,
-    // KHONG dung threadgroup memory cho acc nua). FLASH_MAX_D=128,
-    // ATTN_FLASH_TG=64 => moi thread giu TOI DA 2 phan tu (FLASH_MAX_D/
-    // ATTN_FLASH_TG). Dung mang private co KICH THUOC CO DINH bang so
-    // "slot" nay (khong phai FLASH_MAX_D) va CHI truy cap bang #pragma
-    // unroll voi index SLOT tinh (0,1,...) - KHONG BAO GIO index bang bien
-    // chay "d" truc tiep - de trinh bien dich gan duoc vao thanh ghi thay
-    // vi spill ra scratch memory (day chinh la nguyen nhan GPU Timeout da
-    // gay ra truoc do voi tier1[]/acc[] kieu dynamic-index).
+    // CHANGED (keep acc in "each thread's small RAM" = registers/private,
+    // NO threadgroup memory for acc any more). FLASH_MAX_D=128,
+    // ATTN_FLASH_TG=64 => each thread holds AT MOST 2 elements (FLASH_MAX_D/
+    // ATTN_FLASH_TG). A FIXED-SIZE private array of that many
+    // "slots" (not FLASH_MAX_D), accessed ONLY through #pragma
+    // unroll with a STATIC slot index (0,1,...) - NEVER indexed by the
+    // running variable "d" directly - so the compiler can keep it in registers instead
+    // of spilling to scratch memory (exactly what caused the GPU Timeout
+    // before with the dynamically indexed tier1[]/acc[]).
     #define ACC_SLOTS ((FLASH_MAX_D + ATTN_FLASH_TG - 1) / ATTN_FLASH_TG)
     float acc[ACC_SLOTS];
     #pragma unroll
@@ -1162,8 +1162,8 @@ kernel void attention_fused_flash_kernel(
     for (uint tj = 0u; tj <= ti; ++tj) {
         uint kOff = base + tj * (uint)D;
 
-        // --- dot(q_ti, k_tj) cooperatively: moi thread cong 1 phan D, roi
-        // tree-reduce trong threadgroup memory (KHONG phai mang private) ---
+        // --- dot(q_ti, k_tj) cooperatively: each thread adds part of D, then
+        // tree-reduce in threadgroup memory (NOT a private array) ---
         float partial = 0.0f;
         for (int d = int(tid); d < D; d += ATTN_FLASH_TG) partial += q[qOff + (uint)d] * k[kOff + (uint)d];
         redBuf[tid] = partial;
@@ -1172,10 +1172,10 @@ kernel void attention_fused_flash_kernel(
             if (tid < stride) redBuf[tid] += redBuf[tid + stride];
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        float dot = redBuf[0] * scale;   // moi thread deu doc duoc gia tri giong nhau sau barrier cuoi
+        float dot = redBuf[0] * scale;   // every thread reads the same value after the last barrier
 
-        // --- cap nhat online-softmax: CHI thread 0 tinh (scalar, khong can
-        // song song), broadcast qua threadgroup scalar cho ca nhom dung ---
+        // --- online-softmax update: ONLY thread 0 computes it (scalar, no need
+        // for parallelism), broadcast through a threadgroup scalar to the whole group ---
         if (tid == 0u) {
             float m_old = sM;
             float new_m = max(m_old, dot);
@@ -1190,15 +1190,15 @@ kernel void attention_fused_flash_kernel(
 
         float aOld = sAOld;
         float p = sP;
-        // s la SLOT tinh (compile-time qua unroll) - d = tid + s*ATTN_FLASH_TG
-        // van la runtime nhung CHI dung de doc/ghi device memory (v[], hop le
-        // du D thay doi), KHONG dung de index vao mang private acc[] nua.
+        // s is a STATIC slot (compile time through unroll) - d = tid + s*ATTN_FLASH_TG
+        // is still runtime but ONLY used to read/write device memory (v[], valid
+        // whatever D is), NOT to index the private acc[] array any more.
         #pragma unroll
         for (int s = 0; s < ACC_SLOTS; ++s) {
             int d = int(tid) + s * ATTN_FLASH_TG;
             if (d < D) acc[s] = acc[s] * aOld + p * v[kOff + (uint)d];
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);   // xong tj nay, an toan ghi de redBuf o vong sau
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // done with this tj, safe to overwrite redBuf in the next iteration
     }
 
     float invL = 1.0f / sL;
@@ -1211,39 +1211,39 @@ kernel void attention_fused_flash_kernel(
 #undef ACC_SLOTS
 
 // ============================================================
-// ATTENTION DECODE (GQA) - v2, SONG SONG THẬT + SỬA LỖI FENCE.
-// v1 dùng 1 thread/head (chỉ nRep=4-8 thread tổng) - lãng phí gần hết GPU,
-// đo thực tế chậm hơn ~4x so với đường cũ (1.9s/token -> 8s/token).
-// v2 dùng 1 threadgroup (128 thread)/head + tree-reduction, NHƯNG lần đầu
-// viết bị sai: dùng threadgroup_barrier(mem_flags::mem_threadgroup) trong
-// khi `scores` là bộ nhớ `device` (không phải `threadgroup`) - cờ
-// mem_threadgroup CHỈ đảm bảo đồng bộ cho biến threadgroup (shared_reduce),
-// KHÔNG đảm bảo các thread khác đã ghi xong vào `scores` (device memory)
-// trước khi đọc chéo ở Bước 3 - gây sai lệch ~0.02-0.1 (đọc phải giá trị
-// scores cũ/dở dang). ĐÃ SỬA: dùng mem_flags::mem_device_and_threadgroup
-// cho MỌI barrier trong kernel này (fence cả threadgroup lẫn device memory).
-//   q: [H, D], k/v: [S, D] (dùng chung cho H head), o: [H, D]
-//   scores: [H, S] scratch (bộ nhớ device, ĐỌC/GHI CHÉO giữa các thread)
+// ATTENTION DECODE (GQA) - v2, REALLY PARALLEL + FENCE FIX.
+// v1 used 1 thread/head (only nRep=4-8 threads in total) - wasting almost the whole GPU,
+// measured ~4x slower than the old path (1.9s/token -> 8s/token).
+// v2 uses 1 threadgroup (128 threads)/head + tree reduction, BUT the first
+// version was wrong: it used threadgroup_barrier(mem_flags::mem_threadgroup) while
+// `scores` is `device` memory (not `threadgroup`) - the
+// mem_threadgroup flag ONLY synchronises threadgroup variables (shared_reduce),
+// it does NOT guarantee other threads have finished writing `scores` (device memory)
+// before the cross reads in step 3 - errors of ~0.02-0.1 (reading
+// stale/partial scores). FIXED: mem_flags::mem_device_and_threadgroup
+// for EVERY barrier in this kernel (fences both threadgroup and device memory).
+//   q: [H, D], k/v: [S, D] (shared by H heads), o: [H, D]
+//   scores: [H, S] scratch (device memory, READ/WRITTEN ACROSS threads)
 // ============================================================
 #define ATTN_DECODE_TG 128
 
-// SUA (flash attention, MOI THEM): ban tren dung 3 vong lap qua S + 1
-// buffer device `scores[H,S]` lam trung gian (ghi o Buoc 1, ghi de o Buoc
-// 2, doc cheo o Buoc 3) - dung 1 lan device-memory fence rong (memory
-// traffic ~3x kich thuoc scores). Ban FLASH nay chi 1 vong lap DUY NHAT
-// qua cac KHOI (block) TG=128 key mot luc, giu running max/sum/output
-// (dung y het thuat toan flash attention, ap dung cho truong hop 1 query
-// - S key cua decode) - KHONG con doc/ghi `scores` (device) nua, thay
-// bang `pBlock` (threadgroup memory, chi 512 byte) lam cho xac suat cua
-// DUY NHAT 1 block dang xu ly. Tham so `scores` GIU LAI trong signature
-// (khong dung nua) de KHONG phai doi shim/Nim binding (ABI cu van goi
-// duoc y nguyen).
+// CHANGED (flash attention, NEW): the version above used 3 loops over S + one
+// device buffer `scores[H,S]` as the intermediate (written in step 1, overwritten in step
+// 2, read across threads in step 3) - with a wide device-memory fence (memory
+// traffic ~3x the size of scores). This FLASH version makes ONE loop
+// over BLOCKS of TG=128 keys at a time, keeping a running max/sum/output
+// (the flash-attention algorithm applied to the 1-query
+// - S-key decode case) - NO more reads/writes of `scores` (device), replaced
+// by `pBlock` (threadgroup memory, only 512 bytes) holding the probabilities of
+// the ONE block being processed. The `scores` parameter STAYS in the signature
+// (unused) so the shim/Nim binding need NOT change (the old ABI still
+// works unchanged).
 kernel void attention_decode_gqa_kernel(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],
     device const float* v [[buffer(2)]],
     device float* o [[buffer(3)]],
-    device float* scores [[buffer(4)]],   // KHONG con dung - giu de ABI/shim khong doi
+    device float* scores [[buffer(4)]],   // NO longer used - kept so the ABI/shim does not change
     device const int& H [[buffer(5)]],
     device const int& S [[buffer(6)]],
     device const int& D [[buffer(7)]],
@@ -1252,18 +1252,18 @@ kernel void attention_decode_gqa_kernel(
     uint tid [[thread_position_in_threadgroup]]
 ) {
     threadgroup float shared_reduce[ATTN_DECODE_TG];
-    threadgroup float pBlock[ATTN_DECODE_TG];   // xac suat (chua chuan hoa) cua block key dang xu ly
+    threadgroup float pBlock[ATTN_DECODE_TG];   // (unnormalised) probabilities of the key block being processed
     if (h >= (uint)H) return;
     if (D > FLASH_MAX_D) return;   // xem gioi han o attention_fused_flash_kernel
 
     uint qBase = h * (uint)D;
 
     float m_i = -1e30f;    // running max
-    float l_i = 0.0f;      // running sum (da theo thang m_i)
-    // Moi thread chi giu PHAN acc cua (toi da) 1 chi so d = tid (vi
-    // ATTN_DECODE_TG=128 >= FLASH_MAX_D=128 => moi d duoc dung DUNG 1
-    // thread, khong can mang private nao ca -> khong co van de dynamic-
-    // index register nhu ben attention_fused_flash_kernel).
+    float l_i = 0.0f;      // running sum (already on the m_i scale)
+    // Each thread keeps only the acc PART of (at most) one index d = tid (because
+    // ATTN_DECODE_TG=128 >= FLASH_MAX_D=128 => each d is handled by EXACTLY one
+    // thread, no private array at all -> no dynamic-index
+    // register problem as in attention_fused_flash_kernel).
     float accD = 0.0f;
     bool hasD = (tid < (uint)D);
 
@@ -1279,8 +1279,8 @@ kernel void attention_decode_gqa_kernel(
             dot *= scale;
         }
 
-        // --- tim max cua BLOCK nay (khong phai toan cuc - flash attention
-        // rescale dan, khong can biet max toan cuc truoc) ---
+        // --- max of THIS block (not global - flash attention
+        // rescales gradually, the global max is not needed first) ---
         shared_reduce[tid] = dot;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = ATTN_DECODE_TG / 2; stride > 0; stride >>= 1) {
@@ -1295,7 +1295,7 @@ kernel void attention_decode_gqa_kernel(
         float p = valid ? exp(dot - new_m) : 0.0f;
         pBlock[tid] = p;
 
-        // --- tong p cua block (tree-reduce) ---
+        // --- sum of p over the block (tree-reduce) ---
         shared_reduce[tid] = p;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = ATTN_DECODE_TG / 2; stride > 0; stride >>= 1) {
@@ -1303,12 +1303,12 @@ kernel void attention_decode_gqa_kernel(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float blockSum = shared_reduce[0];
-        threadgroup_barrier(mem_flags::mem_threadgroup);   // dam bao pBlock[] da ghi xong truoc khi doc cheo ben duoi
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // make sure pBlock[] is written before the cross reads below
 
         l_i = l_i * aOld + blockSum;
 
-        // --- cap nhat output: moi thread (neu hasD) doc CHEO toan bo
-        // pBlock[] (cua block nay, TG phan tu) nhan voi v[.., d=tid] ---
+        // --- output update: each thread (if hasD) reads ALL of
+        // pBlock[] (of this block, TG elements) times v[.., d=tid] ---
         if (hasD) {
             float blockAcc = 0.0f;
             uint blockLen = min((uint)ATTN_DECODE_TG, (uint)S - blockStart);
@@ -1318,7 +1318,7 @@ kernel void attention_decode_gqa_kernel(
             accD = accD * aOld + blockAcc;
         }
         m_i = new_m;
-        threadgroup_barrier(mem_flags::mem_threadgroup);   // xong block, an toan ghi de shared_reduce/pBlock o vong sau
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // block done, safe to overwrite shared_reduce/pBlock in the next iteration
     }
 
     if (hasD) {
@@ -1383,7 +1383,7 @@ kernel void attention_fused_backward_kernel(
     }
 }
 // ============================================================
-// GATHER - dung cho permute/concat/split/stack tren GPU thay vi CPU loop.
+// GATHER - used by permute/concat/split/stack on the GPU instead of a CPU loop.
 // dst[id] = src[idx[id]].
 // ============================================================
 kernel void gather_kernel(
@@ -1396,9 +1396,9 @@ kernel void gather_kernel(
 }
 
 // ============================================================
-// ARGMAX (gia tri + chi so) theo threadgroup, cung thuat toan tree-reduce
-// nhu argmax_reduce (CUDA) / argmax.comp (Vulkan). Moi threadgroup xu ly
-// 1 cap (o,i); threadgroup size phai >= dimSize.
+// ARGMAX (value + index) per threadgroup, the same tree-reduce algorithm
+// as argmax_reduce (CUDA) / argmax.comp (Vulkan). Each threadgroup handles
+// one (o,i) pair; the threadgroup size must be >= dimSize.
 // ============================================================
 kernel void argmax_kernel(
     device const float* x       [[buffer(0)]],
@@ -1443,7 +1443,7 @@ kernel void argmax_kernel(
 }
 
 // ============================================================
-// COMPARE - bitmask that tren GPU. op: 0=gt 1=lt 2=eq 3=ge 4=le.
+// COMPARE - a real bitmask on the GPU. op: 0=gt 1=lt 2=eq 3=ge 4=le.
 // ============================================================
 kernel void compare_kernel(
     device const float* a    [[buffer(0)]],
@@ -1463,7 +1463,7 @@ kernel void compare_kernel(
 }
 
 // ============================================================
-// DROPOUT RNG - counter-based xorshift32, cung cong thuc voi CUDA/Vulkan.
+// DROPOUT RNG - counter-based xorshift32, the same formula as CUDA/Vulkan.
 // ============================================================
 inline uint xorshift32_m(uint x) {
     x ^= x << 13;
@@ -1487,8 +1487,8 @@ kernel void dropout_rng_kernel(
 }
 
 // ============================================================
-// PERMUTE - device tự giải mã chỉ số từ strides. Không có mảng chỉ số
-// O(n) build trên host.
+// PERMUTE - the device decodes each index from the strides. No O(n) index
+// array built on the host.
 // ============================================================
 kernel void permute_strided(
     device const float* src        [[buffer(0)]],
@@ -1510,7 +1510,7 @@ kernel void permute_strided(
 }
 
 // ============================================================
-// SPLIT - lát cắt liên tục theo dim, device tự tính offset.
+// SPLIT - a contiguous slice along dim, the device computes the offsets.
 // ============================================================
 kernel void split_slice(
     device const float* src      [[buffer(0)]],
@@ -1530,8 +1530,8 @@ kernel void split_slice(
 }
 
 // ============================================================
-// CONCAT - device tự chọn nguồn qua bảng nhỏ O(numTensors). flatSrc do
-// host nối phẳng (memcpy nối tiếp, không phải tính chỉ số per-element).
+// CONCAT - the device picks the source through a small O(numTensors) table. flatSrc is
+// flattened by the host (sequential memcpy, no per-element index computation).
 // ============================================================
 kernel void concat_gather(
     device const float* flatSrc      [[buffer(0)]],

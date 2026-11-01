@@ -1,8 +1,8 @@
 #version 450
-// GPU argmax (giá trị + chỉ số) theo chiều dimSize, layout [outer,dimSize,inner]
-// phẳng, ra [outer,inner]. Mỗi workgroup xử lý 1 cặp (o,i), local_size_x
-// phải >= dimSize (giống argmax_reduce trong argmax_kernel.cu, cùng thuật
-// toán tree-reduce bằng shared memory).
+// GPU argmax (value + index) along dimSize, flat layout [outer,dimSize,inner],
+// output [outer,inner]. Each workgroup handles one (o,i) pair; local_size_x
+// must be >= dimSize (like argmax_reduce in argmax_kernel.cu, same
+// shared-memory tree-reduce algorithm).
 layout(local_size_x = 1024) in;
 layout(std430, binding = 0) readonly buffer BufX     { float x[]; };
 layout(std430, binding = 1) writeonly buffer BufVal  { float outVal[]; };

@@ -1,7 +1,7 @@
 #version 450
-// Giống permute_strided (CUDA) - mỗi invocation tự giải mã chỉ số nguồn từ
-// strides (mảng nhỏ O(ndim) truyền qua push constants), không có mảng chỉ
-// số O(n) build trên CPU.
+// Like permute_strided (CUDA) - each invocation decodes its source index from
+// the strides (a small O(ndim) array passed in push constants); no O(n) index
+// array built on the CPU.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufSrc { float src[]; };
 layout(std430, binding = 1) writeonly buffer BufDst { float dst[]; };

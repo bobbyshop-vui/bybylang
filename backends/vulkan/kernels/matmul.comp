@@ -1,10 +1,10 @@
 #version 450
-// Matmul FP32 thường (không lượng tử) - dùng tile 16x16 chuẩn qua shared
-// memory, thuật toán tiled-matmul kinh điển (KHÔNG mirror byte-for-byte
-// Metal vì bản Metal có nhiều biến thể tile 8/16/32 chọn runtime theo
-// maxTotalThreadsPerThreadgroup - ở đây chỉ viết 1 biến thể tile=16 cố
-// định, đơn giản/an toàn hơn, đủ dùng cho phần weight resident FP32 không
-// lượng tử, không phải đường nóng chính (đường nóng là Q4).
+// Plain FP32 matmul (not quantized) - standard 16x16 tiles in shared
+// memory, the classic tiled-matmul algorithm (NOT a byte-for-byte mirror of
+// Metal, which has 8/16/32 tile variants picked at runtime from
+// maxTotalThreadsPerThreadgroup - only one fixed tile=16 variant here,
+// simpler/safer, enough for the unquantized FP32 resident weights,
+// which are not the main hot path (the hot path is Q4).
 #define TILE 16
 layout(local_size_x = TILE, local_size_y = TILE) in;
 layout(std430, binding = 0) readonly buffer BufA { float a[]; };  // [M,K]

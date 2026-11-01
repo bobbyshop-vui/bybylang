@@ -1,7 +1,7 @@
 #version 450
-// Mirror attention_fused_kernel (vecop_matmul.metal) - self-attention causal
-// đầy đủ (prefill-style, Q/K/V cùng S dòng). 1 thread = 1 (bh,ti) row,
-// KHÔNG dùng shared/subgroup gì - giống hệt bản Metal gốc "1 thread/row".
+// Mirror of attention_fused_kernel (vecop_matmul.metal): full causal
+// self-attention (prefill style, Q/K/V with the same S rows). 1 thread = 1 (bh,ti) row,
+// no shared memory or subgroups, exactly like the original Metal "1 thread/row".
 layout(local_size_x = 32, local_size_y = 8) in;
 layout(std430, binding = 0) readonly buffer BufQ { float q[]; };
 layout(std430, binding = 1) readonly buffer BufK { float k[]; };

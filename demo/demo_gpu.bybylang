@@ -2,7 +2,7 @@ mode is 3
 
 gpu backend is "vulkan"
 
-# Import module math thật của Nim để dùng hàm sqrt trong demo.
+# Import Nim's real math module to use sqrt in the demo.
 import nim "math"
 
 # 1. Khai bao array
@@ -55,9 +55,9 @@ gpu attention Q, MatKey, V -> ATTENTIONO, ATTENTIONS B 1 H 1 S 4 D 4 scale 0.707
 gpu array DYATTN = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16]
 gpu attention_backward Q, MatKey, V, ATTENTIONS, DYATTN -> DQ, DK, DV B 1 H 1 S 4 D 4 scale 0.7071
 
-# 12. Session API - gop nhieu lenh gpu vao 1 session GPU duy nhat (giam so
-# lan commit+wait GPU so voi goi tung lenh "gpu ..." roi rac). Neu backend
-# khong ho tro session se tu dong fallback ve tung lenh immediate nhu cu.
+# 12. Session API - batches several gpu commands into one GPU session (fewer
+# commit+wait round trips than separate "gpu ..." calls). If the backend
+# has no session support it falls back to immediate calls as before.
 session:
   gpu add A, B -> SESSC size 8
   gpu mul SESSC, A -> SESSD size 8
@@ -69,7 +69,7 @@ session:
   gpu fused_add_act A, B -> SESSFUSED act "relu"
   gpu sqrt A -> SQRTRES
 
-# 14. Cac ham toan hoc unary moi (sqrt/exp/log/pow) - chay tren GPU qua
+# 14. New unary math functions (sqrt/exp/log/pow) - run on the GPU through
 # gpuSqrt/gpuExp/gpuLog/gpuPow.
 gpu exp A -> EXPRES
 gpu log A -> LOGRES
@@ -203,9 +203,9 @@ print "GPU split_slice(E):"
 print SPLITRES
 print "GPU concat(E):"
 print CONCATRES
-print "GPU argmax_index(A) - gia tri lon nhat:"
+print "GPU argmax_index(A) - largest value:"
 print ARGMAXVAL
-print "GPU argmax_index(A) - chi so:"
+print "GPU argmax_index(A) - index:"
 print ARGMAXIDX
 print "GPU dropout_mask(n=8, p=0.0, seed=7):"
 print DROPOUTRES
@@ -217,11 +217,11 @@ if x > 0:
     if x > 3:
         print "x lon hon 3"
         if x == 5:
-            print "x dung bang 5 - if long 3 cap hoat dong!"
+            print "x equals 5 - three nested ifs work!"
         else:
             print "x khac 5"
     else:
-        print "x tu 1 den 3"
+        print "x from 1 to 3"
 elif x == 0:
     print "x bang 0"
 else:
@@ -229,12 +229,12 @@ else:
 
 for i in range(1, 4):
     if i == 2:
-        print "gap so 2 trong vong lap"
+        print "found 2 in the loop"
     else:
-        print "khong phai so 2"
+        print "not 2"
 
-# 18. Micro-kernel được khai báo trực tiếp bằng BybyLang DSL.
-# Mỗi thread đọc A[lid], nhân 2 rồi ghi vào output[lid].
+# 18. A micro-kernel declared directly in the BybyLang DSL.
+# Each thread reads A[lid], multiplies by 2 and writes output[lid].
 micro kernel double A -> DOUBLE_OUT threads 8 tg 4 out 8:
   emitRToU 0 0
   emitULoadIn 1 0

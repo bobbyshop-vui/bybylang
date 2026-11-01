@@ -1,18 +1,18 @@
 ## vendor/bybylang/micro_kernel — facade package cho micro-VM + JIT.
 ##
-## Nội dung thật nằm trong `vendor/bybylang/micro_kernel/`:
+## The implementation lives in `vendor/bybylang/micro_kernel/`:
 ##   session_vm.nim          — opcode / VmProgram / bytecode emit
 ##   session_vm_dispatch.nim — encode Metal/Vulkan (pipeline/bind/dispatch)
 ##   jit_vm.nim              — HotSpot interpret → profile → Metal/Vulkan JIT
 ##
-## Dùng qua:
+## Use it through:
 ##   import vendor/bybylang/micro_kernel
-## hoặc (khuyến nghị app-level):
-##   import nimformers   # đã re-export toàn bộ API public dưới đây
+## or (recommended at app level):
+##   import nimformers   # re-exports the whole public API below
 ##
-## Backend GPU: micro_kernel import `../gpubackend` (Metal path) và
-## `../backends/vulkan/vulkan_driver` — không import `backend.nim` của
-## nimformers (tránh vòng phụ thuộc).
+## GPU backend: micro_kernel imports `../gpubackend` (Metal path) and
+## `../backends/vulkan/vulkan_driver` — it does not import nimformers'
+## `backend.nim` (avoids a dependency cycle).
 
 import ./micro_kernel/session_vm
 import ./micro_kernel/session_vm_dispatch

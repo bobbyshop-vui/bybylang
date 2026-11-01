@@ -14,6 +14,6 @@ void main() {
     else if (pc.op == 5) y[id] = log(v);
     else if (pc.op == 6) y[id] = sqrt(v);
     else if (pc.op == 7) y[id] = pow(v, pc.p);
-    else if (pc.op == 8) y[id] = v * pc.p; // scale: dung cho sessionScale (x *= scalar)
+    else if (pc.op == 8) y[id] = v * pc.p; // scale: used by sessionScale (x *= scalar)
     else y[id] = max(v, 0.0);
 }

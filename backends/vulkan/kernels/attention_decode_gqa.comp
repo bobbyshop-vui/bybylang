@@ -1,21 +1,21 @@
 #version 450
-// attention_decode_gqa.comp - MIRROR CHINH XAC attention_decode_gqa_kernel.cu
-// (backends/cuda/kernels/attention_decode_gqa_kernel.cu, v2) sang GLSL. CUNG
-// 1 thuat toan 3 buoc (max -> exp/sum -> weighted-sum output) dung shared
-// memory + tree-reduction, KHONG tu sang tac thuat toan khac.
+// attention_decode_gqa.comp - EXACT GLSL mirror of attention_decode_gqa_kernel.cu
+// (backends/cuda/kernels/attention_decode_gqa_kernel.cu, v2). The SAME
+// 3-step algorithm (max -> exp/sum -> weighted-sum output) with shared
+// memory + tree reduction, no other algorithm invented.
 //
-//   q: [H, D]      - H query head trong 1 nhom GQA
-//   k, v: [S, D]   - dung chung cho ca H head (1 cap KV-head GQA)
-//   o: [H, D]      - ket qua attention cho tung query head
-//   scores: [H, S] - buffer scratch
+//   q: [H, D]      - H query heads of one GQA group
+//   k, v: [S, D]   - shared by all H heads (one GQA KV-head pair)
+//   o: [H, D]      - attention output per query head
+//   scores: [H, S] - scratch buffer
 //
-// Dispatch convention (PHAI khop vulkanSessionAttentionDecodeGqaEnc):
+// Dispatch convention (MUST match vulkanSessionAttentionDecodeGqaEnc):
 //   groupCount = (H, 1, 1)   -- 1 workgroup / query head
-//   local_size_x = 128       -- khop ATTN_DECODE_TG ben CUDA/Metal/OpenCL
+//   local_size_x = 128       -- matches ATTN_DECODE_TG on CUDA/Metal/OpenCL
 //
-// CANH BAO (mirror nguyen van tu ban CUDA): kernel goc CHUA CHAY TREN PHAN
-// CUNG THAT luc viet - BAT BUOC verify bang BYBY_VERIFY_ATTN_DECODE=1 (xem
-// nim_inference.nim) truoc khi tin dung ket qua tren may that.
+// WARNING (mirrored verbatim from the CUDA version): the original kernel HAD NOT
+// RUN ON REAL HARDWARE when written - verify with BYBY_VERIFY_ATTN_DECODE=1 (see
+// nim_inference.nim) before trusting its results on a real machine.
 
 #define ATTN_DECODE_TG 128
 
@@ -44,7 +44,7 @@ void main() {
     int qBase = h * pc.D;
     int sBase = h * pc.S;
 
-    // Buoc 1: dot(q_h, k_tj) cho cac tj do thread nay phu trach + max cuc bo
+    // Step 1: dot(q_h, k_tj) for the tj owned by this thread + local max
     float localMax = -1e30;
     for (int tj = tid; tj < pc.S; tj += ATTN_DECODE_TG) {
         float dotv = 0.0;
@@ -67,7 +67,7 @@ void main() {
     float mx = sharedReduce[0];
     barrier();
 
-    // Buoc 2: exp(score-mx) + sum cuc bo, tree-reduction lay tong
+    // Step 2: exp(score-mx) + local sum, tree reduction for the total
     float localSum = 0.0;
     for (int tj = tid; tj < pc.S; tj += ATTN_DECODE_TG) {
         float e = exp(scores[sBase + tj] - mx);
@@ -85,7 +85,7 @@ void main() {
     float invSum = 1.0 / sharedReduce[0];
     barrier();
 
-    // Buoc 3: output - chia D cho cac thread, moi thread tu lap S.
+    // Step 3: output - D split across threads, each thread loops over S.
     for (int d = tid; d < pc.D; d += ATTN_DECODE_TG) {
         float acc = 0.0;
         for (int tj = 0; tj < pc.S; ++tj) {

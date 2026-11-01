@@ -1,29 +1,29 @@
 // ============================================================
-// matmul_q4_batched_kernel — BATCH M THẬT cho prefill (M=T token > 1)
+// matmul_q4_batched_kernel — REAL batch M for prefill (M=T tokens > 1)
 // ------------------------------------------------------------
-// BUG GỐC đã tìm ra bằng cách đọc matmul_q4_kernel_ndst2_paired (kernel
-// decode M=1 đang dùng, KHÔNG đụng vào): dispatch grid Y = m (từng hàng
-// M một threadgroup riêng), khiến MỖI hàng đọc lại TOÀN BỘ weight Q4 liên
-// quan từ đầu, hoàn toàn độc lập với hàng khác - với M=92 (prefill), toàn
-// bộ ma trận weight bị đọc lại 92 LẦN thay vì 1 lần. Đây là lý do prefill
-// (944ms/token) gần bằng decode (1121ms/token) dù prefill lẽ ra phải nhanh
-// hơn hàng chục lần (chi phí đọc weight được khấu hao qua nhiều token).
+// ORIGINAL BUG, found by reading matmul_q4_kernel_ndst2_paired (the M=1
+// decode kernel in use, NOT touched): dispatch grid Y = m (one threadgroup per
+// row of M), so EVERY row re-read ALL of its Q4 weights from scratch,
+// independently of the other rows - with M=92 (prefill) the whole
+// weight matrix was read 92 TIMES instead of once. That is why prefill
+// (944ms/token) was almost as slow as decode (1121ms/token) although prefill should be
+// tens of times faster (the weight reads are amortised over many tokens).
 //
-// KERNEL NÀY: đọc mỗi byte weight ĐÚNG 1 LẦN, dùng lại cho MBLOCK=4 hàng
-// liên tiếp (dispatch grid Y = ceil(M/MBLOCK) thay vì Y=M) - giảm ~4 lần
-// lưu lượng đọc bộ nhớ cho phần weight. MBLOCK=4 (không lớn hơn) để giữ áp
-// lực thanh ghi ở mức an toàn - CHÍNH kernel decode M=1 (NDST=2) đã được
-// chọn thay vì NDST=8 VÌ NDST=8 gây register spill trên Intel Iris 640
-// (xem lịch sử comment ở matmul_q4_kernel_ndst2_paired) - kernel này thêm
-// chiều MBLOCK nên cố định NDST=2 (thấp nhất) để tổng thanh ghi vẫn nằm
-// trong vùng an toàn đã được CHÍNH kernel kia chứng minh không spill.
+// THIS KERNEL: reads each weight byte EXACTLY ONCE and reuses it for MBLOCK=4
+// consecutive rows (dispatch grid Y = ceil(M/MBLOCK) instead of Y=M) - about 4x
+// less memory traffic for the weights. MBLOCK=4 (no larger) keeps register
+// pressure safe - the M=1 decode kernel itself picked NDST=2
+// instead of NDST=8 BECAUSE NDST=8 spilled registers on Intel Iris 640
+// (see the comment history of matmul_q4_kernel_ndst2_paired) - this kernel adds
+// the MBLOCK dimension, so NDST stays at 2 (the lowest) to keep the register total
+// within the range that kernel proved does not spill.
 //
-// TOÁN HỌC GIỐNG HỆT kernel gốc (sc[rr]*dot[rr] - zp[rr]*sc[rr]*sumA[mm]),
-// chỉ khác: mảng dot/sum/sumA có thêm chiều mm (0..<MBLOCK), và byte weight
-// wq[...] chỉ đọc 1 lần/k2 rồi TÁI SỬ DỤNG cho mọi mm trong vòng lặp con.
+// SAME MATH as the original kernel (sc[rr]*dot[rr] - zp[rr]*sc[rr]*sumA[mm]),
+// except that dot/sum/sumA have an extra mm dimension (0..<MBLOCK) and the weight byte
+// wq[...] is read once per k2 and REUSED for every mm of the inner loop.
 //
-// CHỈ DÙNG CHO M>1 (prefill) - decode (M=1) vẫn dùng nguyên
-// matmul_q4_kernel_ndst2_paired như cũ, KHÔNG đổi gì đường đó.
+// ONLY FOR M>1 (prefill) - decode (M=1) still uses
+// matmul_q4_kernel_ndst2_paired unchanged.
 // ============================================================
 
 #define BB_MATMUL_Q4_BATCHED(NDST_VAL, MBLOCK_VAL, KFUNC)                    \
@@ -105,17 +105,17 @@ kernel void KFUNC(                                                          \
         }                                                                   \
                                                                               \
         int byteIdx = k2 >> 1;                                              \
-        /* MẤU CHỐT: đọc byte weight ĐÚNG 1 LẦN/k2, TÁI SỬ DỤNG cho toàn bộ \
-           MBLOCK hàng bên dưới - đây là điểm khác biệt DUY NHẤT về mặt    \
-           lưu lượng bộ nhớ so với kernel decode gốc (nơi đọc lại byte này \
-           riêng cho MỖI hàng vì mỗi hàng là 1 threadgroup độc lập).       \
-           THÊM MỚI (sparsity): nếu sc[rr]==0 (khối này đã bị Nim đánh dấu \
-           cat luc uploadResident - xem nimformer.nim), SKIP HẲN việc      \
-           đọc byte weight cho cột rr đó - tiết kiệm băng thông đọc THẬT,  \
-           không chỉ tiết kiệm phép tính (dù không skip, kết quả toán học  \
-           vẫn = 0 vì nhân với sc=0, nhưng SKIP mới thực sự đỡ phải đọc    \
-           byte đó từ bộ nhớ GPU - đây là nguồn lợi tốc độ thật của        \
-           sparsity, khong chi tinh ra 0 nhanh hon). */                    \
+        /* KEY POINT: each weight byte is read EXACTLY ONCE per k2 and REUSED for all \
+           MBLOCK rows below - the ONLY memory-traffic difference                 \
+           from the original decode kernel (which re-reads this byte            \
+           for EACH row because each row is an independent threadgroup).           \
+           NEW (sparsity): if sc[rr]==0 (this block was marked by Nim as   \
+           pruned in uploadResident - see nimformer.nim), the weight byte      \
+           for that column rr is NOT read at all - this saves REAL read bandwidth, \
+           not only arithmetic (without the skip the result would still  \
+           be 0 because sc=0, but skipping is what avoids reading    \
+           that byte from GPU memory - the real speed gain of        \
+           sparsity, not just computing 0 faster). */                    \
         uchar wbyte[NDST_VAL];                                              \
         _Pragma("unroll")                                                   \
         for (int rr = 0; rr < NDST_VAL; ++rr) {                             \
@@ -170,7 +170,7 @@ kernel void KFUNC(                                                          \
     } \
 }
 
-// MBLOCK=4, NDST=2 - tổng thanh ghi thêm (dot[4][2]+sum[4][2]+sumA[4]=20)
-// so với bản gốc NDST=2 (dot[2]+sum[2]+sumA=5) - tăng vừa phải, KHÔNG áp
-// dụng cấu hình NDST cao hơn (đã biết gây spill ở kernel decode).
+// MBLOCK=4, NDST=2 - extra registers (dot[4][2]+sum[4][2]+sumA[4]=20)
+// vs the original NDST=2 (dot[2]+sum[2]+sumA=5) - a moderate increase; higher NDST
+// settings are NOT used (known to spill in the decode kernel).
 BB_MATMUL_Q4_BATCHED(2, 4, matmul_q4_batched_m4_kernel)

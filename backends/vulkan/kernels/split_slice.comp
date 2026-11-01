@@ -1,6 +1,6 @@
 #version 450
-// Giống split_slice (CUDA) - lát cắt liên tục theo dim, mỗi invocation tự
-// tính chỉ số nguồn từ linear id, không cần bảng chỉ số dựng sẵn.
+// Like split_slice (CUDA) - a contiguous slice along dim; each invocation
+// computes its source index from its linear id, no prebuilt index table.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufSrc { float src[]; };
 layout(std430, binding = 1) writeonly buffer BufDst { float dst[]; };

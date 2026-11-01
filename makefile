@@ -1,4 +1,4 @@
-# Makefile - BybyLang (tự detect OS: Linux / macOS / Windows)
+# Makefile - BybyLang (detects the OS: Linux / macOS / Windows)
 ifeq ($(OS),Windows_NT)
     DETECTED_OS := Windows
     EXE := 
@@ -12,7 +12,7 @@ BIN      = bybylang$(EXE)
 DEMO_SRC = demo/demo_gpu.bybylang
 DEMO_OUT = demo/demo_gpu_out$(EXE)
 
-# Cấu trúc thư mục:
+# Directory layout:
 #   bybylang.nim, gpubackend.nim, micro_kernel.nim -> facade + core
 #   micro_kernel/                                                -> bytecode, session, JIT
 #   backends/vulkan/                                             -> Vulkan backend and shaders

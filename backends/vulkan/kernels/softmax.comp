@@ -1,7 +1,7 @@
 #version 450
-// Mirror softmax_kernel (vecop_matmul.metal) - reduction bằng shared memory
-// + barrier (KHÔNG dùng subgroup - đây là reduction toàn workgroup 256
-// thread, khác matmul_q4 chỉ cần 1 subgroup 32 thread).
+// Mirror of softmax_kernel (vecop_matmul.metal) - shared-memory reduction
+// + barrier (NO subgroups - this reduces over the whole 256-thread workgroup,
+// unlike matmul_q4 which needs only one 32-thread subgroup).
 #define BB_WG 256
 layout(local_size_x = BB_WG) in;
 layout(std430, binding = 0) readonly buffer BufX { float x[]; };

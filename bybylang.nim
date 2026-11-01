@@ -1,14 +1,15 @@
 # bybylang.nim - BybyLang AOT executable + Nim code generation + auto compile release
-# Hỗ trợ cơ chế function: define function bằng "function NAME" ... kết thúc bằng một dòng chỉ chứa NAME
+# Functions: "function NAME" or "function NAME(a: int, b = 2): T {.pragma.}"
+# opens a definition; its body is the block indented under that line.
 #
 # --------------------------
-# Cú pháp "session:" (MỚI) - dùng Session API của gpubackend.nim
+# "session:" syntax - uses the Session API of gpubackend.nim
 # --------------------------
-# gpubackend.nim đã có sẵn bộ Session API (sessionBegin/sessionUpload/
+# gpubackend.nim provides a Session API (sessionBegin/sessionUpload/
 # sessionMatmul/sessionVecOp/sessionActivation/sessionSoftmax/
-# sessionLayernormEnc/sessionRope/sessionEnd/sessionRead/sessionFree) để gộp
-# nhiều lệnh GPU vào 1 session (giảm số lần commit+wait GPU so với gọi từng
-# lệnh "gpu ..." rời rạc). Cú pháp:
+# sessionLayernormEnc/sessionRope/sessionEnd/sessionRead/sessionFree) that batches
+# several GPU commands into one session (fewer commit+wait round trips than separate
+# "gpu ..." commands). Syntax:
 #
 #   session:
 #     gpu add A, B -> C size 4
@@ -17,17 +18,17 @@
 #     gpu fused_add_act A, B -> G act "relu"
 #     gpu rope Q, COS, SIN -> Q2 seqlen 4 heads 1 dim 4
 #
-# Các op được hỗ trợ ENCODE-TRONG-SESSION: add/sub/mul/div, relu/sigmoid/tanh,
-# fused_add_act (ghép TRỰC TIẾP sessionVecOp("add") + sessionActivation(act)
-# vào CÙNG session bao ngoài, không mở session con riêng), softmax, matmul,
-# layernorm, rope. Nếu sessionBegin() thất bại (backend không hỗ trợ
-# session), toàn bộ khối tự động rơi về gọi "gpu ..." như bình thường
-# (immediate - vẫn là hàm gpuXxx() gọi GPU thật, KHÔNG bao giờ rơi về CPU),
-# đảm bảo luôn ra kết quả đúng. Các op GPU khác
+# Ops ENCODED INSIDE the session: add/sub/mul/div, relu/sigmoid/tanh,
+# fused_add_act (sessionVecOp("add") + sessionActivation(act) encoded DIRECTLY
+# into the SAME enclosing session, no nested session), softmax, matmul,
+# layernorm, rope. If sessionBegin() fails (the backend has no session
+# support), the whole block falls back to plain "gpu ..." calls
+# (immediate - still the real gpuXxx() GPU functions, NEVER the CPU),
+# so the result is always correct. The other GPU ops
 # (embedding, attention, attention_backward, layernorm_backward, apflu...)
-# CHƯA có bản session tương ứng trong gpubackend.nim nên vẫn được sinh ra
-# dưới dạng lệnh immediate như cũ, không cần đặt trong "session:" (đặt trong
-# đó vẫn chạy đúng, chỉ là không được gộp session).
+# have NO session variant in gpubackend.nim, so they are still generated
+# as immediate calls; they need not be inside "session:" (inside it
+# they still work, they are just not batched).
 import strutils, os, osproc, tables, sequtils, times
 import ./gpubackend
 import ./backends/cpu/cpu_backend as cpu
@@ -85,9 +86,9 @@ proc parseIntSafe(s: string): int =
   except:
     return 0
 
-# THEM MOI: lay gia tri tham so theo TEN (khong phu thuoc vi tri co dinh
-# nhu cac nhanh cu trong genGpuLine) - dung cho cac op moi patch them.
-# vd rhsParts = ["Y", "n", "10", "p", "0.5", "seed", "42"],
+# NEW: reads a parameter by NAME (independent of a fixed position
+# like the old branches of genGpuLine) - used by the newly added ops.
+# e.g. rhsParts = ["Y", "n", "10", "p", "0.5", "seed", "42"],
 # findNamedParam(rhsParts, "p", "0.0") -> "0.5"
 proc findNamedParam*(parts: seq[string], key: string, default: string): string =
   for i in 0..<parts.len:
@@ -108,7 +109,7 @@ type
     indent: int
     
 # --------------------------
-# RAM / Bus / Pins giả lập
+# Simulated RAM / bus / pins
 # --------------------------
 const RAM_SIZE = 1024
 var RAM: array[0..RAM_SIZE-1, int]
@@ -118,7 +119,7 @@ var Pins: array[0..31, bool]
 var ignoreErrors = false
 var quietMode = false
 
-# function table lưu body token
+# function table holding body tokens
 var funcTable = initTable[string, seq[Token]]()
 proc tokenizeLine(line: string): Token =
   var tok: Token
@@ -136,11 +137,11 @@ proc tokenizeLine(line: string): Token =
     tok.text = clean["micro kernel ".len..^1]
   elif clean.startsWith("function "):
     tok.sym = "function"
-    tok.text = clean.replace("function ", "")
+    tok.text = clean["function ".len..^1].strip()
   elif clean.startsWith("import nim "):
-    # THEM MOI: "import nim \"strutils\"" -> import thu vien Nim THAT (khong
-    # phai file .bybylang) - PHAI kiem tra TRUOC nhanh "import " thuong,
-    # neu khong se bi nhanh do bat nham thanh ten file .bybylang.
+    # NEW: "import nim \"strutils\"" -> imports a REAL Nim module (not
+    # a .bybylang file) - MUST be checked BEFORE the plain "import " branch,
+    # otherwise that branch would take it for a .bybylang file name.
     tok.sym = "nimimport"
     tok.text = stripQuotes(clean["import nim ".len..^1].strip())
   elif clean.startsWith("import "):
@@ -155,10 +156,10 @@ proc tokenizeLine(line: string): Token =
 
   return tok
 # --------------------------
-# Hệ thống import: "import tenfile" hoặc "import \"path/ten.bybylang\""
-# Nạp đệ quy, chống import vòng lặp bằng `visited` (đường dẫn tuyệt đối).
-# Token import được thay bằng toàn bộ token của file được import (đặt trước
-# vị trí import), không sinh trực tiếp thành dòng Nim nào.
+# Import system: "import filename" or "import \"path/name.bybylang\""
+# Loaded recursively, import cycles prevented with `visited` (absolute paths).
+# The import token is replaced by all tokens of the imported file (placed at
+# the import position); it does not generate any Nim line itself.
 # --------------------------
 proc resolveImports(filename: string, visited: var seq[string]): seq[Token] =
   result = @[]
@@ -187,13 +188,94 @@ proc resolveImports(filename: string, visited: var seq[string]): seq[Token] =
       result.add(t)
   traceDebug("Resolved " & $result.len & " tokens from " & filename)
 
-# Đọc file .bybylang gốc + toàn bộ file được import thành 1 danh sách tokens
+# Reads the root .bybylang file + every imported file into one token list
 proc tokenizeFile(filename: string): seq[Token] =
   traceInfo("Tokenizing file: " & filename)
   var visited: seq[string] = @[]
   let result = resolveImports(filename, visited)
   traceInfo("Total tokens: " & $result.len)
   return result
+
+# --------------------------
+# Line classification shared by the code generator.
+# --------------------------
+proc isTrivia(t: Token): bool =
+  ## Blank lines and comments never open or close a block.
+  t.sym == "empty" or t.sym == "comment"
+
+proc nextCode(tokens: seq[Token], idx: int): int =
+  ## Index of the first token at or after idx that is not trivia.
+  result = idx
+  while result < tokens.len and tokens[result].isTrivia: inc result
+
+proc isNimIdent(s: string): bool =
+  if s.len == 0 or s[0] notin IdentStartChars: return false
+  for c in s:
+    if c notin IdentChars: return false
+  true
+
+proc functionName(header: string): string =
+  ## "name(a: int): T {.p.}" -> "name"
+  result = header.strip()
+  for i, c in result:
+    if c notin IdentChars: return result[0 ..< i]
+
+proc functionSignature(header: string): string =
+  ## "name" -> "name()"; a header with a parameter list stays as written.
+  let h = header.strip()
+  let name = functionName(h)
+  let rest = h[name.len..^1].strip()
+  if rest.startsWith("("): h
+  elif rest.len > 0: name & "() " & rest
+  else: name & "()"
+
+proc functionParams(header: string): seq[string] =
+  ## Parameter names of "name(a, b: int; c = 1)".
+  let open = header.find('(')
+  let close = header.find(')')
+  if open < 0 or close < open: return
+  for group in header[open + 1 ..< close].split({',', ';'}):
+    var name = group
+    let cut = name.find({':', '='})
+    if cut >= 0: name = name[0 ..< cut]
+    name = name.strip()
+    if name.isNimIdent: result.add name
+
+proc declaredNames(line: string): seq[string] =
+  ## Names introduced by "var a, b: T", "let x {.global.} = y", "const K = 1".
+  var rest = line.split(maxsplit = 1)[^1]
+  let cut = rest.find({'=', ':'})
+  if cut >= 0: rest = rest[0 ..< cut]
+  for part in rest.split(','):
+    var name = part
+    let pragma = name.find("{.")
+    if pragma >= 0: name = name[0 ..< pragma]
+    name = name.strip().strip(chars = {'*'})
+    if name.isNimIdent: result.add name
+
+proc isDeclaration(line: string): bool =
+  line.startsWith("var ") or line.startsWith("let ") or line.startsWith("const ")
+
+proc assignTarget(line: string): string =
+  ## "name = expr" -> "name". Field/index targets ("a.b = x", "a[i] = x"),
+  ## compound operators ("x += 1") and comparisons return "" and are emitted
+  ## unchanged as Nim.
+  let eq = line.find('=')
+  if eq <= 0 or (eq + 1 < line.len and line[eq + 1] == '='): return ""
+  if line[eq - 1] in {'!', '<', '>', '=', '+', '-', '*', '/', '&', '%', '|',
+                      '^', '~', '.', '@', '$', ':'}:
+    return ""
+  let left = line[0 ..< eq].strip()
+  if left.isNimIdent: left else: ""
+
+proc isTypeSection(line: string): bool =
+  line == "type" or line.startsWith("type ")
+
+proc isBlockHeader(line: string): bool =
+  ## Nim statements that own an indented block, besides if/elif/else/while/for.
+  if not line.endsWith(":"): return false
+  let word = line.split({' ', ':'})[0]
+  word in ["try", "except", "finally", "of", "when", "block", "case", "defer"]
 
 proc executeMicroKernel*(backend: GpuBackend; kernelName: string;
     program: VmProgram; inputValues: seq[float32]; outputElems, nThreads,
@@ -329,12 +411,12 @@ proc tranPulse(pin: int, width: string) =
 # Generate Nim code + compile to binary release
 # --------------------------
 # --------------------------
-# Sinh code cho lệnh "gpu ..."
+# Code generation for "gpu ..." commands
 # --------------------------
-# Cú pháp hỗ trợ:
+# Supported syntax:
 #   gpu backend is "auto"          # "auto" | "cuda" (Vulkan alias) | "metal" | "cpu" | "vulkan"
 #   gpu array X = [1, 2, 3, 4]
-#   gpu add A, B -> C size 4       # "size N" tuỳ chọn, chỉ mang tính mô tả
+#   gpu add A, B -> C size 4       # "size N" optional, descriptive only
 #   gpu sub A, B -> C
 #   gpu mul A, B -> C
 #   gpu div A, B -> C
@@ -373,7 +455,7 @@ proc genGpuLine*(line: string): seq[string] =
       result.add("var " & name & ": seq[float32] = @" & valsRaw & ".mapIt(it.float32)")
     else:
       traceWarn("Invalid gpu array syntax: " & line)
-      result.add("# [WARN] cú pháp 'gpu array' không hợp lệ: " & line)
+      result.add("# [WARN] invalid 'gpu array' syntax: " & line)
 
   else:
     let arrowParts = rest.split("->")
@@ -387,7 +469,7 @@ proc genGpuLine*(line: string): seq[string] =
         let operands = operandsStr.split(",")
         traceDebug("GPU op: " & opName & " with " & $operands.len & " operands")
         
-        # Xử lý opName đặc biệt
+        # Special opName handling
         if opName == "layernorm_backward":
           if operands.len >= 4:
             let dy = operands[0].strip()
@@ -414,13 +496,13 @@ proc genGpuLine*(line: string): seq[string] =
                 result.add("var " & targetDbeta & " = lnBwd.dbeta")
               else:
                 traceWarn("Invalid layernorm_backward syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu layernorm_backward' cần: gpu layernorm_backward DY, X, GAMMA, BETA -> DX, DGAMMA, DBETA rows R cols C eps E : " & line)
+                result.add("# [WARN] 'gpu layernorm_backward' syntax: gpu layernorm_backward DY, X, GAMMA, BETA -> DX, DGAMMA, DBETA rows R cols C eps E : " & line)
             else:
               traceWarn("Invalid layernorm_backward syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu layernorm_backward' cần: gpu layernorm_backward DY, X, GAMMA, BETA -> DX, DGAMMA, DBETA rows R cols C eps E : " & line)
+              result.add("# [WARN] 'gpu layernorm_backward' syntax: gpu layernorm_backward DY, X, GAMMA, BETA -> DX, DGAMMA, DBETA rows R cols C eps E : " & line)
           else:
             traceWarn("layernorm_backward needs 4 operands: " & line)
-            result.add("# [WARN] cú pháp 'gpu layernorm_backward' cần 4 toán hạng: " & line)
+            result.add("# [WARN] 'gpu layernorm_backward' needs 4 operands: " & line)
             
         elif opName == "attention":
           if operands.len >= 3:
@@ -449,13 +531,13 @@ proc genGpuLine*(line: string): seq[string] =
                 result.add("var " & targetS & " = attnRes.s_matrix")
               else:
                 traceWarn("Invalid attention syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu attention' cần: gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE : " & line)
+                result.add("# [WARN] 'gpu attention' syntax: gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE : " & line)
             else:
               traceWarn("Invalid attention syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu attention' cần: gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE : " & line)
+              result.add("# [WARN] 'gpu attention' syntax: gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE : " & line)
           else:
             traceWarn("attention needs 3 operands: " & line)
-            result.add("# [WARN] cú pháp 'gpu attention' cần 3 toán hạng Q, K, V: " & line)
+            result.add("# [WARN] 'gpu attention' needs 3 operands Q, K, V: " & line)
             
         elif opName == "attention_backward":
           if operands.len >= 5:
@@ -488,13 +570,13 @@ proc genGpuLine*(line: string): seq[string] =
                 result.add("var " & targetDv & " = attnBwd.dv")
               else:
                 traceWarn("Invalid attention_backward syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu attention_backward' cần: gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE : " & line)
+                result.add("# [WARN] 'gpu attention_backward' syntax: gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE : " & line)
             else:
               traceWarn("Invalid attention_backward syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu attention_backward' cần: gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE : " & line)
+              result.add("# [WARN] 'gpu attention_backward' syntax: gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE : " & line)
           else:
             traceWarn("attention_backward needs 5 operands: " & line)
-            result.add("# [WARN] cú pháp 'gpu attention_backward' cần 5 toán hạng: " & line)
+            result.add("# [WARN] 'gpu attention_backward' needs 5 operands: " & line)
             
         elif opName == "apflu":
           if operands.len >= 1:
@@ -509,11 +591,11 @@ proc genGpuLine*(line: string): seq[string] =
               result.add("var " & rhsParts[0] & " = gpuApflu(gpuBackendSelected, " & x & ", 0.1'f32, 1.0'f32)")
           else:
             traceWarn("apflu needs 1 operand: " & line)
-            result.add("# [WARN] cú pháp 'gpu apflu' cần 1 toán hạng: " & line)
+            result.add("# [WARN] 'gpu apflu' needs 1 operands: " & line)
 
         elif opName == "permute":
-          # THEM MOI: gpu permute SRC -> Y newStrides NS oldStrides OS dimsMap DM n N
-          # NS/OS/DM la TEN BIEN seq[int32] (hoac seq[int]) co san, N la scalar.
+          # NEW: gpu permute SRC -> Y newStrides NS oldStrides OS dimsMap DM n N
+          # NS/OS/DM are NAMES of existing seq[int32] (or seq[int]) variables, N is a scalar.
           if operands.len >= 1:
             let src = operands[0].strip()
             let rhsParts = rhs.splitWhitespace()
@@ -526,10 +608,10 @@ proc genGpuLine*(line: string): seq[string] =
               result.add("var " & target & " = gpuPermute(gpuBackendSelected, " & src & ", " & ns & ".mapIt(int32(it)), " & os & ".mapIt(int32(it)), " & dm & ".mapIt(int32(it)), " & n & ")")
             else:
               traceWarn("Invalid permute syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu permute' cần: gpu permute SRC -> Y newStrides NS oldStrides OS dimsMap DM n N : " & line)
+              result.add("# [WARN] 'gpu permute' syntax: gpu permute SRC -> Y newStrides NS oldStrides OS dimsMap DM n N : " & line)
           else:
             traceWarn("permute needs 1 operand: " & line)
-            result.add("# [WARN] cú pháp 'gpu permute' cần 1 toán hạng: " & line)
+            result.add("# [WARN] 'gpu permute' needs 1 operands: " & line)
 
         elif opName == "split_slice":
           # THEM MOI: gpu split_slice SRC -> Y dimTotal DT thisSize TS offset OFF inner IN n N
@@ -545,12 +627,12 @@ proc genGpuLine*(line: string): seq[string] =
             result.add("var " & target & " = gpuSplitSlice(gpuBackendSelected, " & src & ", " & dimTotal & ", " & thisSize & ", " & offset & ", " & inner & ", " & n & ")")
           else:
             traceWarn("split_slice needs 1 operand: " & line)
-            result.add("# [WARN] cú pháp 'gpu split_slice' cần 1 toán hạng: " & line)
+            result.add("# [WARN] 'gpu split_slice' needs 1 operands: " & line)
 
         elif opName == "concat":
           # THEM MOI: gpu concat FLATSRC -> Y srcBase SB srcDimSize SDS srcDimOffset SDO
           #           numTensors NT totalDim TD inner IN
-          # SB/SDS/SDO la TEN BIEN seq[int32] (hoac seq[int]) co san.
+          # SB/SDS/SDO are the NAMES of existing seq[int32] (or seq[int]) variables.
           if operands.len >= 1:
             let flatSrc = operands[0].strip()
             let rhsParts = rhs.splitWhitespace()
@@ -565,10 +647,10 @@ proc genGpuLine*(line: string): seq[string] =
               result.add("var " & target & " = gpuConcat(gpuBackendSelected, " & flatSrc & ", " & sb & ".mapIt(int32(it)), " & sds & ".mapIt(int32(it)), " & sdo & ".mapIt(int32(it)), " & numT & ", " & totalDim & ", " & inner & ")")
             else:
               traceWarn("Invalid concat syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu concat' cần: gpu concat FLATSRC -> Y srcBase SB srcDimSize SDS srcDimOffset SDO numTensors NT totalDim TD inner IN : " & line)
+              result.add("# [WARN] 'gpu concat' syntax: gpu concat FLATSRC -> Y srcBase SB srcDimSize SDS srcDimOffset SDO numTensors NT totalDim TD inner IN : " & line)
           else:
             traceWarn("concat needs 1 operand: " & line)
-            result.add("# [WARN] cú pháp 'gpu concat' cần 1 toán hạng: " & line)
+            result.add("# [WARN] 'gpu concat' needs 1 operands: " & line)
 
         elif opName == "argmax_index":
           # THEM MOI: gpu argmax_index X -> VAL, IDX outer O dimSize D inner I
@@ -588,15 +670,15 @@ proc genGpuLine*(line: string): seq[string] =
               result.add("var " & targetIdx & " = amRes.idx")
             else:
               traceWarn("Invalid argmax_index syntax: " & line)
-              result.add("# [WARN] cú pháp 'gpu argmax_index' cần: gpu argmax_index X -> VAL, IDX outer O dimSize D inner I : " & line)
+              result.add("# [WARN] 'gpu argmax_index' syntax: gpu argmax_index X -> VAL, IDX outer O dimSize D inner I : " & line)
           else:
             traceWarn("argmax_index needs 1 operand: " & line)
-            result.add("# [WARN] cú pháp 'gpu argmax_index' cần 1 toán hạng: " & line)
+            result.add("# [WARN] 'gpu argmax_index' needs 1 operands: " & line)
 
         elif opName == "dropout_mask":
-          # THEM MOI: gpu dropout_mask -> Y n N p P seed S  (KHONG co operand
-          # dau vao - day la op SINH mask moi, khong bien doi tensor co san,
-          # nen "lhs" chi la ten op, khong co toan hang truoc "->")
+          # NEW: gpu dropout_mask -> Y n N p P seed S  (NO input
+          # operand - this op GENERATES a new mask, it does not transform a tensor,
+          # so "lhs" is only the op name, no operand before "->")
           let rhsParts = rhs.splitWhitespace()
           let target = rhsParts[0]
           let n = findNamedParam(rhsParts, "n", "0")
@@ -617,7 +699,7 @@ proc genGpuLine*(line: string): seq[string] =
                 result.add("var " & target & " = gpuMatmul(gpuBackendSelected, " & a & ", " & b & ", " & m & ", " & k & ", " & n & ")")
               else:
                 traceWarn("Invalid matmul syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu matmul' cần: gpu matmul A, B -> C m M k K n N : " & line)
+                result.add("# [WARN] 'gpu matmul' syntax: gpu matmul A, B -> C m M k K n N : " & line)
             elif opName == "layernorm":
               if operands.len >= 3:
                 let gamma = operands[1].strip()
@@ -629,10 +711,10 @@ proc genGpuLine*(line: string): seq[string] =
                   result.add("var " & target & " = gpuLayernorm(gpuBackendSelected, " & a & ", " & gamma & ", " & beta & ", " & rows & ", " & cols & ", " & eps & ")")
                 else:
                   traceWarn("Invalid layernorm syntax: " & line)
-                  result.add("# [WARN] cú pháp 'gpu layernorm' cần: gpu layernorm X, GAMMA, BETA -> Y rows R cols C eps E : " & line)
+                  result.add("# [WARN] 'gpu layernorm' syntax: gpu layernorm X, GAMMA, BETA -> Y rows R cols C eps E : " & line)
               else:
                 traceWarn("layernorm needs 3 operands: " & line)
-                result.add("# [WARN] cú pháp 'gpu layernorm' cần 3 toán hạng: " & line)
+                result.add("# [WARN] 'gpu layernorm' needs 3 operands: " & line)
             elif opName == "embedding":
               let rhsParts = rhs.splitWhitespace()
               if rhsParts.len >= 5 and rhsParts[1] == "vocab" and rhsParts[3] == "dim":
@@ -641,10 +723,10 @@ proc genGpuLine*(line: string): seq[string] =
                 result.add("var " & target & " = gpuEmbeddingLookup(gpuBackendSelected, " & a & ", " & b & ".mapIt(int32(it)), " & vocab & ", " & dim & ")")
               else:
                 traceWarn("Invalid embedding syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu embedding' cần: gpu embedding TABLE, INDICES -> Y vocab V dim D : " & line)
+                result.add("# [WARN] 'gpu embedding' syntax: gpu embedding TABLE, INDICES -> Y vocab V dim D : " & line)
             elif opName == "gather":
-              # THEM MOI: gpu gather SRC, IDX -> Y  (IDX la bien seq[int32]
-              # hoac seq[int] - .mapIt(int32(it)) an toan ca 2 truong hop)
+              # NEW: gpu gather SRC, IDX -> Y  (IDX is a seq[int32]
+              # or seq[int] variable - .mapIt(int32(it)) is safe for both)
               let target = rhs.splitWhitespace()[0]
               result.add("var " & target & " = gpuGather(gpuBackendSelected, " & a & ", " & b & ".mapIt(int32(it)))")
             elif opName == "compare":
@@ -701,48 +783,64 @@ proc genGpuLine*(line: string): seq[string] =
                 result.add("var " & target & " = gpuSoftmax(gpuBackendSelected, " & x & ", " & rows & ", " & cols & ")")
               else:
                 traceWarn("Invalid softmax syntax: " & line)
-                result.add("# [WARN] cú pháp 'gpu softmax' cần: gpu softmax X -> Y rows R cols C : " & line)
+                result.add("# [WARN] 'gpu softmax' syntax: gpu softmax X -> Y rows R cols C : " & line)
             else:
               traceWarn("Unknown unary op: " & opName)
-              result.add("# [WARN] cú pháp 'gpu " & opName & "' cần 2 toán hạng: " & line)
+              result.add("# [WARN] 'gpu " & opName & "' needs 2 operands: " & line)
           else:
             traceWarn("No operands for op: " & opName)
-            result.add("# [WARN] cú pháp 'gpu " & opName & "' cần toán hạng: " & line)
+            result.add("# [WARN] 'gpu " & opName & "' needs operands: " & line)
       else:
         traceWarn("No words in LHS: " & lhs)
-        result.add("# [WARN] cú pháp gpu không hợp lệ: " & line)
+        result.add("# [WARN] invalid gpu syntax: " & line)
     else:
       traceWarn("No arrow found: " & rest)
-      result.add("# [WARN] cú pháp gpu không hợp lệ (thiếu '->'): " & line)
+      result.add("# [WARN] invalid gpu syntax (missing '->'): " & line)
 # --------------------------
-# Sinh code đệ quy cho một khối lệnh
+# Recursive code generation for a block of statements
 # --------------------------
-# Hỗ trợ lồng nhau ở ĐỘ SÂU BẤT KỲ: if trong if, while trong if, for trong while,
-# gpu-call trong if-trong-for, v.v. Mỗi khi gặp một statement mở khối mới
-# (if/elif/else/while/for) thì gọi lại chính nó (đệ quy) để sinh phần thân,
-# thay vì phải chép lặp code xử lý riêng cho từng cấp như bản cũ.
+# Nests to ANY DEPTH: if in if, while in if, for in while,
+# a gpu call in an if in a for, etc. Each statement that opens a new block
+# (if/elif/else/while/for) calls this function again (recursively) for its body,
+# instead of duplicating the handling code per level like the old version.
 proc genBlock(tokens: seq[Token], idx: var int, indent: string,
               funcNames: seq[string], localVars: var seq[string]): seq[string]
 
-# Dùng chung cho if/elif/else/while/for: emit dòng header, rồi hoặc đệ quy vào
-# thân khối (nếu dòng kế tiếp thụt sâu hơn) hoặc emit "discard" (khối rỗng).
+proc genRawBlock(tokens: seq[Token], idx: var int, indent: string,
+                 blockIndent: int): seq[string] =
+  ## A type section is plain Nim: emit its header and every deeper line
+  ## unchanged, keeping their indentation relative to the first body line.
+  result = @[indent & tokens[idx].text]
+  idx.inc
+  var bodyIndent = -1
+  while idx < tokens.len:
+    let j = nextCode(tokens, idx)
+    if j >= tokens.len or tokens[j].indent <= blockIndent: break
+    if bodyIndent < 0: bodyIndent = tokens[j].indent
+    let t = tokens[j]
+    result.add(indent & "  " & " ".repeat(max(0, t.indent - bodyIndent)) & t.text)
+    idx = j + 1
+
+# Shared by if/elif/else/while/for: emits the header line, then either recurses into
+# the body (when the next line is indented deeper) or emits "discard" (empty block).
 proc genHeaderedBlock(tokens: seq[Token], idx: var int, indent: string, headerLine: string,
                        blockIndent: int, funcNames: seq[string], localVars: var seq[string]): seq[string] =
   result = @[indent & headerLine]
   idx.inc
-  if idx < tokens.len and tokens[idx].indent > blockIndent:
+  let body = nextCode(tokens, idx)
+  if body < tokens.len and tokens[body].indent > blockIndent:
     result.add(genBlock(tokens, idx, indent & "  ", funcNames, localVars))
   else:
     result.add(indent & "  discard")
 # --------------------------
-# Sinh code cho block "session:" - dùng Session API (sessionBegin/
-# sessionUpload/session<Op>/sessionEnd/sessionRead/sessionFree) của
-# gpubackend.nim để gộp nhiều lệnh "gpu ..." vào 1 session GPU.
+# Code generation for a "session:" block - uses the Session API (sessionBegin/
+# sessionUpload/session<Op>/sessionEnd/sessionRead/sessionFree) of
+# gpubackend.nim to batch several "gpu ..." commands into one GPU session.
 # --------------------------
 proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
                       blockIndent: int, localVars: var seq[string]): seq[string] =
   result = @[]
-  idx.inc  # bỏ qua dòng "session:"
+  idx.inc  # skip the "session:" line
 
   var bodyLines: seq[string] = @[]
   if idx < tokens.len and tokens[idx].indent > blockIndent:
@@ -753,31 +851,31 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         bodyLines.add(t.text.strip())
       idx.inc
   else:
-    traceWarn("Khối 'session:' rỗng")
+    traceWarn("Empty 'session:' block")
     result.add(indent & "discard")
     return
 
-  traceInfo("Session block voi " & $bodyLines.len & " dong")
+  traceInfo("Session block with " & $bodyLines.len & " lines")
 
-  var uploaded = initTable[string, string]()      # tên biến (đã có trên CPU) -> tên handle
-  var produced = initTable[string, string]()      # tên biến (mới sinh TRONG session, chưa về CPU) -> tên handle
-  var producedSize = initTable[string, string]()  # tên biến (produced) -> biểu thức kích thước (vì chưa có .len)
+  var uploaded = initTable[string, string]()      # variable name (already on the CPU) -> handle name
+  var produced = initTable[string, string]()      # variable name (created INSIDE the session, not on the CPU yet) -> handle name
+  var producedSize = initTable[string, string]()  # variable name (produced) -> size expression (no .len yet)
   var handleDecls: seq[string] = @[]
   var opLines: seq[string] = @[]
   var resultHandles: seq[tuple[varName: string, handleVar: string, size: string]] = @[]
-  var extraFreeHandles: seq[string] = @[]           # handle trung gian (vd. buffer add trước activation trong fused_add_act) - không nằm trong resultHandles nên phải free riêng
-  var passthrough: seq[string] = @[]               # dòng chạy bình thường, không qua session
-  var sessionSourceLines: seq[string] = @[]         # các dòng "gpu ..." tối ưu được trong session (để fallback)
+  var extraFreeHandles: seq[string] = @[]           # intermediate handles (e.g. the add buffer before the activation in fused_add_act) - not in resultHandles, so freed separately
+  var passthrough: seq[string] = @[]               # lines run normally, outside the session
+  var sessionSourceLines: seq[string] = @[]         # the "gpu ..." lines batched in the session (for the fallback)
 
   var hcount = 0
   proc newHandle(): string =
     hcount.inc
     return "sh" & $hcount
 
-  # Nếu varName vừa được 1 lệnh trước đó TRONG CÙNG session tạo ra (còn nằm
-  # trên GPU, chưa sessionRead về CPU), dùng lại handle GPU đó luôn - không
-  # upload lại từ biến Nim (biến đó còn chưa tồn tại ở thời điểm này).
-  # Ngược lại, upload biến CPU hiện có (chỉ upload 1 lần, cache lại).
+  # If varName was just produced by an earlier command IN THE SAME session (still
+  # on the GPU, not read back to the CPU), reuse that GPU handle - no
+  # re-upload from the Nim variable (which does not exist yet at this point).
+  # Otherwise upload the existing CPU variable (once, cached).
   proc ensureUploaded(varName: string): string =
     if varName in produced:
       return produced[varName]
@@ -788,10 +886,10 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
     uploaded[varName] = h
     return h
 
-  # Kích thước (số phần tử) của varName. Nếu varName vừa được sinh TRONG
-  # session (chưa có dạng seq[float32] thật trên CPU) thì dùng lại biểu thức
-  # kích thước đã biết từ lúc sinh ra nó, thay vì "varName.len" (biến chưa
-  # tồn tại ở bước này).
+  # Size (element count) of varName. If varName was just produced INSIDE the
+  # session (no real seq[float32] on the CPU yet), reuse the size
+  # expression known when it was produced instead of "varName.len" (the variable
+  # does not exist at this step).
   proc sizeOf(varName: string): string =
     if varName in producedSize:
       return producedSize[varName]
@@ -806,7 +904,7 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
     let rest = line[3..^1].strip()
     let arrowParts = rest.split("->")
     if arrowParts.len != 2:
-      passthrough.add(line)   # ví dụ "gpu backend is ..." / "gpu array ..."
+      passthrough.add(line)   # e.g. "gpu backend is ..." / "gpu array ..."
       continue
 
     let lhs = arrowParts[0].strip()
@@ -927,23 +1025,23 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         let seqlen = rhsParts[2]; let heads = rhsParts[4]; let dim = rhsParts[6]
         opLines.add("    discard sessionRope(gpuBackendSelected, " & hx & ", " & hcos &
                     ", " & hsin & ", " & seqlen & ", " & heads & ", " & dim & ")")
-        # sessionRope xoay in-place trên handle X -> đọc lại chính hx làm kết quả
+        # sessionRope rotates handle X in place -> read hx back as the result
         resultHandles.add((target, hx, operands[0] & ".len"))
         produced[target] = hx
         producedSize[target] = sizeOf(operands[0])
         sessionSourceLines.add(line)
       else:
-        traceWarn("Cú pháp 'gpu rope' cần: gpu rope X, COS, SIN -> Y seqlen T heads H dim D")
+        traceWarn("'gpu rope' syntax: gpu rope X, COS, SIN -> Y seqlen T heads H dim D")
         passthrough.add(line)
 
     of "fused_add_act":
       # gpu fused_add_act A, B -> Y act "relu"
-      # Ghép TRỰC TIẾP vào session bao ngoài bằng sessionVecOp("add") +
-      # sessionActivation(act) - CÙNG 2 kernel thật mà gpuFusedAddAct()
-      # (gpubackend.nim) dùng, nhưng ở đây gộp chung sessionBegin/End với
-      # các lệnh "gpu ..." khác trong cùng khối "session:" thay vì mở
-      # 1 session con riêng (gpuFusedAddAct gọi rời sẽ tự sessionBegin/End
-      # của chính nó - vẫn đúng, chỉ không được gộp chung).
+      # Encoded DIRECTLY into the enclosing session with sessionVecOp("add") +
+      # sessionActivation(act) - the SAME 2 real kernels gpuFusedAddAct()
+      # (gpubackend.nim) uses, but here they share the sessionBegin/End of
+      # the other "gpu ..." commands in the same "session:" block instead of
+      # opening a nested session (a separate gpuFusedAddAct call does its own
+      # sessionBegin/End - still correct, just not batched).
       let rhsParts = rhs.splitWhitespace()
       if operands.len >= 2 and rhsParts.len >= 1:
         let target = rhsParts[0]
@@ -989,7 +1087,7 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         passthrough.add(line)
 
     of "pow":
-      # gpu pow A -> Y p 2.0 - opCode 7, cần truyền thêm p qua sessionActivation.
+      # gpu pow A -> Y p 2.0 - opCode 7, p must be passed through sessionActivation.
       let rhsParts = rhs.splitWhitespace()
       if operands.len >= 1 and rhsParts.len >= 1:
         let x = operands[0]
@@ -1009,11 +1107,11 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         passthrough.add(line)
 
     of "apflu":
-      # gpu apflu A -> Y alpha 0.1 beta 1.0 - Metal CHỈ hỗ trợ đúng
-      # alpha=0.1/beta=1.0 trong session (xem sessionApfluEnc); nếu backend
-      # là Metal và alpha/beta khác giá trị đó, sessionApfluEnc tự trả false
-      # -> dòng này rơi ra immediate như bình thường (gpuApflu vẫn đúng mọi
-      # alpha/beta vì đó là hàm CPU/kernel tổng quát hơn).
+      # gpu apflu A -> Y alpha 0.1 beta 1.0 - Metal supports ONLY
+      # alpha=0.1/beta=1.0 inside a session (see sessionApfluEnc); if the backend
+      # is Metal with other alpha/beta, sessionApfluEnc returns false
+      # -> the line falls back to immediate (gpuApflu is correct for every
+      # alpha/beta because it is a more general CPU/kernel function).
       let rhsParts = rhs.splitWhitespace()
       if operands.len >= 1 and rhsParts.len >= 1:
         let x = operands[0]
@@ -1055,9 +1153,9 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         passthrough.add(line)
 
     of "gather":
-      # IDX phải là mảng int (seq[int]/seq[int32]) upload qua
-      # sessionUploadIndices - KHÔNG dùng ensureUploaded (chỉ dành cho
-      # seq[float32]). Không cache lại (idx thường nhỏ, ít khi tái dùng).
+      # IDX must be an int array (seq[int]/seq[int32]) uploaded through
+      # sessionUploadIndices - NOT ensureUploaded (only for
+      # seq[float32]). Not cached (indices are usually small and rarely reused).
       if operands.len >= 2 and rhs.splitWhitespace().len >= 1:
         let src = operands[0]; let idx = operands[1]
         let target = rhs.splitWhitespace()[0]
@@ -1099,8 +1197,8 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         passthrough.add(line)
 
     of "dropout_mask":
-      # KHÔNG có operand đầu vào (op sinh mask mới) - "rhs" chứa cả target
-      # lẫn tham số n/p/seed.
+      # NO input operand (the op generates a new mask) - "rhs" holds both the target
+      # and the n/p/seed parameters.
       let rhsParts = rhs.splitWhitespace()
       if rhsParts.len >= 1:
         let target = rhsParts[0]
@@ -1141,13 +1239,13 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         passthrough.add(line)
 
     else:
-      traceWarn("GPU op '" & opName & "' chưa có bản session - dùng immediate")
+      traceWarn("GPU op '" & opName & "' has no session variant - using immediate")
       passthrough.add(line)
 
-  # --- Sinh khối Nim: thử session, fallback immediate nếu không mở được ---
-  # Các biến kết quả PHẢI khai báo "var" ở NGOÀI block (vì "block:" trong Nim
-  # tạo scope riêng - khai báo bên trong sẽ mất hiệu lực ngay khi ra khỏi
-  # block), rồi bên trong chỉ gán giá trị (không "var" nữa).
+  # --- Generate the Nim block: try the session, fall back to immediate if it cannot open ---
+  # The result variables MUST be declared "var" OUTSIDE the block (Nim's "block:"
+  # opens its own scope - a declaration inside would vanish when leaving the
+  # block); inside, they are only assigned (no "var").
   for rh in resultHandles:
     if rh.varName notin localVars:
       result.add(indent & "var " & rh.varName & ": seq[float32] = @[]")
@@ -1177,16 +1275,16 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
         result.add(indent & "    sessionFree(gpuBackendSelected, " & h & ")")
         freed.add(h)
     result.add(indent & "  else:")
-    result.add(indent & "    echo \"[WARN] session không khởi tạo được, fallback sang immediate\"")
-    # sessionSourceLines và resultHandles được thêm song song (1-1, cùng thứ
-    # tự) ở vòng lặp phía trên nên ghép cặp trực tiếp theo chỉ số được.
+    result.add(indent & "    echo \"[WARN] session could not be started, falling back to immediate\"")
+    # sessionSourceLines and resultHandles are filled in parallel (1-1, same
+    # order) by the loop above, so they pair up by index.
     for i in 0..<sessionSourceLines.len:
       let l = sessionSourceLines[i]
       let rh = resultHandles[i]
       if l.startsWith("gpu rope"):
-        # rope KHÔNG có bản immediate (gpubackend.nim chỉ có sessionRope) -
-        # không thể chạy ngoài session được, nên fallback giữ nguyên input.
-        result.add(indent & "    echo \"[WARN] gpu rope: backend không hỗ trợ session, bỏ qua RoPE (giữ nguyên input)\"")
+        # rope has NO immediate variant (gpubackend.nim only has sessionRope) -
+        # it cannot run outside a session, so the fallback keeps the input.
+        result.add(indent & "    echo \"[WARN] gpu rope: the backend has no session support, skipping RoPE (input unchanged)\"")
         let firstOperand = l.split("gpu rope")[1].split("->")[0].split(",")[0].strip()
         result.add(indent & "    " & rh.varName & " = " & firstOperand)
       else:
@@ -1197,9 +1295,9 @@ proc genSessionBlock(tokens: seq[Token], idx: var int, indent: string,
             fixed = rh.varName & fixed[("var " & rh.varName).len..^1]
           result.add(indent & "    " & fixed)
   else:
-    result.add(indent & "  discard  # không có lệnh gpu nào tối ưu được bằng session trong block này")
+    result.add(indent & "  discard  # no gpu command in this block could be batched in a session")
 
-  # --- Các dòng khác (không phải gpu tối ưu-session được) chạy bình thường ---
+  # --- The other lines (not session-batchable gpu commands) run normally ---
   for l in passthrough:
     if l.startsWith("gpu "):
       for gl in genGpuLine(l):
@@ -1266,11 +1364,14 @@ proc genMicroKernelBlock(tokens: seq[Token], idx: var int, indent: string,
 proc genBlock(tokens: seq[Token], idx: var int, indent: string,
               funcNames: seq[string], localVars: var seq[string]): seq[string] =
   result = @[]
-  if idx >= tokens.len: return
+  let first = nextCode(tokens, idx)
+  if first >= tokens.len:
+    idx = first
+    return
 
-  let blockIndent = tokens[idx].indent
+  let blockIndent = tokens[first].indent
 
-  while idx < tokens.len and tokens[idx].indent >= blockIndent:
+  while idx < tokens.len and (tokens[idx].isTrivia or tokens[idx].indent >= blockIndent):
     let tk = tokens[idx]
 
     if tk.indent > blockIndent:
@@ -1288,15 +1389,15 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
       idx.inc
 
     of "nimimport":
-      # DA duoc gom rieng va emit 1 lan o dau file trong generateNimCode -
-      # bo qua tai day de khong emit trung lap hoac emit sai vi tri (Nim
-      # KHONG cho phep "import" nam trong than proc, chi duoc o top-level
+      # ALREADY collected and emitted once at the top of the file in generateNimCode -
+      # skipped here to avoid emitting it twice or in the wrong place (Nim
+      # does NOT allow "import" inside a proc body, only at the top-level
       # module scope).
       idx.inc
 
     of "print":
       traceDebug("Generating print: " & tk.text)
-      result.add(indent & "echo " & tk.text.replace("print", "").strip())
+      result.add(indent & "echo " & tk.text["print".len..^1].strip())
       idx.inc
 
     of "microkernel":
@@ -1304,10 +1405,17 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
       result.add(genMicroKernelBlock(tokens, idx, indent, blockIndent, localVars))
 
     of "function":
-      let fBase = tk.indent
+      # Top-level functions are emitted by generateNimCode; a nested one is
+      # emitted here as a local proc.
+      let header = tk.text
+      var fnVars = functionParams(header) & @["result"]
+      result.add(indent & "proc " & functionSignature(header) & " =")
       idx.inc
-      while idx < tokens.len and tokens[idx].indent > fBase:
-        idx.inc
+      let body = nextCode(tokens, idx)
+      if body < tokens.len and tokens[body].indent > tk.indent:
+        result.add(genBlock(tokens, idx, indent & "  ", funcNames, fnVars))
+      else:
+        result.add(indent & "  discard")
 
     else:
       let line = tk.text.strip()
@@ -1420,16 +1528,27 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
         result.add(indent & "tranPulse(" & words[3] & ", \"" & words[^1] & "\")")
         idx.inc
 
-      elif line.contains("="):
-        let parts = line.split("=")
-        if parts.len >= 2:
-          let left = parts[0].strip()
-          let right = parts[1..^1].join("=").strip()
-          if left notin localVars:
-            localVars.add(left)
-            result.add(indent & "var " & left & " = " & right)
-          else:
-            result.add(indent & left & " = " & right)
+      elif isTypeSection(line):
+        result.add(genRawBlock(tokens, idx, indent, blockIndent))
+
+      elif isBlockHeader(line):
+        result.add(genHeaderedBlock(tokens, idx, indent, line, blockIndent, funcNames, localVars))
+
+      elif isDeclaration(line):
+        for name in declaredNames(line):
+          if name notin localVars: localVars.add(name)
+        result.add(indent & line)
+        idx.inc
+
+      elif assignTarget(line).len > 0:
+        # First plain "name = expr" declares the variable.
+        let left = assignTarget(line)
+        let right = line[line.find('=') + 1..^1].strip()
+        if left notin localVars:
+          localVars.add(left)
+          result.add(indent & "var " & left & " = " & right)
+        else:
+          result.add(indent & left & " = " & right)
         idx.inc
 
       else:
@@ -1440,26 +1559,45 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
 # --------------------------
 proc generateNimCode(tokens: seq[Token], outFile: string) =
   traceInfo("Generating Nim code for: " & outFile)
-  var funcBodiesLocal = initTable[string, seq[Token]]()
+  # Split the program into top-level type/const declarations, functions (in
+  # source order, so a function may call any function defined above it) and
+  # the remaining top-level statements. Declarations come first in the
+  # output so functions can use the types.
+  var funcHeaders = initOrderedTable[string, string]()
+  var funcBodiesLocal = initOrderedTable[string, seq[Token]]()
+  var declTokens: seq[Token] = @[]
+  var mainTokens: seq[Token] = @[]
   var idx = 0
 
-  # --- tách thân hàm bằng indent ---
+  proc takeBlock(tokens: seq[Token], idx: var int, baseIndent: int): seq[Token] =
+    while idx < tokens.len:
+      let j = nextCode(tokens, idx)
+      if j >= tokens.len or tokens[j].indent <= baseIndent: break
+      while idx <= j:
+        result.add(tokens[idx])
+        idx.inc
+
   while idx < tokens.len:
     let t = tokens[idx]
-    if t.sym == "function":
-      let fname = t.text.strip()
-      let baseIndent = t.indent
-      var body: seq[Token] = @[]
+    if t.sym == "function" and t.indent == 0:
+      let fname = functionName(t.text)
       idx.inc
-      while idx < tokens.len and tokens[idx].indent > baseIndent:
-        body.add(tokens[idx])
-        idx.inc
+      let body = takeBlock(tokens, idx, t.indent)
+      if fname in funcBodiesLocal:
+        traceWarn("Function redefined: " & fname)
+      funcHeaders[fname] = t.text
       funcBodiesLocal[fname] = body
       traceDebug("Found function: " & fname & " with " & $body.len & " body tokens")
+    elif t.indent == 0 and t.sym == "other" and
+        (t.text.isTypeSection or t.text.startsWith("const ")):
+      declTokens.add(t)
+      idx.inc
+      declTokens.add(takeBlock(tokens, idx, t.indent))
     else:
+      mainTokens.add(t)
       idx.inc
 
-  # --- khởi tạo file ---
+  # --- create the file ---
   var nimFile = outFile
   if not nimFile.endsWith(".nim"): nimFile &= ".nim"
   traceInfo("Writing to: " & nimFile)
@@ -1467,11 +1605,11 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
   var code = newSeq[string]()
   code.add("import strutils, sequtils")
   code.add("import bybylang")
-  # THEM MOI: gom TAT CA "import nim \"X\"" tu toan bo tokens (ke ca tu file
-  # .bybylang duoc import long nhau qua resolveImports - cac token nimimport
-  # da duoc giu nguyen xuyen suot qua trinh resolve) - emit 1 LAN DUY NHAT
-  # o dau file, KHONG trung lap, TRUOC moi proc/top-level code (Nim yeu cau
-  # import o module scope, dat cang som cang an toan).
+  # NEW: collects ALL "import nim \"X\"" from every token (including files
+  # imported through resolveImports - the nimimport tokens survive
+  # resolution) - emitted ONCE at the top
+  # of the file, no duplicates, BEFORE any proc/top-level code (Nim requires
+  # imports at module scope, the earlier the safer).
   var nimImportsSeen = initTable[string, bool]()
   for t in tokens:
     if t.sym == "nimimport" and t.text.len > 0 and t.text notin nimImportsSeen:
@@ -1526,17 +1664,24 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
   code.add("  echo \"[TRAN-PULSE] pin \", pin, \" width \", width")
   code.add("")
 
-  # --- thu thập tên hàm ---
+  # --- collect the function names ---
   var funcNames: seq[string] = @[]
   for k, _ in funcBodiesLocal:
     funcNames.add(k)
 
-  # --- 1. Sinh tất cả proc trước ---
+  # --- 1. Top-level type/const declarations ---
+  if declTokens.len > 0:
+    var declVars: seq[string] = @[]
+    var didx = 0
+    code.add("")
+    for l in genBlock(declTokens, didx, "", funcNames, declVars): code.add(l)
+
+  # --- 2. Functions, in source order ---
   traceInfo("Generating " & $funcBodiesLocal.len & " functions")
   for k, v in funcBodiesLocal:
     code.add("")
-    code.add("proc " & k & "() =")
-    var localVars: seq[string] = @[]
+    code.add("proc " & functionSignature(funcHeaders[k]) & " =")
+    var localVars = functionParams(funcHeaders[k]) & @["result"]
     var bidx = 0
     let bodyLines = genBlock(v, bidx, "  ", funcNames, localVars)
     if bodyLines.len == 0:
@@ -1544,13 +1689,13 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
     else:
       for l in bodyLines: code.add(l)
 
-  # --- 2. Sinh top-level code ---
+  # --- 3. Top-level statements ---
   code.add("")
   var topVars: seq[string] = @[]
   var tidx = 0
-  if tokens.len > 0:
+  if mainTokens.len > 0:
     traceInfo("Generating top-level code")
-    let topLines = genBlock(tokens, tidx, "", funcNames, topVars)
+    let topLines = genBlock(mainTokens, tidx, "", funcNames, topVars)
     for l in topLines: code.add(l)
 
   writeFile(nimFile, code.join("\n"))

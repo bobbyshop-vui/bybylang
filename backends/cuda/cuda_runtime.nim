@@ -1,20 +1,20 @@
-# cuda_runtime.nim - Runtime bindings tới CUDA Runtime API (libcudart) + cuBLAS
-# qua dynlib. cuda_driver.nim (Driver API + PTX tay) dùng cho vecop elementwise;
-# module này dùng riêng cho matmul để tận dụng Tensor Core qua cuBLAS thay vì
-# viết tay lệnh PTX `wmma.mma.sync` (rất kén kiến trúc GPU và dễ sai).
+# cuda_runtime.nim - runtime bindings to the CUDA Runtime API (libcudart) + cuBLAS
+# through dynlib. cuda_driver.nim (Driver API + hand-written PTX) handles elementwise vecops;
+# this module is for matmul only, to use Tensor Cores through cuBLAS instead of
+# hand-writing `wmma.mma.sync` PTX (very architecture-specific and error prone).
 #
-# cuBLAS tự chọn kernel Tensor Core khi bật math mode CUBLAS_TENSOR_OP_MATH:
-# trên GPU có Tensor Core (Volta trở lên) cublasSgemm sẽ hạ xuống kernel dùng
-# TF32/FP16 accumulate; trên GPU không có Tensor Core, cuBLAS tự fallback về
-# kernel FP32 CUDA core bình thường -> không cần code riêng cho từng đời GPU.
+# cuBLAS picks Tensor Core kernels when math mode CUBLAS_TENSOR_OP_MATH is on:
+# on GPUs with Tensor Cores (Volta and later) cublasSgemm lowers to kernels with
+# TF32/FP16 accumulation; without Tensor Cores cuBLAS falls back to
+# plain FP32 CUDA-core kernels -> no per-generation code needed.
 #
-# Không phụ thuộc lúc build (dynlib): máy không có libcudart.so/libcublas.so
-# thì cudaRuntimeAvailable() trả về false, gpubackend.nim tự fallback CPU.
+# No build-time dependency (dynlib): without libcudart.so/libcublas.so
+# cudaRuntimeAvailable() returns false and gpubackend.nim falls back to the CPU.
 import std/dynlib
 import std/tables
 import cuda_driver
 
-# Export CudaTensor từ cuda_driver để các module khác dùng được
+# Export CudaTensor from cuda_driver for other modules
 export cuda_driver.CudaTensor
 
 type
@@ -158,7 +158,7 @@ proc debugLog(msg: string) =
 proc cudaMatmulF32R*(a, b: CudaTensor, m, k, n: int): CudaTensor =
   gpuCheck(tryLoadCudart(), "cudaMatmulF32R: libcudart not found")
   gpuCheck(tryLoadCublas(), "cudaMatmulF32R: libcublas not found")
-  gpuCheck(a.dptr != 0 and b.dptr != 0, "cudaMatmulF32R: input tensor rỗng/đã free")
+  gpuCheck(a.dptr != 0 and b.dptr != 0, "cudaMatmulF32R: input tensor empty/freed")
   gpuCheck(a.numel == m * k, "cudaMatmulF32R: a.numel=" & $a.numel & " != m*k=" & $(m*k))
   gpuCheck(b.numel == k * n, "cudaMatmulF32R: b.numel=" & $b.numel & " != k*n=" & $(k*n))
 

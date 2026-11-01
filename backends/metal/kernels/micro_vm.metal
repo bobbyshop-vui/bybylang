@@ -1,9 +1,9 @@
-// micro_vm.metal — full opcode interpreter (Cách A)
-// Hỗ trợ đủ opcode cho Mamba2 SSM / conv1d / RMS+gate 100% GPU.
-// Compile vào cùng library với vecop_matmul.metal (hoặc library riêng rồi link).
+// micro_vm.metal — full opcode interpreter (approach A)
+// Supports every opcode needed for Mamba2 SSM / conv1d / RMS+gate 100% on the GPU.
+// Compiled into the same library as vecop_matmul.metal (or a separate library, then linked).
 //
-// Mỗi thread: private R[16], loop/if stack; đọc bytecode; thực thi op siêu thấp.
-// Threadgroup memory: tgF32[] dùng chung trong 1 dispatch.
+// Each thread: private R[16], loop/if stack; reads bytecode; executes very low-level ops.
+// Threadgroup memory: tgF32[] shared within one dispatch.
 
 #include <metal_stdlib>
 using namespace metal;

@@ -1,6 +1,6 @@
 #version 450
-// GPU gather: dst[id] = src[idx[id]]. Xem gather_kernel.cu (CUDA) - cung
-// công thức, dùng cho permute/concat/split/stack không còn CPU loop.
+// GPU gather: dst[id] = src[idx[id]]. Same formula as gather_kernel.cu (CUDA);
+// used by permute/concat/split/stack so they need no CPU loop.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufSrc { float src[]; };
 layout(std430, binding = 1) readonly buffer BufIdx { int idx[]; };

@@ -1,17 +1,17 @@
 # cuda_driver.nim - Runtime bindings to the CUDA Driver API (libcuda) loaded via dynlib.
-# Không phụ thuộc lúc build: nếu máy không có CUDA/GPU NVIDIA, module này chỉ trả về
-# "không khả dụng" thay vì làm sập chương trình -> cho phép fallback CPU an toàn.
+# No build-time dependency: without CUDA/an NVIDIA GPU this module only reports
+# "unavailable" instead of crashing -> a safe CPU fallback.
 #
-# SỬA SO VỚI BẢN CŨ:
-# - Context/module/stream/function được tạo ĐÚNG 1 LẦN (lazy, tại lần gọi đầu) và
-#   giữ sống suốt vòng đời process, thay vì cuCtxCreate + cuModuleLoadData mỗi lần gọi.
-# - Dùng 1 CUstream không-NULL, tạo 1 lần, dùng lại cho mọi kernel + copy.
-# - Copy H2D/D2H dùng bản Async trên stream đó, chỉ cuStreamSynchronize MỘT LẦN
-#   ở cuối mỗi proc (thay vì đồng bộ ngầm ở từng cuMemcpyHtoD/DtoH).
-# - Host staging buffer dùng pinned memory (cuMemAllocHost) thay vì heap thường,
-#   để tránh CUDA driver phải tự copy sang buffer ẩn trước khi DMA lên GPU.
-# - Device buffer + pinned host buffer đều lấy từ pool theo kích thước (byte),
-#   KHÔNG cuMemAlloc/cuMemFree hay cuMemAllocHost/cuMemFreeHost mỗi lần gọi nữa.
+# CHANGES FROM THE OLD VERSION:
+# - Context/module/stream/functions are created EXACTLY ONCE (lazily, on first use) and
+#   live for the whole process, instead of cuCtxCreate + cuModuleLoadData per call.
+# - One non-NULL CUstream, created once, reused for every kernel + copy.
+# - H2D/D2H copies use the Async variants on that stream, with ONE cuStreamSynchronize
+#   at the end of each proc (instead of the implicit sync of each cuMemcpyHtoD/DtoH).
+# - Host staging buffers use pinned memory (cuMemAllocHost) instead of the normal heap,
+#   so the CUDA driver does not copy into a hidden buffer before DMA to the GPU.
+# - Device buffers and pinned host buffers come from size-keyed pools (bytes),
+#   NO more cuMemAlloc/cuMemFree or cuMemAllocHost/cuMemFreeHost per call.
 import std/dynlib
 import std/os
 import std/tables
@@ -60,11 +60,11 @@ const
   CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK: CUdevice_attribute = 1
 
 # --------------------------------------------------------------------------
-# PTX kernels (tương đương nvcc -ptx cho 4 phép elementwise float32), nằm ở
-# file thật backends/cuda/kernels/vecop.ptx (KHÔNG còn escape-string trong
-# .nim nữa) -- 4 entry point riêng: vecop_add/vecop_sub/vecop_mul/vecop_div,
-# gộp trong cùng 1 module PTX, nạp 1 lần bằng cuModuleLoadData tại runtime,
-# không cần nvcc trên máy chạy.
+# PTX kernels (equivalent to nvcc -ptx for 4 float32 elementwise ops), in
+# the real file backends/cuda/kernels/vecop.ptx (NO escaped string in the
+# .nim any more) -- 4 entry points: vecop_add/vecop_sub/vecop_mul/vecop_div,
+# in one PTX module, loaded once with cuModuleLoadData at runtime,
+# no nvcc needed on the target machine.
 # --------------------------------------------------------------------------
 const ptxSource = staticRead(currentSourcePath().parentDir() / "kernels" / "vecop.ptx")
 
@@ -77,26 +77,26 @@ proc fnNameFor(op: string): string =
   else: "vecop_add"
 
 proc gpuCheck(cond: bool, msg: string) =
-  ## Giống doAssert nhưng raise CatchableError thay vì Defect, để gpubackend.nim
-  ## có thể bắt lỗi và fallback CPU thay vì làm crash chương trình.
+  ## Like doAssert but raises CatchableError instead of Defect, so gpubackend.nim
+  ## can catch it and fall back to the CPU instead of crashing.
   if not cond:
     raise newException(CatchableError, msg)
 
 var lib: CudaLib
 var loaded = false
 
-# ---- State toàn cục, khởi tạo 1 lần (ensureInit), sống tới khi process thoát ----
+# ---- Global state, initialised once (ensureInit), alive until the process exits ----
 var gInitialized = false
 var gCtx: CUcontext
 var gModule: CUmodule
 var gStream: CUstream
 var gFnCache = initTable[string, CUfunction]()
 
-# ---- Pool device memory + pinned host memory, key theo số byte ----
+# ---- Device memory + pinned host memory pools, keyed by byte size ----
 var gDevicePool = initTable[csize_t, seq[CUdeviceptr]]()
 var gHostPool = initTable[csize_t, seq[pointer]]()
 
-# ---- Tối ưu block size theo GPU ----
+# ---- Block size tuned per GPU ----
 var gOptimalBlockSize: uint32 = 256
 var gBlockSizeInitialized = false
 
@@ -119,7 +119,7 @@ proc gridFor(n: int): uint32 =
 proc tryLoad(): bool =
   if loaded: return lib.handle != nil
   loaded = true
-  # Tên thư viện phổ biến trên Linux / Windows.
+  # Common library names on Linux / Windows.
   for name in ["libcuda.so", "libcuda.so.1", "nvcuda.dll"]:
     lib.handle = loadLib(name)
     if lib.handle != nil: break
@@ -148,7 +148,7 @@ proc tryLoad(): bool =
   result = lib.cuInit != nil and lib.cuLaunchKernel != nil
 
 proc cudaAvailable*(): bool =
-  ## Dò xem máy có driver NVIDIA (libcuda) và ít nhất 1 GPU hay không.
+  ## Checks whether the machine has an NVIDIA driver (libcuda) and at least one GPU.
   if not tryLoad(): return false
   if lib.cuInit(0) != 0: return false
   var count: int32 = 0
@@ -156,9 +156,9 @@ proc cudaAvailable*(): bool =
   result = count > 0
 
 proc ensureInit() =
-  ## Tạo context + module PTX + stream ĐÚNG 1 LẦN cho suốt vòng đời process.
-  ## Các lần gọi sau chỉ return ngay - không còn cuCtxCreate/cuModuleLoadData
-  ## lặp lại mỗi phép toán như bản cũ.
+  ## Creates the context + PTX module + stream EXACTLY ONCE for the process lifetime.
+  ## Later calls return immediately - no repeated cuCtxCreate/cuModuleLoadData
+  ## per operation as in the old version.
   if gInitialized: return
   gpuCheck(tryLoad(), "libcuda not found")
   var dev: CUdevice
@@ -183,7 +183,7 @@ proc getStream*(): CUstream =
   result = gStream
 
 proc getFn(name: string): CUfunction =
-  ## Cache CUfunction theo tên - tránh cuModuleGetFunction lặp lại.
+  ## CUfunction cache by name - avoids repeated cuModuleGetFunction.
   if gFnCache.hasKey(name):
     return gFnCache[name]
   var fn: CUfunction
@@ -193,10 +193,10 @@ proc getFn(name: string): CUfunction =
   result = fn
 
 proc getDeviceBuf*(bytes: csize_t): CUdeviceptr =
-  ## Lấy device buffer từ pool nếu có sẵn cùng kích thước, không thì cuMemAlloc.
-  ## Export (*) để cuda_runtime.nim dùng chung 1 pool cho CudaTensor resident
-  ## (matmul resident cũng cấp phát qua đây, thay vì mở pool riêng bằng cudaMalloc,
-  ## để tránh 2 hệ thống pool tách rời cho cùng 1 loại buffer).
+  ## Takes a device buffer of the same size from the pool if available, else cuMemAlloc.
+  ## Exported (*) so cuda_runtime.nim shares one pool for resident CudaTensors
+  ## (resident matmul also allocates here instead of a separate cudaMalloc pool,
+  ## to avoid two separate pools for the same kind of buffer).
   if gDevicePool.hasKey(bytes) and gDevicePool[bytes].len > 0:
     return gDevicePool[bytes].pop()
   var dptr: CUdeviceptr
@@ -204,11 +204,11 @@ proc getDeviceBuf*(bytes: csize_t): CUdeviceptr =
   result = dptr
 
 proc putDeviceBuf*(bytes: csize_t, dptr: CUdeviceptr) =
-  ## Trả buffer về pool để tái sử dụng thay vì cuMemFree ngay.
+  ## Returns the buffer to the pool for reuse instead of cuMemFree right away.
   gDevicePool.mgetOrPut(bytes, @[]).add(dptr)
 
 proc getHostBuf(bytes: csize_t): pointer =
-  ## Lấy pinned host staging buffer từ pool, không thì cuMemAllocHost.
+  ## Takes a pinned host staging buffer from the pool, else cuMemAllocHost.
   if gHostPool.hasKey(bytes) and gHostPool[bytes].len > 0:
     return gHostPool[bytes].pop()
   var p: pointer
@@ -247,8 +247,8 @@ proc freeResident*(t: var CudaTensor) =
 # VECTOR OPERATIONS
 # ============================================================
 proc cudaVecOp*(op: string, a, b: seq[float32]): seq[float32] =
-  ## Chạy phép toán elementwise (add/sub/mul/div) trên GPU NVIDIA qua CUDA Driver API.
-  ## Raise nếu có lỗi bất kỳ, để tầng gọi (gpubackend) fallback về CPU.
+  ## Runs an elementwise op (add/sub/mul/div) on an NVIDIA GPU through the CUDA Driver API.
+  ## Raises on any error so the caller (gpubackend) falls back to the CPU.
   ensureInit()
   let n = a.len
   result = newSeq[float32](n)
@@ -465,12 +465,12 @@ proc cudaLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, e
     cast[pointer](addr rParam), cast[pointer](addr cParam),
     cast[pointer](addr eParam)
   ]
-  # FIX: layernorm_backward_kernel la kernel kieu "1 thread = 1 id doc lap"
-  # (giong OpenCL get_global_id, khong cong tac giua cac thread trong cung block),
-  # khac voi layernorm_kernel (forward) la kieu "1 block = 1 row, nhieu thread cong tac".
-  # Truoc day dung getOptimalBlockSize() (128/256/512 thread/block) khien moi block
-  # chi tinh duoc id trong khoang [0, blockSize) roi GHI DE len nhau -> sai ket qua /
-  # race giua cac block -> CUDA context bi loi ngam -> D2H that bai o lan goi ke tiep.
+  # FIX: layernorm_backward_kernel is a "1 thread = 1 independent id" kernel
+  # (like OpenCL get_global_id, threads in a block do not cooperate),
+  # unlike layernorm_kernel (forward), which is "1 block = 1 row, cooperating threads".
+  # It used getOptimalBlockSize() (128/256/512 threads/block), so each block
+  # computed only ids in [0, blockSize) and they OVERWROTE each other -> wrong results /
+  # races between blocks -> a silently broken CUDA context -> D2H failed on the next call.
   gpuCheck(lib.cuLaunchKernel(fn, uint32(max(rows, cols)), 1, 1, 1, 1, 1, 0, gStream,
                                 addr params[0], nil) == 0, "cuLaunchKernel failed")
   gpuCheck(lib.cuMemcpyDtoHAsync(addr dx[0], dDxBuf, bytesX, gStream) == 0, "D2H failed")

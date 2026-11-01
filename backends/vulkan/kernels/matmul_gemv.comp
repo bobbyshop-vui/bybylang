@@ -1,16 +1,16 @@
 #version 450
-// matmul_gemv.comp - GEMV rieng cho m=1 (mirror matmul_gemv_kernel ben Metal).
-// SUA (BUG DA TIM RA): ban truoc dung subgroupAdd() + gia dinh subgroup
-// size = 32 (dung tren Apple GPU qua Metal simdgroup, NHUNG SAI tren
-// Intel Iris Plus qua Vulkan/MoltenVK - SIMD width goc cua Intel Gen9 la
-// 8 hoac 16, KHONG phai 32). Khi subgroup thuc te < 32, workgroup 32
-// thread bi chia thanh NHIEU subgroup rieng - moi subgroup co
-// gl_SubgroupInvocationID==0 RIENG -> NHIEU thread cung ghi de c[col]
-// (race condition) va moi subgroup chi cong duoc 1 phan K -> ket qua SAI
-// (day chinh la nguyen nhan token rac "!!!!" chi xay ra o Vulkan, khong
-// xay ra o Metal). Fix: KHONG dung subgroupAdd/gia dinh phan cung nua -
-// dung shared memory + tree reduction theo dung local_size_x (32) - luon
-// dung bat ke phan cung report subgroup size bao nhieu.
+// matmul_gemv.comp - GEMV for m=1 (mirror of matmul_gemv_kernel on Metal).
+// FIXED BUG: the previous version used subgroupAdd() and assumed a subgroup
+// size of 32 (true for Apple GPUs through Metal simdgroups, WRONG on
+// Intel Iris Plus through Vulkan/MoltenVK, where the native Gen9 SIMD width is
+// 8 or 16, not 32). With a real subgroup < 32 a 32-thread workgroup
+// is split into SEVERAL subgroups, each with its own
+// gl_SubgroupInvocationID==0 -> SEVERAL threads overwrote c[col]
+// (race condition) and each subgroup summed only part of K -> WRONG results
+// (the cause of the "!!!!" garbage tokens seen only on Vulkan, never
+// on Metal). Fix: no subgroupAdd and no hardware assumption -
+// shared memory + a tree reduction over local_size_x (32), correct
+// whatever subgroup size the hardware reports.
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 layout(std430, binding = 0) readonly buffer BufA { float a[]; };  // [K]
 layout(std430, binding = 1) readonly buffer BufB { float b[]; };  // [K,N]
@@ -21,7 +21,7 @@ shared float sdata[32];
 
 void main() {
     int col = int(gl_WorkGroupID.x);
-    uint lid = gl_LocalInvocationID.x;   // 0..31, LUON duy nhat trong workgroup
+    uint lid = gl_LocalInvocationID.x;   // 0..31, ALWAYS unique within the workgroup
     float sum = 0.0;
     if (col < pc.N) {
         for (int i = int(lid); i < pc.K; i += 32) {
@@ -30,8 +30,8 @@ void main() {
     }
     sdata[lid] = sum;
     barrier();
-    // Tree reduction trong shared memory - dung voi MOI kich thuoc
-    // subgroup phan cung vi khong dua vao subgroupAdd nua.
+    // Tree reduction in shared memory - correct for EVERY hardware
+    // subgroup size because it no longer relies on subgroupAdd.
     for (uint stride = 16u; stride > 0u; stride >>= 1) {
         if (lid < stride) {
             sdata[lid] += sdata[lid + stride];

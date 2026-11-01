@@ -48,8 +48,8 @@ typedef struct {
 
 typedef struct {
     int pc;
-    float r[16];
-    uint32_t u[16];
+    float r[32];
+    uint32_t u[32];
     int sp;
     VmLoop loops[VM_MAX_LOOPS];
     size_t base_f32, base_u8, base_lut, base_in;
@@ -58,9 +58,11 @@ typedef struct {
 } VmThread;
 
 static inline uint32_t op_of(uint32_t w) { return w & 0xFFu; }
-static inline uint32_t a_of(uint32_t w) { return (w >> 8) & 0xFu; }
-static inline uint32_t b_of(uint32_t w) { return (w >> 12) & 0xFu; }
-static inline uint32_t c_of(uint32_t w) { return (w >> 16) & 0xFu; }
+/* 5-bit register fields (32 R[] and 32 U[]), matching pack3 in session_vm.nim
+   and the decoder in jit_vm.nim. */
+static inline uint32_t a_of(uint32_t w) { return (w >> 8) & 0x1Fu; }
+static inline uint32_t b_of(uint32_t w) { return (w >> 13) & 0x1Fu; }
+static inline uint32_t c_of(uint32_t w) { return (w >> 18) & 0x1Fu; }
 
 static int extra_words(uint32_t op) {
     switch (op) {
@@ -233,7 +235,7 @@ int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
             case OP_DIV: t->r[a] = t->r[b] / t->r[c]; break;
             case OP_FMA: {
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
-                uint32_t rc = code[npc++] & 0xFu;
+                uint32_t rc = code[npc++] & 0x1Fu;
                 t->r[a] = fmaf(t->r[b], t->r[c], t->r[rc]);
                 break;
             }

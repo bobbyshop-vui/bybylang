@@ -1,8 +1,8 @@
 #version 450
-// Sinh dropout mask thật trên GPU bằng counter-based xorshift32, cùng công
-// thức với dropout_mask trong dropout_rng_kernel.cu (CUDA) để 2 backend ra
-// cùng phân phối thống kê (không nhất thiết bit-for-bit vì seed derive khác
-// runtime, nhưng cùng thuật toán).
+// Dropout mask generated on the GPU with a counter-based xorshift32, same
+// formula as dropout_mask in dropout_rng_kernel.cu (CUDA) so both backends give
+// the same statistical distribution (not necessarily bit-for-bit, the seed is
+// derived differently at runtime, but the algorithm is the same).
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) writeonly buffer BufMask { float mask[]; };
 layout(push_constant) uniform PC { uint seed; float p; float scale; int n; } pc;

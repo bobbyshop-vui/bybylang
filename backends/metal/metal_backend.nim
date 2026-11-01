@@ -1,4 +1,4 @@
-# metal_backend.nim - Metal GPU backend wrapper (chỉ biên dịch trên macOS).
+# metal_backend.nim - Metal GPU backend wrapper (compiled on macOS only).
 import std/os
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 
@@ -14,9 +14,9 @@ when defined(macosx):
     "\n" & staticRead(metalDir / "kernels" / "matmul_q4_batched.metal") &
     "\n" & staticRead(metalDir / "kernels" / "micro_vm.metal") &
     "\n" & staticRead(metalDir / "kernels" / "q4_dynamic.metal")
-    ## kernel batch M thật cho prefill (matmul_q4_batched_m4_kernel) - xem
-    ## giải thích đầy đủ trong file đó (bug gốc: kernel decode M=1 đọc lại
-    ## toàn bộ weight cho MỖI hàng khi bị gọi với M>1).
+    ## real batch-M kernel for prefill (matmul_q4_batched_m4_kernel) - see
+    ## the full explanation in that file (original bug: the M=1 decode kernel re-read
+    ## all weights for EVERY row when called with M>1).
 
   proc metal_available_c(): cint {.importc: "metal_available", header: "metal_shim.h".}
   proc metal_vecop_c(kernelSrc: cstring, op: cint, a, b: ptr float32, c: ptr float32, n: cint, error_out: ptr cstring): cint
@@ -103,30 +103,30 @@ when defined(macosx):
       raise newException(CatchableError, msg)
 
   # ─────────────────────────────────────────────────────────────────────
-  # CÔNG TẮC BẬT/TẮT MPS - sửa trực tiếp giá trị này để chọn đường matmul.
-    #   bmUseMps    -> luôn dùng MPSMatrixMultiplication (fallback tự động
-    #                  về kernel tay viết nếu máy không hỗ trợ / lỗi).
-    #   bmUseKernel -> luôn dùng kernel tay viết matmul_kernel_t{8,16,32}
-    #                  (bỏ qua MPS hoàn toàn - dùng khi cần so sánh benchmark
-    #                  hoặc nghi ngờ MPS cho kết quả sai trên 1 GPU cụ thể).
+  # MPS ON/OFF SWITCH - edit this value to choose the matmul path.
+    #   bmUseMps    -> always MPSMatrixMultiplication (falls back automatically
+    #                  to the hand-written kernel if unsupported / on error).
+    #   bmUseKernel -> always the hand-written matmul_kernel_t{8,16,32}
+    #                  (skips MPS entirely - for benchmark comparisons
+    #                  or when MPS is suspected of wrong results on a given GPU).
     # ─────────────────────────────────────────────────────────────────────
   type BbMatmulBackend = enum
     bmUseMps, bmUseKernel
 
-  const bbMatmulBackend: BbMatmulBackend = bmUseKernel   # <<< SỬA Ở ĐÂY
-  # SUA: đổi mặc định từ bmUseMps -> bmUseKernel. Đo thực tế trên Iris Plus
-  # 640: MPS chậm HƠN kernel tay viết cho workload decode LLM (16942ms/token
-  # so với ~7000-7800ms/token trước đó). Lý do: mỗi bước decode chỉ nhân
-  # M=1 (1 token) - thực chất là matrix-VECTOR chứ không phải GEMM lớn, mà
-  # MPS được tối ưu cho ma trận lớn/batch lớn. Trên GPU yếu, overhead setup
-  # nội bộ của MPS (chọn thuật toán, validate descriptor...) cho M=1 lớn
-  # hơn cả phần tính toán thật -> phản tác dụng. Vẫn giữ code MPS lại (bật
-  # bmUseMps để so sánh nếu cần, hoặc dùng cho prefill M lớn sau này).
+  const bbMatmulBackend: BbMatmulBackend = bmUseKernel   # <<< EDIT HERE
+  # CHANGED: default bmUseMps -> bmUseKernel. Measured on Iris Plus
+  # 640: MPS is SLOWER than the hand-written kernel for LLM decode (16942ms/token
+  # vs ~7000-7800ms/token before). Reason: each decode step multiplies only
+  # M=1 (one token) - really a matrix-VECTOR product, not a large GEMM, and
+  # MPS is optimised for large matrices/batches. On a weak GPU MPS's internal
+  # setup (algorithm choice, descriptor validation...) for M=1 costs more
+  # than the actual math -> counterproductive. The MPS code stays (set
+  # bmUseMps to compare, or for large-M prefill later).
 
-  var gMpsFailedOnce = false  # SUA: nếu MPS lỗi 1 lần (vd. GPU không hỗ trợ),
-                              # đừng thử lại mỗi token - tốn 1 lần gọi native
-                              # thất bại mỗi bước. Fallback hẳn về kernel tay
-                              # viết cho phần đời còn lại của process.
+  var gMpsFailedOnce = false  # CHANGED: if MPS fails once (e.g. unsupported GPU),
+                              # do not retry every token - each costs a failed
+                              # native call. Fall back to the hand-written
+                              # kernel for the rest of the process.
 
   proc metalMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
     # FIX: Check for empty inputs before GPU allocation
@@ -137,12 +137,12 @@ when defined(macosx):
     result = newSeq[float32](m * n)
     var aVar = a
     var bVar = b
-    # SUA (#3 - dùng MPS): ưu tiên MPSMatrixMultiplication trước - Apple tự
-    # chọn thuật toán tối ưu theo đúng GPU đang chạy, thường nhanh hơn đáng
-    # kể so với matmul_kernel_t{8,16,32} tay viết, và không cần lo threadgroup
-    # limit / tile size gì nữa. Fallback về kernel tay viết (đã có tile động
-    # ở #A) nếu MPS không khả dụng trên máy này hoặc lỗi. Có thể tắt hẳn
-    # bằng cách đổi bbMatmulBackend ở trên thành bmUseKernel.
+    # CHANGED (#3 - use MPS): prefer MPSMatrixMultiplication - Apple picks
+    # the best algorithm for the GPU in use, usually noticeably faster
+    # than the hand-written matmul_kernel_t{8,16,32}, with no threadgroup
+    # limit / tile size concerns. Falls back to the hand-written kernel (with dynamic tiles
+    # from #A) if MPS is unavailable or fails. Can be disabled entirely
+    # by setting bbMatmulBackend above to bmUseKernel.
     if m > 1 and bbMatmulBackend == bmUseMps and not gMpsFailedOnce:
       var err: cstring = nil
       let okMps = metal_matmul_mps_c(addr aVar[0], addr bVar[0], addr result[0], cint(m), cint(k), cint(n), addr err)
@@ -151,7 +151,7 @@ when defined(macosx):
         return
       if err != nil: c_free(err)
       gMpsFailedOnce = true
-      stderr.write("[metal] MPS matmul khong kha dung/loi - chuyen han ve kernel tay viet cho phan con lai cua phien\n")
+      stderr.write("[metal] MPS matmul unavailable/failed - using the hand-written kernel for the rest of the session\n")
     for attempt in 0 ..< 2:
       var err: cstring = nil
       let ok = metal_matmul_c(kMetalKernelSrc.cstring, addr aVar[0], addr bVar[0], addr result[0], cint(m), cint(k), cint(n), addr err)
@@ -169,11 +169,11 @@ when defined(macosx):
   proc metalMatmul2*(a1, b1: seq[float32], m1, k1, n1: int,
                       a2, b2: seq[float32], m2, k2, n2: int):
                       tuple[c1, c2: seq[float32]] =
-    ## Intel iGPU watchdog: backward Linear gộp dW+dX có thể làm một
-    ## command buffer chạy quá lâu.  Một command buffer đã timeout còn làm
-    ## queue cũ bị poisoned, vì vậy retry bắt buộc phải tạo queue mới trước.
-    ## Sau hai lần retry y nguyên, tách theo hàng để giảm thời gian mỗi
-    ## dispatch.  Đây vẫn là GPU path, không rơi sang CPU trong train.
+    ## Intel iGPU watchdog: a backward Linear merging dW+dX can make one
+    ## command buffer run too long.  A timed-out command buffer also
+    ## poisons the old queue, so a retry must create a new queue first.
+    ## After two identical retries, split by rows to shorten each
+    ## dispatch.  This is still the GPU path, training never falls back to the CPU.
     proc tiled(a, b: seq[float32], m, k, n, rowTile: int): seq[float32] =
       result = newSeq[float32](m * n)
       var row = 0
@@ -205,7 +205,7 @@ when defined(macosx):
       stderr.writeLine("[metal] matmul2 that bai (co the timeout), retry " & $(attempt + 1) & "/2")
       discard metal_recover_queue_c()
 
-    stderr.writeLine("[metal] matmul2 retry khong thanh cong -> tach tile GPU nho dan de tranh watchdog")
+    stderr.writeLine("[metal] matmul2 retry failed -> splitting into smaller GPU tiles to avoid the watchdog")
     var lastError = "unknown"
     for rowTile in [16, 8, 4, 2, 1]:
       discard metal_recover_queue_c()
@@ -221,9 +221,9 @@ when defined(macosx):
 
   proc metalMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
                       m, k, n, groupSize, nGroupsPerRow: int): seq[float32] =
-    ## Matmul truc tiep tren weight int4-asymmetric da pack, khong dequant ra
-    ## fp32 tren CPU truoc (xem matmul_q4_kernel trong vecop_matmul.metal va
-    ## quant.nim/dequantizeTensorTransposed cho dinh nghia layout chinh xac).
+    ## Matmul directly on packed int4-asymmetric weights, no fp32 dequant
+    ## on the CPU first (see matmul_q4_kernel in vecop_matmul.metal and
+    ## quant.nim/dequantizeTensorTransposed for the exact layout).
     # FIX: Check for empty inputs before GPU allocation
     if a.len == 0 or wq.len == 0 or scales.len == 0 or zeros.len == 0 or m == 0 or k == 0 or n == 0:
       stderr.writeLine("[metalMatmulQ4] WARNING: empty input detected, fallback to CPU, dims=(" & $m & "," & $k & "," & $n & ")")
@@ -298,8 +298,8 @@ when defined(macosx):
       raise newException(CatchableError, msg)
 
   proc metalPermute*(src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] =
-    ## GIỐNG TORCH: chỉ truyền bảng nhỏ O(rank) (strides+dimsMap) - device tự
-    ## giải mã chỉ số nguồn của từng phần tử, không có mảng chỉ số O(n).
+    ## LIKE TORCH: only a small O(rank) table (strides+dimsMap) is passed - the device
+    ## decodes each element's source index, no O(n) index array.
     let ndim = newStrides.len
     result = newSeq[float32](n)
     var srcVar = src
@@ -390,7 +390,7 @@ when defined(macosx):
   proc metalApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
     if alpha != 0.1'f32 or beta != 1.0'f32:
       raise newException(CatchableError,
-        "metalApflu: kernel Metal hien chi ho tro alpha=0.1, beta=1.0")
+        "metalApflu: the Metal kernel currently only supports alpha=0.1, beta=1.0")
     let n = x.len
     result = newSeq[float32](n)
     var xVar = x
@@ -402,7 +402,7 @@ when defined(macosx):
   proc metalApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float32] =
     if alpha != 0.1'f32 or beta != 1.0'f32:
       raise newException(CatchableError,
-        "metalApfluBackward: kernel Metal hien chi ho tro alpha=0.1, beta=1.0")
+        "metalApfluBackward: the Metal kernel currently only supports alpha=0.1, beta=1.0")
     let n = x.len
     result = newSeq[float32](n)
     var xVar = x; var dyVar = dy
@@ -451,9 +451,9 @@ when defined(macosx):
       raise newException(CatchableError, "metal_attention_fused_backward failed")
     return (dq, dk, dv)
 
-  # === API resident: gộp nhiều op vào 1 MTLCommandBuffer, chỉ commit+wait
-  # 1 lần ở sessionEnd() thay vì mỗi matmul/softmax 1 lần riêng. Dùng cho
-  # decode loop (mỗi token) để giảm overhead dispatch trên iGPU yếu.
+  # === Resident API: batches many ops into one MTLCommandBuffer, commit+wait
+  # only once in sessionEnd() instead of once per matmul/softmax. Used by the
+  # decode loop (per token) to cut dispatch overhead on weak iGPUs.
   type MetalBufferHandle* = pointer
 
   proc metal_session_begin_c(kernelSrc: cstring, error_out: ptr cstring): cint {.importc: "metal_session_begin", header: "metal_shim.h".}
@@ -461,9 +461,9 @@ when defined(macosx):
   proc metal_upload_borrowed_c(data: ptr float32, n: cint): MetalBufferHandle {.importc: "metal_upload_borrowed", header: "metal_shim.h".}
   proc metal_wrap_host_nocopy_c(data: pointer, bytes: csize_t): MetalBufferHandle {.importc: "metal_wrap_host_nocopy", header: "metal_shim.h".}
   proc metal_alloc_scratch_c(n: cint): MetalBufferHandle {.importc: "metal_alloc_scratch", header: "metal_shim.h".}
-  # THÊM MỚI: xem giải thích đầy đủ trong metal_shim.h/metal_shim.m -
-  # MTLHeap để suballocate nhiều buffer cùng vòng đời (KV resident) RẺ
-  # hơn nhiều so với gọi metal_alloc_scratch riêng lẻ hàng nghìn lần.
+  # NEW: see the full explanation in metal_shim.h/metal_shim.m -
+  # an MTLHeap to suballocate many buffers with the same lifetime (resident KV) is MUCH
+  # cheaper than thousands of separate metal_alloc_scratch calls.
   proc metal_alloc_heap_c(bytes: clong): pointer {.importc: "metal_alloc_heap", header: "metal_shim.h".}
   proc metal_alloc_from_heap_c(heap: pointer, n: cint): MetalBufferHandle {.importc: "metal_alloc_from_heap", header: "metal_shim.h".}
   proc metal_free_heap_c(heap: pointer) {.importc: "metal_free_heap", header: "metal_shim.h".}
@@ -498,7 +498,7 @@ when defined(macosx):
   proc metal_session_commit_continue_c(): cint {.importc: "metal_session_commit_continue", header: "metal_shim.h".}
   proc metal_buffer_read_c(h: MetalBufferHandle, outData: ptr float32, n: cint): cint {.importc: "metal_buffer_read", header: "metal_shim.h".}
   proc metal_buffer_free_c(h: MetalBufferHandle) {.importc: "metal_buffer_free", header: "metal_shim.h".}
-  # MỚI THÊM: session hoá 100% - các op còn lại (sqrt/exp/log/pow, apflu,
+  # NEW: 100% sessionised - the remaining ops (sqrt/exp/log/pow, apflu,
   # apflu_backward, layernorm_backward, attention_backward, gather, argmax,
   # compare, dropout_mask, permute, split_slice, concat).
   proc metal_activation_enc_p_c(op: cint, x, y: MetalBufferHandle, n: cint, p: cfloat): cint
@@ -530,10 +530,10 @@ when defined(macosx):
     {.importc: "metal_concat_gather_enc", header: "metal_shim.h".}
 
   proc metalInit*(): bool =
-    ## Gọi ensureMetalInit() tường minh (dispatch_once bên trong - gọi nhiều
-    ## lần vẫn rẻ). PHẢI gọi trước metalUploadBytes/metalSessionUpload nếu
-    ## chưa có metalSessionBegin nào chạy trước đó (đúng case resident-upload
-    ## lúc load model, trước khi vào decode loop).
+    ## Calls ensureMetalInit() explicitly (dispatch_once inside - cheap to call
+    ## repeatedly). MUST be called before metalUploadBytes/metalSessionUpload if
+    ## no metalSessionBegin has run yet (exactly the resident-upload case
+    ## while loading the model, before the decode loop).
     metal_init_c(kMetalKernelSrc.cstring) != 0
 
   proc metalSessionBegin*(): bool =
@@ -543,7 +543,7 @@ when defined(macosx):
     ok
 
   proc metalSessionUpload*(data: seq[float32]): MetalBufferHandle =
-    discard metalInit()  # SUA: an toàn khi gọi resident-upload TRƯỚC session begin đầu tiên
+    discard metalInit()  # CHANGED: safe for a resident upload BEFORE the first session begin
     var d = data
     metal_upload_c(addr d[0], cint(d.len))
 
@@ -558,11 +558,11 @@ when defined(macosx):
     metal_alloc_scratch_c(cint(n))
 
   proc metalAllocHeap*(bytes: int): pointer =
-    ## THÊM MỚI: cấp 1 vùng lớn duy nhất (device-level, phí cố định 1 lần)
-    ## rồi metalAllocFromHeap() suballocate nhiều buffer con RẺ từ đó - dùng
-    ## cho KV resident (xem ensureKvResident trong nim_inference.nim) để
-    ## tránh gọi metalSessionAllocScratch (=1 lượt device alloc riêng) hàng
-    ## nghìn lần lúc khởi động.
+    ## NEW: allocates one large region (device level, one fixed cost)
+    ## and metalAllocFromHeap() suballocates many CHEAP child buffers from it - used
+    ## for the resident KV (see ensureKvResident in nim_inference.nim) to
+    ## avoid thousands of metalSessionAllocScratch calls (= one device allocation each)
+    ## at startup.
     metal_alloc_heap_c(clong(bytes))
 
   proc metalAllocFromHeap*(heap: pointer, n: int): MetalBufferHandle =
@@ -588,8 +588,8 @@ when defined(macosx):
     metal_matmul_mps_nt_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(stride), cint(offset)) != 0
 
   proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool =
-    ## C(m,n) = A(m,k) @ B(n,k)^T - B GIU NGUYEN layout goc [n,k] (khong
-    ## transpose CPU truoc). Dung cho attention decode (K/V-cache).
+    ## C(m,n) = A(m,k) @ B(n,k)^T - B KEEPS its original [n,k] layout (no
+    ## CPU transpose first). Used by attention decode (K/V cache).
     metal_matmul_nt_enc_c(a, b, c, cint(m), cint(k), cint(n)) != 0
 
   proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n, bOffsetBytes: int): bool =
@@ -604,15 +604,15 @@ when defined(macosx):
     metal_upload_bytes_c(unsafeAddr data[0], cint(data.len))
 
   proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle =
-    ## Bản Private-storage của metalSessionUpload - CHỈ dùng cho resident
-    ## weight fp32 (int8/int4-symmetric/tied-embedding qua beResidentUploadFp32)
-    ## mà CPU không đọc/ghi lại sau lúc upload.
+    ## Private-storage variant of metalSessionUpload - ONLY for resident
+    ## fp32 weights (int8/int4-symmetric/tied embedding through beResidentUploadFp32)
+    ## that the CPU never reads/writes after the upload.
     discard metalInit()
     if data.len == 0: return nil
     metal_upload_private_c(unsafeAddr data[0], cint(data.len))
 
   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle =
-    ## Bản Private-storage của metalUploadBytes - dùng cho wq (Q4 packed) resident.
+    ## Private-storage variant of metalUploadBytes - for resident wq (packed Q4).
     discard metalInit()
     if data.len == 0: return nil
     var d = data
@@ -658,15 +658,15 @@ when defined(macosx):
 
   proc metalSessionMatmulQ4BatchedEnc*(a, wq, scales, zeros, c: MetalBufferHandle,
                                         m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool =
-    ## THÊM MỚI: chỉ dùng cho M>1 (prefill) - xem matmul_q4_batched.metal.
+    ## NEW: only for M>1 (prefill) - see matmul_q4_batched.metal.
     metal_matmul_q4_batched_enc_c(a, wq, scales, zeros, c,
       cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow), cint(wqOffset)) != 0
 
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: int): bool =
     metal_copy_into_enc_c(src, dst, cint(srcOffsetElems), cint(dstOffsetElems), cint(n)) != 0
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool =
-    ## Giữ nguyên overload cũ (srcOffsetElems=0) để KHÔNG phải sửa các chỗ gọi
-    ## đã chạy đúng từ trước (vd merge oProj) - tương thích ngược 100%.
+    ## Keeps the old overload (srcOffsetElems=0) so callers that already worked
+    ## (e.g. merge oProj) need no change - 100% backward compatible.
     metalSessionCopyIntoEnc(src, dst, 0, dstOffsetElems, n)
 
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool =
@@ -685,19 +685,19 @@ when defined(macosx):
     metal_attention_fused_enc_c(q, k, v, o, sMatrix, cint(B), cint(H), cint(S), cint(D), cfloat(scale)) != 0
 
   proc metalSessionAttentionDecodeGqaEnc*(q, k, v, o, scores: MetalBufferHandle, H, S, D: int, scale: float32): bool =
-    ## MỚI THÊM: attention decode 1-query/head cho 1 nhóm GQA (xem giải thích
-    ## đầy đủ ở attention_decode_gqa_kernel trong vecop_matmul.metal). Gọi 1
-    ## lần cho mỗi cặp KV-head trong forwardDecode, thay cho vòng lặp thủ công
-    ## matmul+softmax+matmul trước đây - giảm số lệnh encode/token đáng kể.
+    ## NEW: 1-query/head attention decode for one GQA group (see the full explanation
+    ## in attention_decode_gqa_kernel in vecop_matmul.metal). Called once
+    ## per KV-head pair in forwardDecode, replacing the manual
+    ## matmul+softmax+matmul loop - noticeably fewer encodes per token.
     metal_attention_decode_gqa_enc_c(q, k, v, o, scores, cint(H), cint(S), cint(D), cfloat(scale)) != 0
 
   proc metalSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll, o: MetalBufferHandle,
                                                 H, HKV, D, S, maxSeqLen: int): bool =
-    ## THÊM MỚI: attention decode FUSED toàn bộ H head trong 1 dispatch (xem
-    ## attention_decode_all_heads.metal). kAll/vAll PHẢI là buffer LIÊN TỤC
-    ## theo head (offset head hkv = hkv*maxSeqLen*D) - dùng
-    ## kResidentCombined/vResidentCombined bên nim_inference.nim, KHÔNG dùng
-    ## kResident/vResident (32 buffer rời suballocate từ heap).
+    ## NEW: FUSED attention decode for all H heads in one dispatch (see
+    ## attention_decode_all_heads.metal). kAll/vAll MUST be buffers CONTIGUOUS
+    ## per head (offset of head hkv = hkv*maxSeqLen*D) - use
+    ## kResidentCombined/vResidentCombined from nim_inference.nim, NOT
+    ## kResident/vResident (32 separate buffers suballocated from a heap).
     metal_attention_decode_all_heads_enc_c(q, kAll, vAll, o, cint(H), cint(HKV), cint(D),
                                             cint(S), cint(maxSeqLen)) != 0
 
@@ -745,22 +745,22 @@ when defined(macosx):
 
   proc metalGetLastSessionError*(): string =
     $metal_get_last_session_error_c()   ## '$' copy ra Nim string NGAY - an
-    ## toàn dù con trỏ C gốc bị ghi đè ở lần metal_session_end() kế tiếp.
+    ## safe even if the original C pointer is overwritten by the next metal_session_end().
 
   proc metalRecoverQueue*(): bool =
-    ## MOI: goi khi metalSessionEnd() tra ve false - tao lai MTLCommandQueue
-    ## (xem metal_shim.m::metal_recover_queue). Sau khi 1 command buffer
-    ## THAT SU loi (Timeout/StackOverflow/...), queue cu bi "poisoned" va
-    ## MOI buffer sau do se tu dong bi driver tu choi ("Ignored") - khong
-    ## goi ham nay se khien MOI token sau do doc logits RAC (buffer khong
-    ## he duoc GPU thuc thi) ma khong co dau hieu loi nao ro rang.
+    ## NEW: call when metalSessionEnd() returns false - recreates the MTLCommandQueue
+    ## (see metal_shim.m::metal_recover_queue). After a command buffer
+    ## REALLY fails (Timeout/StackOverflow/...), the old queue is "poisoned" and
+    ## EVERY later buffer is rejected by the driver ("Ignored") - without
+    ## this call EVERY later token reads GARBAGE logits (the buffers never
+    ## ran on the GPU) without any clear error.
     metal_recover_queue_c() != 0
 
   proc metalSessionCommitContinue*(): bool =
-    ## MOI: "commitAndContinue" - xem giai thich day du o
-    ## metal_shim.m::metal_session_commit_continue. Day la FIX GOC cho GPU
-    ## Timeout (hoc theo MPSCommandBuffer cua Apple / PyTorch MPS backend),
-    ## thay vi flush-cho-that (cham) hay 1-buffer-khong-lo (dut watchdog).
+    ## NEW: "commitAndContinue" - see the full explanation in
+    ## metal_shim.m::metal_session_commit_continue. This is the ROOT FIX for GPU
+    ## timeouts (following Apple's MPSCommandBuffer / the PyTorch MPS backend),
+    ## instead of a real flush-and-wait (slow) or one huge buffer (watchdog kill).
     metal_session_commit_continue_c() != 0
 
   proc metalSessionRead*(h: MetalBufferHandle, n: int): seq[float32] =
@@ -829,49 +829,49 @@ when not defined(macosx):
 
   proc metalAvailable*(): bool = false
   proc metalVecOp*(op: string, a, b: seq[float32]): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalMatmul2*(a1, b1: seq[float32], m1, k1, n1: int,
                       a2, b2: seq[float32], m2, k2, n2: int):
                       tuple[c1, c2: seq[float32]] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
                        m, k, n, groupSize, nGroupsPerRow: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalActivation*(op: string, x: seq[float32], p: float32 = 0.0'f32): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalGather*(src: seq[float32], idx: seq[int32]): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalArgmaxIndex*(x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalCompare*(a, b: seq[float32], op: int): seq[uint8] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalDropoutMask*(n: int, p: float32, seed: uint32): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalPermute*(src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalSplitSlice*(src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalConcat*(flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq[int32],
                      totalDim, inner, n: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float32] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
-    raise newException(CatchableError, "Metal backend chỉ khả dụng trên macOS")
+    raise newException(CatchableError, "The Metal backend is only available on macOS")
 
 when defined(macosx):
   proc metalDeviceMaxTgThreads*(): cint {.importc: "metal_device_max_tg_threads", header: "metal_shim.h".}

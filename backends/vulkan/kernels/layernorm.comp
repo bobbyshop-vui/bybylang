@@ -1,7 +1,7 @@
 #version 450
-// layernorm.comp - MIRROR CHINH XAC layernorm_kernel (vecop_matmul.metal).
-// Cung co che reduction voi rmsnorm.comp (da proven chay that), chi khac:
-// co tinh mean + var (thay vi chi meanSq), co beta (bias) o buoc cuoi.
+// layernorm.comp - exact mirror of layernorm_kernel (vecop_matmul.metal).
+// Same reduction scheme as rmsnorm.comp (proven on hardware); the differences:
+// it computes mean + variance (instead of only meanSq) and adds beta (bias) at the end.
 #define BB_WG 256
 layout(local_size_x = BB_WG) in;
 layout(std430, binding = 0) readonly buffer BufX     { float x[]; };

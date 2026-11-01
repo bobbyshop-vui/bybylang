@@ -4,37 +4,37 @@
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// matmul_q4.comp - MIRROR 100% ky thuat da DO THAT tren Metal
-// (matmul_q4_kernel_ndst2_paired trong vecop_matmul.metal, xem giai thich
-// day du o do): NDST 8 -> 2 (giam ap luc thanh ghi/shared memory tren GPU
-// yeu Intel Gen9 - da do that tren Iris Plus 640: decode 0.86->1.01 tok/s,
-// prefill 1.6->2.15 tok/s) + doc nibble THEO CAP (k2,k2+1) bang 1 lan doc
-// uint8_t + bitmask thuan, KHONG con nhanh runtime (k&1)==0 nao ca.
+// matmul_q4.comp - mirrors 100% of the techniques MEASURED on Metal
+// (matmul_q4_kernel_ndst2_paired in vecop_matmul.metal, fully explained
+// there): NDST 8 -> 2 (less register/shared-memory pressure on weak
+// Intel Gen9 GPUs - measured on Iris Plus 640: decode 0.86->1.01 tok/s,
+// prefill 1.6->2.15 tok/s) + nibbles read IN PAIRS (k2,k2+1) with one
+// uint8_t read + plain bitmasks, no runtime (k&1)==0 branch at all.
 //
-// CHUA CHAY THU TREN GPU VULKAN THAT (khong co may Vulkan de test khi
-// viet ban nay) - BAT BUOC tu do lai truoc khi dung cho sinh token that.
-// Neu sai/cham hon, ban cu (NDST=8, khong pairing) van con trong lich su
-// git - quay lai duoc ngay.
+// NOT YET RUN ON A REAL VULKAN GPU (no Vulkan machine to test on when
+// this was written) - measure it before using it for real token generation.
+// If it is wrong/slower, the old version (NDST=8, no pairing) is still in
+// git history and can be restored right away.
 //
-// SUA BUG THAT PHAT HIEN THEM (co san TU TRUOC, KHONG lien quan gi toi
-// thay doi NDST/pairing lan nay): local_size_x=128 nhung vong lap k cu
-// hardcode "k += 32" - nghia la lane 32 bat dau tai k=32 buoc 32, TRUNG
-// hoan toan voi lane 0 o vong lap THU 2 cua no (k=32) - k=32 bi CONG 2
-// LAN (mot lan vao sdata[rr][0], mot lan vao sdata[rr][32]) roi tree-
-// reduction cong ca 2 slot do lai -> KET QUA SAI (bi dem thua), khong
-// phai crash nen rat de bi bo sot khi test bang mat (chi sai so hoc, van
-// sinh ra text "co ve hop ly" nhung logits sai). FIX: doi "k += 32" thanh
-// "k += WG_SIZE" (128, dung bang local_size_x that su) - moi lane trong
-// workgroup gio phu dung 1 tap k RIENG BIET, khong con chong lan.
+// FIXED A REAL BUG FOUND ALONG THE WAY (it predates and is UNRELATED to
+// the NDST/pairing change): local_size_x=128 but the old k loop
+// hardcoded "k += 32" - lane 32 started at k=32 with step 32, EXACTLY
+// overlapping lane 0 on its SECOND iteration (k=32) - k=32 was ADDED
+// TWICE (once into sdata[rr][0], once into sdata[rr][32]) and the tree
+// reduction added both slots -> WRONG RESULTS (double counted), not a
+// crash, so easy to miss when checking by eye (only numerically wrong,
+// "plausible" text with wrong logits). FIX: "k += 32" became
+// "k += WG_SIZE" (128, the real local_size_x) - every lane in the
+// workgroup now covers its OWN set of k, no more overlap.
 //
 // Bien dich: glslangValidator -V matmul_q4.comp -o matmul_q4.spv
 //        hoac: glslc matmul_q4.comp -o matmul_q4.spv
 
 #define MMQ4_NDST 2
-// SUA: 8 -> 2 (mirror N_R0_Q4_K=2 cua ggml + ket qua do that ben Metal -
-// xem giai thich day du o vecop_matmul.metal). PHAI dong bo voi
-// const MMQ4_NDST trong vulkan_driver.nim (2 noi phai khop nhau, khong
-// thi rowBlocks dispatch sai).
+// CHANGED: 8 -> 2 (mirrors ggml's N_R0_Q4_K=2 + the Metal measurements -
+// fully explained in vecop_matmul.metal). MUST match
+// const MMQ4_NDST in vulkan_driver.nim (the two must agree,
+// otherwise rowBlocks are dispatched wrong).
 
 #define WG_SIZE 128
 layout(local_size_x = WG_SIZE, local_size_y = 1, local_size_z = 1) in;
@@ -54,11 +54,11 @@ layout(push_constant) uniform PushConsts {
     int wqOff;          // byte position of the packed weights inside wq
 } pc;
 
-// shared memory cho tree reduction - NDST nho (2) -> mang nay gio RAT nho
-// (2*128*4 byte = 1KB, so voi 8*128*4=4KB ban cu) - dung y "giam ap luc
-// bo nho on-chip" giong thay doi ben Metal (o do la thanh ghi, o day la
-// shared memory, nhung cung 1 nguyen ly: NDST nho -> it tai nguyen
-// on-chip/workgroup hon -> occupancy tot hon tren GPU yeu).
+// shared memory for the tree reduction - small NDST (2) -> this array is now TINY
+// (2*128*4 bytes = 1KB vs 8*128*4=4KB before) - same "less on-chip
+// memory pressure" idea as the Metal change (registers there, shared
+// memory here, same principle: smaller NDST -> fewer on-chip
+// resources per workgroup -> better occupancy on weak GPUs).
 shared float sdata[MMQ4_NDST][WG_SIZE];
 
 void main() {
@@ -66,7 +66,7 @@ void main() {
     int m = int(gl_WorkGroupID.y);
     if (m >= pc.M) return;
     int rowBlock = int(gl_WorkGroupID.x);
-    uint lid = gl_LocalInvocationID.x;   // 0..WG_SIZE-1, duy nhat trong toan bo workgroup
+    uint lid = gl_LocalInvocationID.x;   // 0..WG_SIZE-1, unique within the whole workgroup
 
     int bytesPerRow = (pc.K + 1) / 2;
     int n0 = rowBlock * MMQ4_NDST;
@@ -85,8 +85,8 @@ void main() {
     float zpCache[MMQ4_NDST];
     for (int rr = 0; rr < MMQ4_NDST; ++rr) curGroup[rr] = -1;
 
-    // groupSize duoc gia dinh CHAN (dung voi 32/64/128/256 pho bien) de k2
-    // va k2+1 luon cung 1 group - xem giai thich chi tiet o ban Metal.
+    // groupSize is assumed EVEN (true for the usual 32/64/128/256) so k2
+    // and k2+1 are always in the same group - see the Metal version for details.
     for (int k2 = int(lid) * 2; k2 < pc.K; k2 += WG_SIZE * 2) {
         float aVal0 = a[m * pc.K + k2];
         bool hasK1 = (k2 + 1) < pc.K;
@@ -114,9 +114,9 @@ void main() {
         sdata[rr][lid] = partial[rr];
     }
     barrier();
-    // Tree reduction chuan tren toan bo WG_SIZE thread cua WORKGROUP -
-    // dung voi MOI kich thuoc subgroup phan cung (khong dua vao
-    // subgroupAdd/gl_SubgroupInvocationID - xem giai thich o dau file).
+    // Standard tree reduction over all WG_SIZE threads of the WORKGROUP -
+    // correct for EVERY hardware subgroup size (no reliance on
+    // subgroupAdd/gl_SubgroupInvocationID - see the top of the file).
     for (uint stride = uint(WG_SIZE) / 2u; stride > 0u; stride >>= 1) {
         if (lid < stride) {
             for (int rr = 0; rr < MMQ4_NDST; ++rr) {

@@ -27,6 +27,9 @@ nim c -d:release -o:bybylang bybylang.nim
 - `import name` or `import "path/name.bybylang"` — recursive import, `.bybylang` extension auto-appended, cycle-protected via absolute path.
 - `print <expr>` → generates `echo <expr>`.
 - `function NAME` opens a definition; the body is whatever's indented deeper than the `function` line (same dedent rule as `if/while/for`), no closing marker needed. Invoke it with `call NAME` or just a line containing only `NAME`.
+- `function NAME(a: int, b = 2.0): T {.pragma.}` declares parameters, a return type and pragmas exactly as a Nim `proc` header; assign `result` or use `return`. Functions are emitted in source order before the top-level statements, so a function can call those defined above it but cannot read top-level variables: pass them as parameters. Top-level `type` sections and `const` lines are emitted before the functions.
+- The first plain `name = expr` declares `var name`; later ones assign. Field, index and compound assignments (`a.b = x`, `a[i] = x`, `x += 1`) and `var`/`let`/`const` lines are passed to Nim unchanged.
+- Besides `if/elif/else/while/for`, the Nim block statements `case`/`of`, `try`/`except`/`finally`, `when`, `block` and `defer` nest by indentation; a `type` section is copied to Nim verbatim. Blank lines and comments never end a block.
 - `if cond:` / `elif cond:` / `else:` / `while cond:` / `for x in range(a, b):` — translated directly to the equivalent Nim construct, arbitrarily nestable.
 - `mode is N` (N = 1..4) → prints "Mode 1: Low-level" / "Mode 2: Mid-level" / "Mode 3: High-level" / "Mode 4: Web-level" (any other N → "Unknown mode").
 

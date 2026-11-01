@@ -1,50 +1,50 @@
 ## jit_vm.nim — JIT bytecode theo HotSpot + tinygrad MetalCompiler
 ##
-## Pipeline (đúng tài liệu bạn gửi):
+## Pipeline:
 ##
 ##   Bytecode (.bvm / VmProgram)
 ##        │
-##        ├─► Interpreter (micro_vm_kernel) + đếm hot
+##        ├─► Interpreter (micro_vm_kernel) + hot counter
 ##        │
-##        └─► khi hot ≥ threshold
+##        └─► once hot ≥ threshold
 ##                 ├─► lower bytecode → Metal source (string)
 ##                 ├─► Metal compile (newLibraryWithSource / MTLCompiler)
-##                 ├─► code cache (key = hash program + meta)
-##                 └─► lần sau: dispatch kernel đã JIT, bỏ interpreter
+##                 ├─► code cache (key = program hash + meta)
+##                 └─► next time: dispatch the JIT kernel, skip the interpreter
 ##
-## Kernel cũ (matmul_q4, vecop, ...) GIỮ NGUYÊN — path nóng production.
-## JIT chỉ cho program micro-VM / logic custom.
+## The existing kernels (matmul_q4, vecop, ...) are UNCHANGED — the production hot path.
+## JIT is only for micro-VM programs / custom logic.
 
 import std/[tables, strutils, strformat, times, os, pegs, hashes]
 import ./session_vm
 when defined(macosx):
   import ./session_vm_dispatch
-  # backend GPU sống ở vendor/bybylang/gpubackend (cùng package bybylang)
+  # the GPU backend lives in vendor/bybylang/gpubackend (same bybylang package)
   import ../gpubackend as byby
 
-# ── Cấu hình tier (HotSpot-style) ────────────────────────────
+# ── Tier configuration (HotSpot-style) ────────────────────────────
 
 type
   JitTier* = enum
-    tierInterpret = 0  ## chỉ micro_vm
-    tierProfile   = 1  ## interpret + đếm
-    tierCompiled  = 2  ## đã có Metal pipeline từ JIT
+    tierInterpret = 0  ## micro_vm only
+    tierProfile   = 1  ## interpret + count
+    tierCompiled  = 2  ## has a Metal pipeline from the JIT
 
   JitConfig* = object
-    hotThreshold*: int     ## số lần chạy trước khi JIT (mặc định 10)
+    hotThreshold*: int     ## runs before JIT (default 10)
     enableMetalJit*: bool  ## compile ra Metal source
     enableVulkanJit*: bool ## compile ra GLSL source (Vulkan)
-    enableCpuJit*: bool    ## (dự phòng) LLVM ORC — chưa nối
+    enableCpuJit*: bool    ## (reserved) LLVM ORC — not wired yet
     maxCacheEntries*: int
 
   CompiledEntry* = object
     tier*: JitTier
     hitCount*: int
-    metalSource*: string   ## source đã lower (debug / tái compile)
-    glslSource*: string    ## GLSL source đã lower (Vulkan path)
-    kernelName*: string    ## tên trong library sau JIT
+    metalSource*: string   ## lowered source (debug / recompile)
+    glslSource*: string    ## lowered GLSL source (Vulkan path)
+    kernelName*: string    ## name in the library after JIT
     compiledAt*: float
-    ## pipeline handle thật nằm phía C/Metal; Nim giữ tên + key
+    ## the real pipeline handle lives on the C/Metal side; Nim keeps the name + key
 
   JitCache* = object
     cfg*: JitConfig
@@ -63,24 +63,24 @@ proc initJitCache*(cfg = defaultJitConfig()): JitCache =
   JitCache(cfg: cfg, entries: initTable[string, CompiledEntry]())
 
 # ── Lower bytecode → Metal source ────────────────────────────
-## KHÔNG còn vòng for/while nào trên host: bộ giải mã chạy bằng đệ quy đuôi.
-## (Sinh TEXT Metal bắt buộc nằm ở host - GPU không tự viết source cho chính nó -
-## nhưng đó là xử lý chuỗi, không phải phép tính số. Mọi phép tính số (hash...)
-## đã chuyển sang micro-kernel, xem programKey.)
-## Kernel cũ sinh ra Y HỆT như trước (đã diff với bản gốc).
+## NO for/while loop on the host: the decoder runs by tail recursion.
+## (Generating Metal TEXT has to happen on the host - the GPU cannot write its own source -
+## but that is string processing, not arithmetic. All arithmetic (hashing...)
+## moved to a micro-kernel, see programKey.)
+## The existing kernels are generated EXACTLY as before (diffed against the original).
 
 type LowerState = object
   body: seq[string]
   pc, loopDepth, indent: int
   usesU, usesIn: bool
   glsl: bool
-  od: bool              ## dung op one-dispatch (persistent kernel) -> kernel co prologue rieng
-  vtgModes: seq[uint32] ## stack mode cua cac khoi OP_VTG_BEGIN dang mo
+  od: bool              ## uses one-dispatch ops (persistent kernel) -> the kernel has its own prologue
+  vtgModes: seq[uint32] ## mode stack of the open OP_VTG_BEGIN blocks
 
 proc ind(st: LowerState): string = "  ".repeat(st.indent)
 
 proc imm(st: var LowerState; p: VmProgram): uint32 =
-  ## Đọc word toán hạng kế tiếp (0 nếu hết program) và nhảy qua nó.
+  ## Reads the next operand word (0 past the end of the program) and skips it.
   if st.pc < p.words.len:
     result = p.words[st.pc]
     inc st.pc
@@ -174,7 +174,7 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.body.add st.ind() & &"R[{a}] = (R[{b}] < R[{c}]) ? 1.0f : 0.0f;"
   of OP_IF_BEGIN:
     st.body.add st.ind() & &"if (R[{a}] != 0.0f) {{"
-    inc st.loopDepth   # dùng chung bộ đếm đóng-ngoặc với FOR (đủ vì chỉ cần biết còn khối nào chưa đóng ở cuối hàm)
+    inc st.loopDepth   # shares the bracket counter with FOR (enough: we only need to know whether a block is still open at the end)
     inc st.indent
   of OP_IF_END:
     if st.loopDepth > 0:
@@ -301,7 +301,7 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     let ctrl = st.imm(p)
     st.od = true
     if st.glsl:
-      st.body.add st.ind() & "/* OP_GRID_BARRIER chua ho tro GLSL */ return;"
+      st.body.add st.ind() & "/* OP_GRID_BARRIER is not supported in GLSL yet */ return;"
     else:
       st.body.add st.ind() & "{"
       st.body.add st.ind() & &"  device atomic_uint* gbc = (device atomic_uint*)((device uint*)memF32_ + {ctrl}u);"
@@ -355,8 +355,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.od = true
     st.vtgModes.add a
     if a == 1:
-      # V=32 < tgs: moi TG vat ly chay tgs/32 threadgroup ao song song (sub), moi sub 1 vung tgF32 rieng.
-      # So vong LAP CO DINH (dong deu moi TG) de cac barrier ben trong khong lech.
+      # V=32 < tgs: each physical TG runs tgs/32 virtual threadgroups in parallel (sub), each sub with its own tgF32 region.
+      # FIXED loop count (uniform across the TG) so the barriers inside stay aligned.
       st.body.add st.ind() & "{"
       st.body.add st.ind() & &"  const uint vSubs = gTgs / 32u;"
       st.body.add st.ind() & "  const uint vSub = gLid / 32u;"
@@ -382,7 +382,7 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & "  uint U[32]; for (int i=0;i<32;++i) U[i]=0u;"
       st.indent += 1
       if a == 2:
-        # mode guard: chi chay than lenh neu tid < NT (than KHONG duoc chua barrier_tg)
+        # mode guard: run the body only if tid < NT (the body must NOT contain barrier_tg)
         st.body.add st.ind() & &"if (tid < {prm}u) {{"
         st.indent += 1
   of OP_VTG_END:
@@ -403,13 +403,13 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.body.add st.ind() & &"/* unknown op {op} */ return;"
 
 proc lowerAll(st: var LowerState; p: VmProgram) =
-  ## đệ quy đuôi thay cho `while pc < n`
+  ## tail recursion instead of `while pc < n`
   if st.pc >= p.words.len: return
   st.lowerStep(p)
   st.lowerAll(p)
 
 proc closeBlocks(st: var LowerState) =
-  ## đóng nốt các khối FOR/IF còn mở (thay cho `while loopDepth > 0`)
+  ## closes the remaining open FOR/IF blocks (instead of `while loopDepth > 0`)
   if st.loopDepth <= 0: return
   dec st.indent
   dec st.loopDepth
@@ -417,14 +417,14 @@ proc closeBlocks(st: var LowerState) =
   st.closeBlocks()
 
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
-  ## Sinh 1 kernel Metal từ bytecode. Mọi thread: tid → R0.
+  ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
   var st = LowerState(indent: 2)
   st.lowerAll(p)
   st.closeBlocks()
   if st.od:
     ## ── ONE-DISPATCH persistent kernel ───────────────────────────────────
-    ## Ten goc *_ giu nguyen buffer; memF32/memU8/lut/inF32 la con tro CO THE doi base
-    ## (OP_BASE_*). tid/lid/tgid ben trong khoi VTG bi che (shadow) boi gia tri AO.
+    ## The original *_ names keep the buffers; memF32/memU8/lut/inF32 are pointers whose base MAY change
+    ## (OP_BASE_*). tid/lid/tgid inside a VTG block are shadowed by the VIRTUAL values.
     let hdr = @["  device float* memF32 = memF32_;",
                 "  device const uchar* memU8 = memU8_;",
                 "  device const float* lut = lut_;",
@@ -458,8 +458,8 @@ kernel void """ & kernelName & """(
 """ & hdr.join("\n") & "\n" & st.body.join("\n") & """
 }
 """
-  # Khai báo U[]/inF32 chỉ khi program THẬT SỰ dùng (cờ đặt ngay lúc giải mã,
-  # nên không cần pre-scan riêng) -> kernel cũ không đổi một ký tự.
+  # U[]/inF32 are declared only when the program REALLY uses them (flag set while decoding,
+  # so no separate pre-scan) -> the existing kernels do not change by a single character.
   let uDecl = if st.usesU:
       @["  uint U[32];", "  for (int i=0;i<32;++i) U[i]=0u;"]
     else: newSeq[string]()
@@ -540,16 +540,16 @@ proc lowerBytecodeToGlslCached*(p: VmProgram; kernelName: string): string =
   result = lowerBytecodeToGlsl(p, kernelName)
   gGlslByKernel[kernelName] = result
 
-# ── Key program: hash chạy bằng MICRO-KERNEL trên GPU ────────
-## Trước đây: `for w in p.words: h = h !& hash(w)` trên CPU. Giờ: 1 program
-## bytecode (buildHashProgram) có FOR_BEGIN/END chạy trên GPU, đọc byte của
-## program, tích luỹ 2 hash uint32 độc lập bằng thanh ghi U[] -> key 64-bit.
+# ── Program key: hash computed by a MICRO-KERNEL on the GPU ────────
+## Before: `for w in p.words: h = h !& hash(w)` on the CPU. Now: a bytecode
+## program (buildHashProgram) with FOR_BEGIN/END runs on the GPU, reads the program
+## bytes and accumulates 2 independent uint32 hashes in U[] registers -> a 64-bit key.
 ##
-## Layout buffer (cùng 1 buffer float32 bind vào slot 1, 2 và 3):
-##   memF32[0]    = số byte của program
-##   memF32[1..4] = OUT: lo16(h1), hi16(h2)... (mỗi uint32 tách 2 nửa 16-bit vì
-##                  R[] là float32 chỉ giữ chính xác số nguyên <= 2^24)
-##   byte offset 32 trở đi (= float 8..) = các word của program (memU8 view)
+## Buffer layout (the same float32 buffer bound to slots 1, 2 and 3):
+##   memF32[0]    = program size in bytes
+##   memF32[1..4] = OUT: lo16(h1), hi16(h2)... (each uint32 split into two 16-bit halves because
+##                  R[] is float32 and holds integers exactly only up to 2^24)
+##   from byte offset 32 (= float 8..) = the program words (memU8 view)
 
 const
   HashHeaderFloats = 8                ## 32 byte header
@@ -557,10 +557,10 @@ const
 
 proc buildHashProgram*(): VmProgram =
   var p: VmProgram
-  p.emitLoadF32(1, 0, 0)                  # R1 = nBytes   (chỉ tid 0 chạy)
+  p.emitLoadF32(1, 0, 0)                  # R1 = nBytes   (tid 0 only)
   p.emitUConst(0, 0x811C9DC5'u32)         # U0 = h1
   p.emitUConst(1, 0x9E3779B1'u32)         # U1 = h2
-  p.emitUConst(2, uint32(HashHeaderFloats * 4))  # U2 = con trỏ byte
+  p.emitUConst(2, uint32(HashHeaderFloats * 4))  # U2 = byte pointer
   p.emitForBegin(1)                       # for _ in 0 ..< nBytes   (GPU)
   p.emitULoadU8(3, 2, 0)                  #   U3 = memU8[U2]
   p.emitUAdd(0, 0, 3)
@@ -569,7 +569,7 @@ proc buildHashProgram*(): VmProgram =
   p.emitUMulK(1, 1, 0x85EBCA6B'u32)       #   h2 = (h2 + byte) * murmur c
   p.emitUAddK(2, 2, 1)                    #   U2 += 1
   p.emitForEnd()
-  # ghi 2 hash dưới dạng 4 nửa 16-bit (float chính xác)
+  # write the 2 hashes as 4 16-bit halves (exact in float)
   p.emitUAndK(4, 0, 0xFFFF'u32); p.emitUToR(2, 4); p.emitStoreF32(2, 0, 1)
   p.emitUShrK(4, 0, 16'u32);     p.emitUToR(2, 4); p.emitStoreF32(2, 0, 2)
   p.emitUAndK(4, 1, 0xFFFF'u32); p.emitUToR(2, 4); p.emitStoreF32(2, 0, 3)
@@ -580,20 +580,20 @@ proc buildHashProgram*(): VmProgram =
 var gHashKernelReady = false
 
 var gWordsKey = initTable[seq[uint32], string]()
-  ## key da tinh theo NOI DUNG bytecode (khop chinh xac tung word) -> moi chuong trinh chi hash MOT lan.
+  ## key computed from the bytecode CONTENT (exact word match) -> each program is hashed only ONCE.
 
 proc fallbackWordsKey(words: seq[uint32]): string =
-  ## Key KHONG can GPU/session: dung khi DANG trong session (Metal khong cho session long nhau nen
-  ## khong the mo session rieng de hash tren GPU). hash cua std + do dai; tien to 'S' de phan biet.
+  ## Key that needs NO GPU/session: used while INSIDE a session (Metal does not allow nested sessions,
+  ## so a separate session for GPU hashing is impossible). std hash + length; prefix 'S' to tell it apart.
   "S" & toHex(uint64(words.len), 4) & toHex(cast[uint64](hash(words)), 16)
 
 proc sanitizeTag(tag: string): string =
-  ## chỉ giữ [A-Za-z0-9_], ký tự khác -> '_' (peg, không vòng lặp tường minh)
+  ## keeps only [A-Za-z0-9_], other characters -> '_' (peg, no explicit loop)
   tag.replace(peg"[^A-Za-z0-9_]", "_")
 
 when defined(macosx):
-  var jitHashBackend* = byby.gbAuto   ## đổi nếu cần backend khác gbAuto
-  # tryMetalJitCompile khai báo ở dưới; forward declare để dùng cho hash kernel
+  var jitHashBackend* = byby.gbAuto   ## change if another backend than gbAuto is needed
+  # tryMetalJitCompile is declared below; forward-declared for the hash kernel
   proc tryMetalJitCompile*(source, kernelName: string): bool
 
   proc gpuHashWords(words: seq[uint32]): string =
@@ -603,15 +603,15 @@ when defined(macosx):
         raise newException(CatchableError, "jit_vm: compile hash micro-kernel THAT BAI")
       gHashKernelReady = true
     let nBytes = words.len * 4
-    # memcpy (không phải vòng tính toán): word -> vùng float32 sau header
+    # memcpy (not an arithmetic loop): words -> the float32 region after the header
     var host = newSeq[float32](HashHeaderFloats + words.len)
     host[0] = float32(nBytes)
     if words.len > 0:
       copyMem(addr host[HashHeaderFloats], unsafeAddr words[0], nBytes)
     let be = jitHashBackend
     if not byby.sessionBegin(be):
-      # DANG trong session (Metal tu choi session long nhau): khong the hash tren GPU luc nay.
-      # Dung key fallback (khong can GPU) thay vi raise - ket qua duoc nho lai theo noi dung program.
+      # INSIDE a session (Metal refuses nested sessions): cannot hash on the GPU now.
+      # Use the fallback key (no GPU needed) instead of raising - the result is memoized by program content.
       return fallbackWordsKey(words)
     let h = byby.sessionUploadPrivate(be, host)
     var ok = sessionPipeline(HashKernelName)
@@ -623,15 +623,15 @@ when defined(macosx):
       raise newException(CatchableError, "jit_vm: dispatch hash micro-kernel that bai")
     let o = byby.sessionRead(be, h, HashHeaderFloats)
     if o.len < 5:
-      raise newException(CatchableError, "jit_vm: doc ket qua hash tu GPU that bai")
+      raise newException(CatchableError, "jit_vm: reading the hash result from the GPU failed")
     let h1 = uint64(uint32(o[1])) or (uint64(uint32(o[2])) shl 16)
     let h2 = uint64(uint32(o[3])) or (uint64(uint32(o[4])) shl 16)
     result = toHex((h2 shl 32) or h1, 16)
 else:
   proc gpuHashWords(words: seq[uint32]): string =
-    ## Build ngoài macOS (chỉ để nim check/test bytecode): KHÔNG có GPU nên không
-    ## hash được. Key O(1) (độ dài + word đầu/cuối), không vòng lặp. An toàn vì
-    ## nhánh này không bao giờ compile/dispatch kernel (tryMetalJitCompile = false).
+    ## Builds outside macOS (only for nim check/bytecode tests): NO GPU, so no
+    ## hashing. O(1) key (length + first/last word), no loop. Safe because
+    ## this branch never compiles/dispatches a kernel (tryMetalJitCompile = false).
     let first = if words.len > 0: words[0] else: 0'u32
     let last = if words.len > 0: words[words.len - 1] else: 0'u32
     toHex(uint64(words.len), 8) & toHex(uint64(first), 8)[^4 .. ^1] & toHex(uint64(last), 8)[^4 .. ^1]
@@ -639,12 +639,12 @@ else:
 var gJitDeviceReady = false
 
 proc ensureJitDeviceReady*(): bool =
-  ## Khoi tao device GPU (Metal: gDevice/gQueue) truoc moi JIT/hash kernel. An toan goi nhieu lan.
-  ## Dung API co san: sessionBegin -> metalSessionBegin -> ensureMetalInit (dispatch_once).
-  ## Neu sessionBegin tra false vi DANG co session mo thi device chac chan da init -> coi la san sang.
+  ## Initialises the GPU device (Metal: gDevice/gQueue) before any JIT/hash kernel. Safe to call repeatedly.
+  ## Uses the existing API: sessionBegin -> metalSessionBegin -> ensureMetalInit (dispatch_once).
+  ## If sessionBegin returns false because a session IS open, the device is surely initialised -> ready.
   when defined(macosx):
     if not gJitDeviceReady:
-      gJitDeviceReady = true     # chi thu 1 lan (false = dang trong session => device da init)
+      gJitDeviceReady = true     # tried only once (false = inside a session => device already initialised)
       if byby.sessionBegin(byby.gbAuto):
         discard byby.sessionEnd(byby.gbAuto)
     result = true
@@ -652,18 +652,18 @@ proc ensureJitDeviceReady*(): bool =
     result = true
 
 proc programKey*(p: VmProgram; tag = ""): string =
-  ## Hash (GPU micro-kernel) + tag. Tên phải là identifier Metal hợp lệ.
+  ## Hash (GPU micro-kernel) + tag. The name must be a valid Metal identifier.
   result = gWordsKey.getOrDefault(p.words, "")
   if result.len == 0:
-    result = gpuHashWords(p.words)       # GPU (mo session rieng) - neu dang trong session: key fallback
+    result = gpuHashWords(p.words)       # GPU (opens its own session) - inside a session: fallback key
     gWordsKey[p.words] = result
   if tag.len > 0:
     result.add '_'
     result.add sanitizeTag(tag)
 
 proc programKeyNoSession*(p: VmProgram; tag = ""): string =
-  ## NHU programKey nhung KHONG BAO GIO mo session (an toan khi DANG trong session, vd encodeMicroVm).
-  ## Chuong trinh da hash tren GPU truoc do thi dung lai key do (cung ten kernel); chua co thi dung fallback.
+  ## LIKE programKey but NEVER opens a session (safe INSIDE a session, e.g. encodeMicroVm).
+  ## A program hashed on the GPU before reuses that key (same kernel name); otherwise the fallback.
   result = gWordsKey.getOrDefault(p.words, "")
   if result.len == 0:
     result = fallbackWordsKey(p.words)
@@ -672,13 +672,13 @@ proc programKeyNoSession*(p: VmProgram; tag = ""): string =
     result.add '_'
     result.add sanitizeTag(tag)
 
-# ── Compile hook (Metal) — cần bridge C ──────────────────────
-## Giống tinygrad MetalCompiler: source → compiled library → pipeline name.
-## Shim cần thêm (một lần):
+# ── Compile hook (Metal) — needs a C bridge ──────────────────────
+## Like tinygrad's MetalCompiler: source → compiled library → pipeline name.
+## The shim needs (once):
 ##   int metal_jit_compile(const char* src, const char* kernelName);
-##   // dùng newLibraryWithSource:options:error: rồi merge function vào cache pipeline
+##   // uses newLibraryWithSource:options:error: then merges the function into the pipeline cache
 ##
-## Khi chưa có shim: lower vẫn chạy (xem source), compile trả false → ở lại interpreter.
+## Without the shim: lowering still runs (source visible), compile returns false → stays on the interpreter.
 
 when defined(macosx):
   proc metal_jit_compile(source, kernelName: cstring): cint {.
@@ -688,22 +688,22 @@ when defined(macosx):
 
   proc tryMetalJitCompile*(source, kernelName: string): bool =
     try:
-      # FIX "[metal_jit] gDevice nil": dam bao Metal da init (gDevice/gQueue) TRUOC khi JIT.
+      # FIX "[metal_jit] gDevice nil": make sure Metal is initialised (gDevice/gQueue) BEFORE JIT.
       if not ensureJitDeviceReady():
-        stderr.writeLine "[jit_vm] khoi tao GPU(Metal) that bai - khong the JIT compile"
+        stderr.writeLine "[jit_vm] GPU (Metal) initialisation failed - cannot JIT compile"
         return false
       result = metal_jit_compile(source.cstring, kernelName.cstring) != 0
     except:
       result = false
 else:
-  ## Build ngoai macOS (vd CI Linux chi de nim check/test bytecode): khong co
-  ## metal_shim.h/.m tren include path. Compile "thanh cong" nhung khong lam
-  ## gi - moi kernel roi ve tier interpret (session_vm_dispatch cung da stub
-  ## sessionPipeline/... = true tren nhanh else cua no).
+  ## Builds outside macOS (e.g. Linux CI only for nim check/bytecode tests): no
+  ## metal_shim.h/.m on the include path. Compiles "successfully" but does
+  ## nothing - every kernel stays on the interpret tier (session_vm_dispatch also stubs
+  ## sessionPipeline/... = true in its else branch).
   proc metalJitCompileAvailable*: bool = false
   proc tryMetalJitCompile*(source, kernelName: string): bool = false
 
-# ── API chính: chạy program qua cache + JIT ──────────────────
+# ── Main API: run a program through the cache + JIT ──────────────────
 
 proc noteHit*(cache: var JitCache; key: string): var CompiledEntry =
   if key notin cache.entries:
@@ -713,7 +713,7 @@ proc noteHit*(cache: var JitCache; key: string): var CompiledEntry =
   result = cache.entries[key]
 
 proc maybeJit*(cache: var JitCache; p: VmProgram; key: string): CompiledEntry =
-  ## Gọi trước mỗi lần chạy. Nếu đủ nóng và bật Metal JIT → compile + lên tierCompiled.
+  ## Call before each run. When hot enough and Metal JIT is on → compile + move to tierCompiled.
   var e = cache.noteHit(key)
   if e.tier == tierCompiled:
     return e
@@ -726,20 +726,20 @@ proc maybeJit*(cache: var JitCache; p: VmProgram; key: string): CompiledEntry =
     cache.entries[key] = e
     return e
 
-  # Đủ nóng → lower + compile
+  # Hot enough → lower + compile
   let kname = "jit_" & key
   let src = lowerBytecodeToMetal(p, kname)
   e.metalSource = src
   e.kernelName = kname
-  # MOI: dump TOAN BO Metal source THAT SU duoc sinh ra - truoc gio chi
-  # log TEN kernel ("OK kernel=jit_..."), khong bao gio thay NOI DUNG code
-  # duoc gen ra sao. Bat bang env var (mac dinh TAT vi source co the dai/
-  # spam) - cuc ky huu ich de kiem tra buildSplitProjProgram/buildConv1d.../
-  # cac ham sinh VmProgram co dang ra dung Metal code hop ly hay khong
-  # (vi du: co bi thieu threadgroup cache nhu bug LUT o fp4 gemv da tim
-  # thay truoc do khong, co unroll/vector hoa dung khong, v.v).
+  # NEW: dumps the WHOLE generated Metal source - before, only the
+  # kernel NAME was logged ("OK kernel=jit_..."), never the generated
+  # CODE. Enabled by an env var (off by default, the source can be long/
+  # spammy) - very useful to check that buildSplitProjProgram/buildConv1d.../
+  # the VmProgram builders produce sensible Metal code
+  # (e.g. a missing threadgroup cache like the LUT bug found earlier in fp4 gemv,
+  # correct unrolling/vectorisation, etc).
   if getEnv("BYBY_JIT_DUMP_SOURCE", "0") == "1":
-    stderr.writeLine "════ [jit_vm] Metal source sinh ra cho kernel=" & kname &
+    stderr.writeLine "════ [jit_vm] generated Metal source for kernel=" & kname &
       " (key=" & key & ") ════"
     stderr.writeLine src
     stderr.writeLine "════ [jit_vm] het source " & kname & " ════"
@@ -747,7 +747,7 @@ proc maybeJit*(cache: var JitCache; p: VmProgram; key: string): CompiledEntry =
     e.tier = tierCompiled
     e.compiledAt = epochTime()
   else:
-    # Chưa có bridge / compile fail → giữ interpreter, vẫn lưu source để debug
+    # No bridge / compile failed → stay on the interpreter, keep the source for debugging
     e.tier = tierProfile
     e.kernelName = "micro_vm_kernel"
   cache.entries[key] = e
@@ -764,14 +764,14 @@ proc dispatchProgramTagged*(cache: var JitCache; p: VmProgram; tag: string): str
   result = cache.maybeJit(p, key).kernelName
 
 proc dispatchProgramNoSession*(cache: var JitCache; p: VmProgram; tag = ""): string =
-  ## Nhu dispatchProgram nhung khong bao gio mo session de hash -> dung duoc TRONG session dang mo
-  ## (encodeMicroVm/encodeVm luc encode). JIT compile (neu du nong) khong can session.
+  ## Like dispatchProgram but never opens a session to hash -> usable INSIDE an open session
+  ## (encodeMicroVm/encodeVm while encoding). JIT compile (when hot) needs no session.
   let key = programKeyNoSession(p, tag)
   cache.maybeJit(p, key).kernelName
 
 proc dispatchProgram*(cache: var JitCache; p: VmProgram; tag = ""): string =
-  ## Trả về tên kernel nên sessionPipeline.
-  ## tierCompiled → kernel JIT; không thì micro_vm_kernel.
+  ## Returns the kernel name for sessionPipeline.
+  ## tierCompiled → the JIT kernel; otherwise micro_vm_kernel.
   let key = programKey(p, tag)
   let e = cache.maybeJit(p, key)
   result = e.kernelName
@@ -790,9 +790,9 @@ proc kernelNameFor*(cache: var JitCache; p: VmProgram; tag: string): string =
     e.kernelName = kname
     e.tier = tierCompiled
     e.compiledAt = epochTime()
-    # Log compile MOI chi khi bat BYBY_VULKAN_JIT_VERBOSE: truoc day in vo dieu
-    # kien moi lan compile -> "Vulkan JIT in tua lua" khong the doc log.
-    # Nhanh cache-hit da co elif rieng o duoi (cung gate BYBY_VULKAN_JIT_VERBOSE).
+    # Logs a NEW compile only with BYBY_VULKAN_JIT_VERBOSE: it used to print
+    # unconditionally on every compile -> "Vulkan JIT" spam made the log unreadable.
+    # The cache-hit branch has its own elif below (same BYBY_VULKAN_JIT_VERBOSE gate).
     if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") == "1":
       stderr.writeLine "[vulkan_jit] kernelNameFor tag=" & tag &
         " kernel=" & kname & " srcBytes=" & $src.len & " words=" & $p.words.len
@@ -819,11 +819,11 @@ proc cachedGlslSource*(cache: var JitCache; kernelName: string): string =
       return e.glslSource
   result = ""
 
-# ── Gộp program (merge file) ─────────────────────────────────
-## Chỉ là nối dữ liệu (không có phép tính số), viết bằng đệ quy - không for/while.
-## SỬA BUG so với bản cũ: bản cũ bỏ MỌI word có byte thấp == HALT (0x01), kể cả
-## word TOÁN HẠNG (vd OP_U_CONST ... 1, OP_U_ADDK ... 1, hằng float có byte thấp 1)
-## -> làm hỏng program im lặng. Giờ giải mã đúng: chỉ bỏ opcode HALT thật.
+# ── Merging programs (merge files) ─────────────────────────────────
+## Plain data concatenation (no arithmetic), written recursively - no for/while.
+## BUG FIX vs the old version: it dropped EVERY word whose low byte == HALT (0x01), including
+## OPERAND words (e.g. OP_U_CONST ... 1, OP_U_ADDK ... 1, float constants with low byte 1)
+## -> silently corrupting the program. Now decoded properly: only real HALT opcodes are dropped.
 
 proc mergePart(dst: var VmProgram; part: VmProgram; pc: int; dropHalt: bool) =
   if pc >= part.words.len: return
@@ -845,7 +845,7 @@ proc mergeParts(dst: var VmProgram; parts: openArray[VmProgram]; i: int) =
   dst.mergeParts(parts, i + 1)
 
 proc mergePrograms*(parts: openArray[VmProgram]): VmProgram =
-  ## Gộp nhiều .bvm thành một file chạy một dispatch (bỏ HALT giữa chừng).
+  ## Merges several .bvm files into one that runs in a single dispatch (mid-program HALTs dropped).
   result.mergeParts(parts, 0)
   if result.words.len == 0 or (result.words[^1] and 0xFF'u32) != OP_HALT:
     result.emitHalt()

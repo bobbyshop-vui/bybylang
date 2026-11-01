@@ -1,10 +1,10 @@
 #version 450
-// Giống concat_gather (CUDA) nhưng SPIR-V không có mảng con trỏ device
-// tiện dụng như CUDA -> dùng 1 buffer nguồn ĐÃ NỐI PHẲNG (flatSrc, do host
-// ghép các tensor lại - chỉ là memcpy nối tiếp, KHÔNG phải tính chỉ số)
-// + 1 bảng nhỏ O(numTensors): base offset trong flatSrc, dimSize, dimOffset
-// (lũy kế) từng nguồn. Mỗi invocation tự quét bảng nhỏ này để chọn đúng
-// nguồn - không có mảng chỉ số O(n) build trên CPU.
+// Like concat_gather (CUDA), but SPIR-V has no convenient array of device
+// pointers like CUDA -> uses one FLATTENED source buffer (flatSrc, the host
+// concatenates the tensors - a plain sequential memcpy, NO index computation)
+// + a small O(numTensors) table: base offset in flatSrc, dimSize, dimOffset
+// (prefix sum) per source. Each invocation scans that small table to pick the
+// right source - no O(n) index array built on the CPU.
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer BufSrc   { float flatSrc[]; };
 layout(std430, binding = 1) readonly buffer BufBase  { int srcBase[]; };       // [numTensors]

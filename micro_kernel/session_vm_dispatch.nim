@@ -1,10 +1,10 @@
-## session_vm_dispatch.nim — cầu nối Nim ↔ backend encoder (Metal / Vulkan)
+## session_vm_dispatch.nim — bridge between Nim and the backend encoders (Metal / Vulkan)
 ## cho micro_vm_kernel.
 ##
-## Metal: metal_enc_* thật (metal_shim.m).
+## Metal: the real metal_enc_* (metal_shim.m).
 ## Vulkan: multi-buffer JIT session API (vulkanJitBegin / vulkanBindBuf /
 ##         vulkanKernelDispatch) + 1-buffer vulkanSessionJitMicroVmEnc.
-## CUDA đã bị loại — mọi path non-macOS đi qua Vulkan.
+## CUDA was removed — every non-macOS path goes through Vulkan.
 
 when defined(macosx):
   type MetalBufferHandle* = pointer
@@ -58,20 +58,20 @@ when defined(macosx):
     metal_enc_set_threadgroup_bytes(index.cint, nBytes.cint) != 0
 
   proc sessionSimdWidth*(): int =
-    ## MOI: doc threadExecutionWidth THAT cua pipeline dang duoc bind
-    ## (sessionPipeline() da goi truoc do) - dung de dispatch dung so
-    ## thread/simdgroup thay vi doan cung 32 (xem giai thich day du o
-    ## fp4MatmulMetalSource trong lora.nim va fp4GemvGpuInto). PHAI goi SAU
-    ## sessionPipeline(name), truoc khi dispatch.
+    ## NEW: reads the REAL threadExecutionWidth of the bound pipeline
+    ## (sessionPipeline() must have run) - used to dispatch the right number of
+    ## threads/simdgroups instead of hardcoding 32 (see the full explanation in
+    ## fp4MatmulMetalSource in lora.nim and fp4GemvGpuInto). MUST be called AFTER
+    ## sessionPipeline(name), before dispatch.
     int(metal_enc_simd_width())
 
   proc sessionMaxTgThreads*(): int =
-    ## MOI (FIX token rac bug #9): doc maxTotalThreadsPerThreadgroup THAT cua
-    ## pipeline dang bind. Metal KHONG cho 1 threadgroup vuot qua so nay;
-    ## metal_enc_dispatch_threads se AM THAM ha tgSize xuong maxTG neu ta xin
-    ## nhieu hon -> moi kernel dung threadgroup memory + barrier (reduction)
-    ## se bi chia thanh NHIEU threadgroup, moi cai reduce rieng tren vung nho
-    ## RIENG -> ket qua RAC ma khong bao loi. PHAI goi SAU sessionPipeline().
+    ## NEW (fix for garbage-token bug #9): reads the REAL maxTotalThreadsPerThreadgroup of
+    ## the bound pipeline. Metal does NOT allow a threadgroup larger than this;
+    ## metal_enc_dispatch_threads SILENTLY lowers tgSize to maxTG if we ask for
+    ## more -> any kernel using threadgroup memory + barriers (reductions)
+    ## gets split into SEVERAL threadgroups, each reducing its OWN memory
+    ## -> GARBAGE results without any error. MUST be called AFTER sessionPipeline().
     int(metal_enc_max_tg_threads())
 
 else:
@@ -88,7 +88,7 @@ else:
 
 # ── Vulkan multi-buffer session wrappers (available on all platforms) ──
 # Inference encode path: pipeline → bind × N → dispatch, parallel to Metal.
-# Path tương đối trong vendor/bybylang: micro_kernel → backends/vulkan
+# Relative path inside vendor/bybylang: micro_kernel → backends/vulkan
 import ../backends/vulkan/vulkan_driver as vkDrv
 
 proc sessionPipelineVk*(name, glslSrc: string): bool =
@@ -107,12 +107,12 @@ proc sessionMaxTgThreadsVk*(): int =
   vkDrv.vulkanMaxTgThreads()
 
 # ════════════════════════════════════════════════════════════════════
-# API CHUNG encode (Metal + Vulkan) — caller chi can isVulkan + name/glsl/handle.
-# Shim native van tach; day la lop gom de encodeVm / encodeVmKernel khong nhai if.
+# SHARED encode API (Metal + Vulkan) — the caller only needs isVulkan + name/glsl/handle.
+# The native shims stay separate; this layer keeps encodeVm / encodeVmKernel free of if-chains.
 # ════════════════════════════════════════════════════════════════════
 
 proc sessionEncPipeline*(isVulkan: bool; name: string; glslSrc = ""): bool =
-  ## Vulkan BAT BUOC glslSrc; Metal chi can ten pipeline da JIT.
+  ## Vulkan REQUIRES glslSrc; Metal only needs the name of an already JIT-compiled pipeline.
   if isVulkan:
     if glslSrc.len == 0: return false
     return sessionPipelineVk(name, glslSrc)

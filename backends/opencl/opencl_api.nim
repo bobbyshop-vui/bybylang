@@ -131,7 +131,7 @@ proc findPlatformAndDevice(platform_ret: ptr cl_platform_id, device_ret: ptr cl_
 proc ensureInit() =
   if gInitialized: return
   gpuCheck(tryLoad(), "libOpenCL not found")
-  gpuCheck(findPlatformAndDevice(addr gPlatform, addr gDevice), "Khong tim thay platform/device OpenCL")
+  gpuCheck(findPlatformAndDevice(addr gPlatform, addr gDevice), "No OpenCL platform/device found")
 
   var err: cl_int
   var props: array[3, int]
@@ -465,7 +465,7 @@ proc openclAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: 
   gpuCheck(lib.clSetKernelArg(kernel, 8, csize_t(sizeof(int32)), addr dArg) == 0, "setArg failed")
   gpuCheck(lib.clSetKernelArg(kernel, 9, csize_t(sizeof(float32)), addr scArg) == 0, "setArg failed")
 
-  gpuCheck(S <= 256, "openclAttentionFused: S=" & $S & " vuot gioi han 256")
+  gpuCheck(S <= 256, "openclAttentionFused: S=" & $S & " exceeds the limit of 256")
   var globalSize2D = [csize_t(B * H), csize_t(S)]
   gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], nil, 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
   gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufO, CL_TRUE, 0, bytesQKV, addr o[0], 0, nil, nil) == 0, "read failed")
@@ -526,7 +526,7 @@ proc openclAttentionFusedBackward*(q, k, v, sMatrix, dy: seq[float32], B, H, S, 
   gpuCheck(lib.clSetKernelArg(kernel, 11, csize_t(sizeof(int32)), addr dArg) == 0, "setArg failed")
   gpuCheck(lib.clSetKernelArg(kernel, 12, csize_t(sizeof(float32)), addr scArg) == 0, "setArg failed")
 
-  gpuCheck(S <= 256, "openclAttentionFusedBackward: S=" & $S & " vuot gioi han 256")
+  gpuCheck(S <= 256, "openclAttentionFusedBackward: S=" & $S & " exceeds the limit of 256")
   var globalSize2D = [csize_t(B * H), csize_t(S)]
   gpuCheck(lib.clEnqueueNDRangeKernel(gQueue, kernel, 2, nil, addr globalSize2D[0], nil, 0, nil, nil) == 0, "clEnqueueNDRangeKernel failed")
   gpuCheck(lib.clEnqueueReadBuffer(gQueue, bufDq, CL_TRUE, 0, bytesQKV, addr dqOut[0], 0, nil, nil) == 0, "read failed")

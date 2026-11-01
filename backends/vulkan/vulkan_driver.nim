@@ -28,10 +28,10 @@ type
   VkFence* = pointer
   VkResult* = int32
 
-  # ---- Struct Vulkan tối thiểu cần cho Bước 1 (đúng thứ tự field như
-  # vulkan_core.h thật - SAI THỨ TỰ SẼ GÂY LỖI NGẦM, không phải lỗi compile,
-  # vì Nim object truyền theo layout khai báo, khớp C struct layout chỉ khi
-  # thứ tự + kiểu field khớp CHÍNH XÁC). ----
+  # ---- Minimal Vulkan structs needed for step 1 (fields in the same order as
+  # the real vulkan_core.h - A WRONG ORDER FAILS SILENTLY, not at compile time,
+  # because a Nim object is passed with its declared layout, which matches the C struct only when
+  # field order + types match EXACTLY). ----
   VkApplicationInfo* = object
     sType*: uint32          # VK_STRUCTURE_TYPE_APPLICATION_INFO = 0
     pNext*: pointer
@@ -118,8 +118,8 @@ type
     sType*: uint32               # VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO = 16
     pNext*: pointer
     flags*: uint32
-    codeSize*: uint             # csize_t thực chất, dùng uint cho khớp size_t 64-bit
-    pCode*: ptr uint32           # con trỏ tới bytecode SPIR-V (bội số 4 byte)
+    codeSize*: uint             # really csize_t; uint matches a 64-bit size_t
+    pCode*: ptr uint32           # pointer to the SPIR-V bytecode (multiple of 4 bytes)
 
   VkDescriptorSetLayoutBinding* = object
     binding*: uint32
@@ -306,8 +306,8 @@ const
   VK_ACCESS_TRANSFER_WRITE_BIT: uint32 = 0x00001000
   VK_SUCCESS*: VkResult = 0
 
-  # MoltenVK/macOS BẮT BUỘC 2 cờ portability này khi tạo instance (từ
-  # Vulkan 1.3.216+ trở đi trên macOS) - thiếu sẽ lỗi VK_ERROR_INCOMPATIBLE_DRIVER.
+  # MoltenVK/macOS REQUIRES these 2 portability flags when creating the instance (from
+  # Vulkan 1.3.216 on macOS) - without them VK_ERROR_INCOMPATIBLE_DRIVER.
   VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR: uint32 = 0x00000001
   KHR_PORTABILITY_ENUMERATION_EXTENSION: cstring = "VK_KHR_portability_enumeration"
 
@@ -366,9 +366,9 @@ type
 
 type
   VulkanBufferHandle* = object
-    ## Vulkan CẦN CẢ HAI (VkBuffer + VkDeviceMemory) để dùng 1 buffer -
-    ## khác Metal/CUDA/OpenCL chỉ cần 1 handle - đóng gói lại thành 1 struct
-    ## cho khớp interface SessionHandle chung (chỉ có 1 field/backend).
+    ## Vulkan NEEDS BOTH (VkBuffer + VkDeviceMemory) to use a buffer -
+    ## unlike Metal/CUDA/OpenCL with a single handle - wrapped in one struct
+    ## to fit the shared SessionHandle interface (one field per backend).
     buf*: VkBuffer
     mem*: VkDeviceMemory
     sizeBytes*: uint64
@@ -380,8 +380,8 @@ type
     mapped*: pointer   ## persistent host mapping of a pooled staging buffer
 
 proc gpuCheck(cond: bool, msg: string) =
-  ## Giống hệt pattern trong cuda_driver.nim - raise CatchableError (không
-  ## phải Defect) để lớp trên bắt được và fallback, không crash cả process.
+  ## Same pattern as cuda_driver.nim - raises CatchableError (not
+  ## Defect) so the layer above can catch it and fall back instead of crashing the process.
   if not cond:
     raise newException(CatchableError, msg)
 
@@ -427,11 +427,11 @@ var gCommandPool: VkCommandPool
 proc tryLoad(): bool =
   if loaded: return lib.handle != nil
   loaded = true
-  # MoltenVK có thể cài dưới 1 trong vài tên tuỳ cách cài (Vulkan SDK cho
-  # macOS thường cài libMoltenVK.dylib + libvulkan.1.dylib làm loader trỏ
-  # tới nó - thử cả 2 tên phổ biến nhất). Trên Linux, loader chuẩn tên
-  # libvulkan.so.1 (package vulkan-loader/libvulkan1) - TRUOC DAY THIEU tên
-  # này nên tryLoad() luôn thất bại trên Linux dù máy có driver Vulkan thật.
+  # MoltenVK can be installed under one of several names depending on the install (the Vulkan SDK for
+  # macOS usually installs libMoltenVK.dylib + libvulkan.1.dylib as the loader pointing
+  # to it - both common names are tried). On Linux the standard loader is
+  # libvulkan.so.1 (package vulkan-loader/libvulkan1) - that name USED TO BE MISSING,
+  # so tryLoad() always failed on Linux even with a real Vulkan driver.
   for name in ["vulkan-1.dll", "libvulkan.1.dylib", "libvulkan.dylib", "libMoltenVK.dylib",
                "libvulkan.so.1", "libvulkan.so"]:
     lib.handle = loadLib(name)
@@ -441,24 +441,24 @@ proc tryLoad(): bool =
   lib.vkGetInstanceProcAddr = cast[typeof(lib.vkGetInstanceProcAddr)](lib.handle.symAddr("vkGetInstanceProcAddr"))
   if lib.vkGetInstanceProcAddr == nil:
     return false
-  # vkCreateInstance là hàm DUY NHẤT resolve được TRỰC TIẾP qua symAddr của
-  # thư viện (chưa cần instance) - các hàm còn lại BẮT BUỘC resolve qua
-  # vkGetInstanceProcAddr(instance, ...) SAU KHI đã có instance thật (đúng
-  # theo spec Vulkan loader - KHÔNG phải tuỳ chọn, thiếu bước này 1 số hàm
-  # sẽ trả về nil trên driver ICD thật dù dlsym trực tiếp "có vẻ" ra địa chỉ).
+  # vkCreateInstance is the ONLY function resolved DIRECTLY through the library's symAddr
+  # (no instance needed yet) - all others MUST be resolved through
+  # vkGetInstanceProcAddr(instance, ...) AFTER a real instance exists (as
+  # the Vulkan loader spec requires - NOT optional; without it some functions
+  # return nil on a real ICD driver even though a direct dlsym "seems" to give an address).
   lib.vkCreateInstance = cast[typeof(lib.vkCreateInstance)](lib.handle.symAddr("vkCreateInstance"))
   result = lib.vkCreateInstance != nil
 
 proc loadInstanceProc[T](name: string): T =
   let p = lib.vkGetInstanceProcAddr(gInstance, name.cstring)
-  gpuCheck(p != nil, "vkGetInstanceProcAddr tra ve nil cho ham: " & name)
+  gpuCheck(p != nil, "vkGetInstanceProcAddr returned nil for function: " & name)
   result = cast[T](p)
 
 proc ensureInit() =
   if gInitialized: return
-  gpuCheck(tryLoad(), "Khong tim thay/tai duoc thu vien Vulkan loader (libvulkan.so.1 tren Linux, libvulkan.1.dylib/libMoltenVK.dylib tren macOS) - kiem tra da cai Vulkan driver/ICD (vd. package vulkan-loader hoac vulkan-icd-loader) hoac MoltenVK/Vulkan SDK chua, va LD_LIBRARY_PATH/DYLD_LIBRARY_PATH co tro toi thu muc chua no khong")
+  gpuCheck(tryLoad(), "Vulkan loader library not found/loadable (libvulkan.so.1 on Linux, libvulkan.1.dylib/libMoltenVK.dylib on macOS) - check that a Vulkan driver/ICD (e.g. package vulkan-loader or vulkan-icd-loader) or MoltenVK/the Vulkan SDK is installed, and that LD_LIBRARY_PATH/DYLD_LIBRARY_PATH points to its directory")
 
-  # ---- 1. Tạo VkInstance (kèm cờ portability bắt buộc cho MoltenVK) ----
+  # ---- 1. Create the VkInstance (with the portability flag MoltenVK requires) ----
   var appInfo = VkApplicationInfo(
     sType: VK_STRUCTURE_TYPE_APPLICATION_INFO,
     pNext: nil,
@@ -482,14 +482,14 @@ proc ensureInit() =
   var inst: VkInstance
   var rInst = lib.vkCreateInstance(addr instInfo, nil, addr inst)
 
-  # THU LAI KHONG CO CO PORTABILITY: co VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
-  # + extension "VK_KHR_portability_enumeration" la khai niem o TANG VULKAN LOADER
-  # (de loader biet liet ke ca cac ICD "khong chuan" nhu MoltenVK). Neu may nay
-  # KHONG co Vulkan Loader that (vd. libvulkan.1.dylib khong ton tai) va tryLoad()
-  # da phai fallback load THANG vao libMoltenVK.dylib (ICD tran, bo qua loader),
-  # thi ICD tran do KHONG hieu cai co/extension nay -> tra ve chinh xac
-  # VK_ERROR_INCOMPATIBLE_DRIVER (-9) du driver GPU van hoan toan on. Truong hop
-  # nay, tao lai instance lan 2 KHONG co co/extension portability.
+  # RETRY WITHOUT THE PORTABILITY FLAG: VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+  # + the "VK_KHR_portability_enumeration" extension belong to the VULKAN LOADER LAYER
+  # (so the loader also lists "non-conformant" ICDs such as MoltenVK). If this machine
+  # has NO real Vulkan loader (e.g. libvulkan.1.dylib missing) and tryLoad()
+  # had to load libMoltenVK.dylib DIRECTLY (a bare ICD, no loader),
+  # that bare ICD does NOT understand this flag/extension -> it returns exactly
+  # VK_ERROR_INCOMPATIBLE_DRIVER (-9) although the GPU driver is fine. In that
+  # case the instance is created a second time WITHOUT the portability flag/extension.
   if rInst != VK_SUCCESS:
     var instInfoNoPortability = VkInstanceCreateInfo(
       sType: VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -503,13 +503,13 @@ proc ensureInit() =
     )
     rInst = lib.vkCreateInstance(addr instInfoNoPortability, nil, addr inst)
 
-  gpuCheckVk(rInst, "vkCreateInstance that bai ca 2 lan (co va khong co " &
-    "portability extension). Neu -9=VK_ERROR_INCOMPATIBLE_DRIVER: may nay dang thieu Vulkan Loader/ICD that su " &
-    "(khong phai loi logic tao instance nua) - can cai: 'brew install molten-vk vulkan-loader' " &
-    "roi set VK_ICD_FILENAMES tro toi file MoltenVK_icd.json (xem 'brew --prefix molten-vk')")
+  gpuCheckVk(rInst, "vkCreateInstance failed both times (with and without the " &
+    "portability extension). If -9=VK_ERROR_INCOMPATIBLE_DRIVER: this machine lacks a real Vulkan loader/ICD " &
+    "(no longer an instance-creation logic error) - install: 'brew install molten-vk vulkan-loader' " &
+    "and set VK_ICD_FILENAMES to the MoltenVK_icd.json file (see 'brew --prefix molten-vk')")
   gInstance = inst
 
-  # ---- 2. Resolve các hàm còn lại QUA vkGetInstanceProcAddr(instance,...) ----
+  # ---- 2. Resolve the remaining functions THROUGH vkGetInstanceProcAddr(instance,...) ----
   lib.vkEnumeratePhysicalDevices = loadInstanceProc[typeof(lib.vkEnumeratePhysicalDevices)]("vkEnumeratePhysicalDevices")
   lib.vkGetPhysicalDeviceQueueFamilyProperties = loadInstanceProc[typeof(lib.vkGetPhysicalDeviceQueueFamilyProperties)]("vkGetPhysicalDeviceQueueFamilyProperties")
   lib.vkCreateDevice = loadInstanceProc[typeof(lib.vkCreateDevice)]("vkCreateDevice")
@@ -558,9 +558,9 @@ proc ensureInit() =
   # ---- 3. Prefer a discrete GPU; allow explicit device index selection. ----
   var devCount: uint32 = 0
   gpuCheck(lib.vkEnumeratePhysicalDevices(gInstance, addr devCount, nil) == VK_SUCCESS, "vkEnumeratePhysicalDevices (dem) that bai")
-  gpuCheck(devCount > 0, "Khong tim thay physical device Vulkan nao")
+  gpuCheck(devCount > 0, "No Vulkan physical device found")
   var devices = newSeq[VkPhysicalDevice](devCount)
-  gpuCheck(lib.vkEnumeratePhysicalDevices(gInstance, addr devCount, addr devices[0]) == VK_SUCCESS, "vkEnumeratePhysicalDevices (lay danh sach) that bai")
+  gpuCheck(lib.vkEnumeratePhysicalDevices(gInstance, addr devCount, addr devices[0]) == VK_SUCCESS, "vkEnumeratePhysicalDevices (listing) failed")
   var selected = -1
   let requested = getEnv("BYBY_VULKAN_DEVICE")
   if requested.len > 0:
@@ -576,10 +576,10 @@ proc ensureInit() =
       gDeviceCaps = caps
       bestScore = score
 
-  # ---- 4. Tìm queue family hỗ trợ compute ----
+  # ---- 4. Find a queue family with compute support ----
   var qCount: uint32 = 0
   lib.vkGetPhysicalDeviceQueueFamilyProperties(gPhysicalDevice, addr qCount, nil)
-  gpuCheck(qCount > 0, "Physical device khong co queue family nao")
+  gpuCheck(qCount > 0, "The physical device has no queue family")
   var qProps = newSeq[VkQueueFamilyProperties](qCount)
   lib.vkGetPhysicalDeviceQueueFamilyProperties(gPhysicalDevice, addr qCount, addr qProps[0])
   var foundQueue = false
@@ -588,9 +588,9 @@ proc ensureInit() =
       gQueueFamilyIndex = uint32(i)
       foundQueue = true
       break
-  gpuCheck(foundQueue, "Khong tim thay queue family ho tro compute")
+  gpuCheck(foundQueue, "No queue family supporting compute found")
 
-  # ---- 5. Tạo logical device + lấy queue ----
+  # ---- 5. Create the logical device + get the queue ----
   var prio: float32 = 1.0
   var qInfo = VkDeviceQueueCreateInfo(
     sType: VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -656,8 +656,8 @@ proc ensureInit() =
     gHostImportEnabled = vkGetMemoryHostPointerPropertiesEXT != nil
   lib.vkGetDeviceQueue(gDevice, gQueueFamilyIndex, 0, addr gQueue)
 
-  # ---- 6. Command pool (dùng lại cho mọi lệnh compute sau này, giống
-  # gSessionEncoder bên Metal) ----
+  # ---- 6. Command pool (reused for every later compute command, like
+  # gSessionEncoder on Metal) ----
   var poolInfo = VkCommandPoolCreateInfo(
     sType: VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
     pNext: nil, flags: 0, queueFamilyIndex: gQueueFamilyIndex
@@ -681,7 +681,7 @@ proc ensureInit() =
     " mmapImport=" & (if gHostImportEnabled: $gDeviceCaps.hostImportAlignment else: "off") &
     " matrix=" & (if gFp8CoopEnabled: "KHR_cooperative_matrix FP8-E4M3/FP32 + FP16/FP32"
       elif gCoopEnabled: "KHR_cooperative_matrix FP16/FP32" else: "scalar")
-  stderr.writeLine "[vulkan] Khoi tao xong: instance+device+queue+commandPool san sang (queueFamily=" & $gQueueFamilyIndex & ")"
+  stderr.writeLine "[vulkan] Initialised: instance+device+queue+commandPool ready (queueFamily=" & $gQueueFamilyIndex & ")"
 
 proc vulkanDeviceCaps*(): VulkanCaps =
   ensureInit()
@@ -707,7 +707,7 @@ proc findMemoryType(typeFilter: uint32, properties: uint32): uint32 =
     if (typeFilter and (1'u32 shl uint32(i))) != 0 and
        (memProps.memoryTypes[i].propertyFlags and properties) == properties:
       return uint32(i)
-  gpuCheck(false, "Khong tim thay memory type phu hop (typeFilter=" & $typeFilter & ", can properties=" & $properties & ")")
+  gpuCheck(false, "No suitable memory type found (typeFilter=" & $typeFilter & ", needed properties=" & $properties & ")")
 
 proc createHostVisibleBuffer(sizeBytes: uint64, usage: uint32; memoryFlags =
     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT): tuple[buf: VkBuffer, mem: VkDeviceMemory] =
@@ -757,22 +757,22 @@ proc readFromBuffer(mem: VkDeviceMemory, data: pointer, sizeBytes: uint64) =
   lib.vkUnmapMemory(gDevice, mem)
 
 # ---------------------------------------------------------------------
-# TEST TỐI GIẢN: vecAdd(a,b) = c, dùng để XÁC NHẬN toàn bộ pipeline
-# instance->device->buffer->shader->pipeline->dispatch->readback chạy
-# ĐÚNG trên máy thật, trước khi viết bất cứ kernel Q4 nào phức tạp hơn.
-# Shader nguồn GLSL nằm ở kernels/vecadd.comp - PHẢI tự biên dịch sang
-# SPIR-V bằng glslc/glslangValidator (có sẵn nếu đã cài Vulkan SDK) rồi
-# copy file .spv ra CÙNG thư mục kernels/ với tên vecadd.spv:
+# MINIMAL TEST: vecAdd(a,b) = c, used to CONFIRM the whole pipeline
+# instance->device->buffer->shader->pipeline->dispatch->readback works
+# CORRECTLY on real hardware before writing any more complex Q4 kernel.
+# The GLSL source is kernels/vecadd.comp - it MUST be compiled to
+# SPIR-V with glslc/glslangValidator (included in the Vulkan SDK) and
+# the .spv placed in the SAME kernels/ directory as vecadd.spv:
 #
 #     glslc kernels/vecadd.comp -o kernels/vecadd.spv
 #
-# hoặc:
+# or:
 #
 #     glslangValidator -V kernels/vecadd.comp -o kernels/vecadd.spv
 # ---------------------------------------------------------------------
 proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32] =
   ensureInit()
-  gpuCheck(a.len == b.len, "vulkanVecAddTest: a va b phai cung do dai")
+  gpuCheck(a.len == b.len, "vulkanVecAddTest: a and b must have the same length")
   let n = a.len
   let bytes = uint64(n * sizeof(float32))
 
@@ -784,13 +784,13 @@ proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32] =
   uploadToBuffer(memA, addr aVar[0], bytes)
   uploadToBuffer(memB, addr bVar[0], bytes)
 
-  # ---- Nạp shader SPIR-V đã biên dịch sẵn (đọc lúc COMPILE Nim, giống
-  # staticRead của Metal/CUDA - KHÔNG đọc file lúc runtime) ----
+  # ---- Load the precompiled SPIR-V shader (read at Nim COMPILE time, like
+  # Metal/CUDA staticRead - NOT read from disk at runtime) ----
   let spirvPath = currentSourcePath().parentDir() / "kernels" / "vecadd.spv"
   gpuCheck(fileExists(spirvPath),
-    "Chua thay " & spirvPath & " - can bien dich truoc: glslc kernels/vecadd.comp -o kernels/vecadd.spv")
+    "Missing " & spirvPath & " - compile it first: glslc kernels/vecadd.comp -o kernels/vecadd.spv")
   let spirvBytes = readFile(spirvPath)
-  gpuCheck(spirvBytes.len mod 4 == 0, "File SPIR-V khong hop le (do dai khong chia het 4 byte)")
+  gpuCheck(spirvBytes.len mod 4 == 0, "Invalid SPIR-V file (length not a multiple of 4 bytes)")
 
   var shaderInfo = VkShaderModuleCreateInfo(
     sType: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, pNext: nil, flags: 0,
@@ -835,7 +835,7 @@ proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32] =
   var pipeline: VkPipeline
   gpuCheck(lib.vkCreateComputePipelines(gDevice, nil, 1, addr pipelineInfo, nil, addr pipeline) == VK_SUCCESS, "vkCreateComputePipelines that bai")
 
-  # ---- Descriptor pool + set, trỏ 3 buffer vào 3 binding ----
+  # ---- Descriptor pool + set, pointing the 3 buffers at the 3 bindings ----
   var poolSize = VkDescriptorPoolSize(descriptorType: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, descriptorCount: 3)
   var descPoolInfo = VkDescriptorPoolCreateInfo(
     sType: VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, pNext: nil, flags: 0,
@@ -882,7 +882,7 @@ proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32] =
   lib.vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline)
   var descSetVar = descSet
   lib.vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, addr descSetVar, 0, nil)
-  # local_size_x = 64 trong shader (xem vecadd.comp) - chia đủ nhóm để phủ n phần tử.
+  # local_size_x = 64 in the shader (see vecadd.comp) - enough groups to cover n elements.
   let groupCount = uint32((n + 63) div 64)
   lib.vkCmdDispatch(cmdBuf, groupCount, 1, 1)
   gpuCheck(lib.vkEndCommandBuffer(cmdBuf) == VK_SUCCESS, "vkEndCommandBuffer that bai")
@@ -906,22 +906,22 @@ proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32] =
   stderr.writeLine "[vulkan] vecAddTest xong, n=" & $n
 
 # ---------------------------------------------------------------------
-# KERNEL Q4 MATMUL THẬT - mirror chính xác thuật toán Metal/CUDA/OpenCL.
-# Bản "immediate" (không session) - mỗi lần gọi tự upload/dispatch/đọc về,
-# giống metal_matmul_q4 (bản non-session) chứ CHƯA có session API gộp
-# nhiều lệnh như metal_matmul_q4_enc - đó là việc của bước sau (Bước 2/3),
-# sau khi bản immediate này đã CHẠY ĐÚNG đã.
+# REAL Q4 MATMUL KERNEL - an exact mirror of the Metal/CUDA/OpenCL algorithm.
+# The "immediate" variant (no session) - each call uploads/dispatches/reads back itself,
+# like metal_matmul_q4 (the non-session variant), NOT yet the session API that batches
+# many commands like metal_matmul_q4_enc - that is the next step (step 2/3),
+# once this immediate variant RUNS CORRECTLY.
 #
-# BẮT BUỘC biên dịch shader trước:
+# The shader MUST be compiled first:
 #     glslc kernels/matmul_q4.comp -o kernels/matmul_q4.spv
 # ---------------------------------------------------------------------
-const MMQ4_NDST = 2  # SUA: 8 -> 2 (mirror ket qua da DO THAT tren Metal -
-  # matmul_q4_kernel_ndst2_paired, xem giai thich day du trong
-  # vecop_matmul.metal va kernels/matmul_q4.comp). PHAI dong bo VOI CA 2 noi
-  # dung gia tri nay: #define MMQ4_NDST trong kernels/matmul_q4.comp (dong
-  # tren cung file khong sua nhau tu dong - GLSL macro va Nim const la 2 the
-  # gioi bien dich rieng biet). Neu lech nhau, rowBlocks tinh SAI -> ket qua
-  # SAI/crash. CHUA CHAY THU TREN GPU VULKAN THAT.
+const MMQ4_NDST = 2  # CHANGED: 8 -> 2 (mirrors the MEASURED Metal result -
+  # matmul_q4_kernel_ndst2_paired, fully explained in
+  # vecop_matmul.metal and kernels/matmul_q4.comp). MUST stay in sync with BOTH places
+  # using this value: #define MMQ4_NDST in kernels/matmul_q4.comp (the
+  # two do not update each other - a GLSL macro and a Nim const are two
+  # separate compile worlds). If they differ, rowBlocks are WRONG -> WRONG
+  # results/crash. NOT YET RUN ON A REAL VULKAN GPU.
 
 proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
                       M, K, N, groupSize, nGroupsPerRow: int): seq[float32] =
@@ -946,9 +946,9 @@ proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
 
   let spirvPath = currentSourcePath().parentDir() / "kernels" / "matmul_q4.spv"
   gpuCheck(fileExists(spirvPath),
-    "Chua thay " & spirvPath & " - can bien dich truoc: glslc kernels/matmul_q4.comp -o kernels/matmul_q4.spv")
+    "Missing " & spirvPath & " - compile it first: glslc kernels/matmul_q4.comp -o kernels/matmul_q4.spv")
   let spirvBytes = readFile(spirvPath)
-  gpuCheck(spirvBytes.len mod 4 == 0, "File SPIR-V khong hop le")
+  gpuCheck(spirvBytes.len mod 4 == 0, "Invalid SPIR-V file")
 
   var shaderInfo = VkShaderModuleCreateInfo(
     sType: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, pNext: nil, flags: 0,
@@ -970,9 +970,9 @@ proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
   var setLayout: VkDescriptorSetLayout
   gpuCheck(lib.vkCreateDescriptorSetLayout(gDevice, addr setLayoutInfo, nil, addr setLayout) == VK_SUCCESS, "vkCreateDescriptorSetLayout that bai")
 
-  # push constant: 6 int32 (M,K,N,groupSize,nGroupsPerRow,wqOff) = 24 byte, khớp
-  # struct PushConsts trong matmul_q4.comp - SAI THỨ TỰ/KIỂU Ở ĐÂY SẼ ĐỌC
-  # NHẦM GIÁ TRỊ bên shader (không lỗi compile, chỉ tính sai âm thầm).
+  # push constants: 6 int32 (M,K,N,groupSize,nGroupsPerRow,wqOff) = 24 bytes, matching
+  # struct PushConsts in matmul_q4.comp - A WRONG ORDER/TYPE HERE MAKES THE SHADER READ
+  # WRONG VALUES (no compile error, silently wrong results).
   var pcRange = VkPushConstantRange(stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, offset: 0, size: 24)
   var pipelineLayoutInfo = VkPipelineLayoutCreateInfo(
     sType: VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, pNext: nil, flags: 0,
@@ -1041,7 +1041,7 @@ proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
   var descSetVar = descSet
   lib.vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, addr descSetVar, 0, nil)
 
-  # push constants: PHẢI đúng thứ tự int32 khớp struct PushConsts trong .comp
+  # push constants: int32s MUST be in the order of struct PushConsts in the .comp
   var pcData = [int32(M), int32(K), int32(N), int32(groupSize), int32(nGroupsPerRow), 0'i32]
   lib.vkCmdPushConstants(cmdBuf, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 24, addr pcData[0])
 
@@ -1067,13 +1067,13 @@ proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
   readFromBuffer(memC, addr result[0], bytesC)
 
 # =======================================================================
-# SESSION API ĐẦY ĐỦ - mirror kiến trúc session bên Metal (gSessionEncoder)
-# nhưng dùng VkCommandBuffer làm đơn vị "session": sessionBegin() mở +
-# bắt đầu record 1 command buffer, các hàm *Enc() RECORD lệnh vào đó
-# (KHÔNG submit ngay), sessionEnd() kết thúc record + submit + CHỜ xong
-# (fence) - ĐÚNG bài học rút ra từ Metal: sessionRead() chỉ an toàn SAU
-# khi sessionEnd() đã hoàn tất, KHÔNG được đọc buffer giữa chừng session
-# chưa commit.
+# FULL SESSION API - mirrors the Metal session architecture (gSessionEncoder)
+# but uses a VkCommandBuffer as the "session" unit: sessionBegin() opens +
+# starts recording a command buffer, the *Enc() functions RECORD commands into it
+# (NOT submitted yet), sessionEnd() ends recording + submits + WAITS for completion
+# (fence) - the SAME lesson learned on Metal: sessionRead() is only safe AFTER
+# sessionEnd() has completed, buffers must NOT be read in the middle of an
+# uncommitted session.
 # =======================================================================
 import std/tables
 
@@ -1094,11 +1094,11 @@ var gSessionCleanupPools: seq[VkDescriptorPool] = @[]
 # read/free after End (vulkanMatmul/VecOp/Activation: AllocScratch → End →
 # Read → Free) — that caused SIGSEGV use-after-free on first matmul.
 var gSessionInternalBufs: seq[VulkanBufferHandle] = @[]
-## Buffer bi sessionFree() KHI session con mo: command buffer dang ghi van tham chieu chung,
-## destroy ngay => vkQueueSubmit dung VkBuffer da huy => SIGSEGV (Metal ref-count nen khong sao).
-## Hoan huy toi sau khi vulkanSessionEnd da wait fence.
+## A buffer freed with sessionFree() WHILE a session is open: the command buffer being recorded still references it,
+## destroying it right away => vkQueueSubmit uses a destroyed VkBuffer => SIGSEGV (Metal is ref-counted, so fine there).
+## Destruction is deferred until vulkanSessionEnd has waited on the fence.
 var gSessionDeferredFree: seq[VulkanBufferHandle] = @[]
-var gVkLastError: string = ""   ## mo ta loi cua lan vulkanSessionEnd gan nhat that bai
+var gVkLastError: string = ""   ## error description of the last failed vulkanSessionEnd
 
 # ---- Buffer pool (dGPU scratch) ----
 # A decode step allocates the same few hundred scratch buffers every token.
@@ -1281,10 +1281,10 @@ proc stagedRead(src: VulkanBufferHandle; data: pointer; bytes: uint64) =
 
 proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: uint32,
                          localSizeX = 0, spirvPathOverride = "", sharedFloats = 0): PipelineEntry =
-  ## Cache pipeline theo tên shader + numBindings + localSizeX.
-  ## Trước đây cacheKey chỉ gồm shaderName+localSizeX → cùng kernel với số
-  ## binding khác nhau (microVm 5 vs multiBuf 3..5) trả về entry cũ →
-  ## vkUpdateDescriptorSets ghi quá layout → UB / validation error.
+  ## Pipeline cache keyed by shader name + numBindings + localSizeX.
+  ## The cacheKey used to be only shaderName+localSizeX → the same kernel with a different
+  ## binding count (microVm 5 vs multiBuf 3..5) returned the old entry →
+  ## vkUpdateDescriptorSets wrote past the layout → UB / validation error.
   let cacheKey = shaderName & "_nb" & $numBindings &
     (if localSizeX > 0: "_local" & $localSizeX else: "") & "_sm" & $sharedFloats
   if gPipelineCache.hasKey(cacheKey):
@@ -1293,9 +1293,9 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
   let spirvPath = if spirvPathOverride.len > 0: spirvPathOverride
                   else: currentSourcePath().parentDir() / "kernels" / (shaderName & ".spv")
   gpuCheck(fileExists(spirvPath),
-    "Chua thay " & spirvPath & " - can bien dich truoc: glslc kernels/" & shaderName & ".comp -o kernels/" & shaderName & ".spv")
+    "Missing " & spirvPath & " - compile it first: glslc kernels/" & shaderName & ".comp -o kernels/" & shaderName & ".spv")
   let spirvBytes = readFile(spirvPath)
-  gpuCheck(spirvBytes.len mod 4 == 0, "File SPIR-V khong hop le: " & spirvPath)
+  gpuCheck(spirvBytes.len mod 4 == 0, "Invalid SPIR-V file: " & spirvPath)
 
   var shaderInfo = VkShaderModuleCreateInfo(
     sType: VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, pNext: nil, flags: 0,
@@ -1303,7 +1303,7 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
   )
   var shaderModule: VkShaderModule
   gpuCheck(lib.vkCreateShaderModule(gDevice, addr shaderInfo, nil, addr shaderModule) == VK_SUCCESS,
-    "vkCreateShaderModule that bai cho " & shaderName)
+    "vkCreateShaderModule failed for " & shaderName)
 
   var bindings = newSeq[VkDescriptorSetLayoutBinding](numBindings)
   for i in 0 ..< numBindings:
@@ -1317,7 +1317,7 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
   )
   var setLayout: VkDescriptorSetLayout
   gpuCheck(lib.vkCreateDescriptorSetLayout(gDevice, addr setLayoutInfo, nil, addr setLayout) == VK_SUCCESS,
-    "vkCreateDescriptorSetLayout that bai cho " & shaderName)
+    "vkCreateDescriptorSetLayout failed for " & shaderName)
 
   var pcRange = VkPushConstantRange(stageFlags: VK_SHADER_STAGE_COMPUTE_BIT, offset: 0, size: pushConstSize)
   var pipelineLayoutInfo = VkPipelineLayoutCreateInfo(
@@ -1328,7 +1328,7 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
   )
   var pipelineLayout: VkPipelineLayout
   gpuCheck(lib.vkCreatePipelineLayout(gDevice, addr pipelineLayoutInfo, nil, addr pipelineLayout) == VK_SUCCESS,
-    "vkCreatePipelineLayout that bai cho " & shaderName)
+    "vkCreatePipelineLayout failed for " & shaderName)
 
   var specEntries = [
     VkSpecializationMapEntry(constantID: 0, offset: 0, size: uint(sizeof(uint32))),
@@ -1348,7 +1348,7 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
   )
   var pipeline: VkPipeline
   gpuCheck(lib.vkCreateComputePipelines(gDevice, nil, 1, addr pipelineInfo, nil, addr pipeline) == VK_SUCCESS,
-    "vkCreateComputePipelines that bai cho " & shaderName)
+    "vkCreateComputePipelines failed for " & shaderName)
 
   result = PipelineEntry(pipeline: pipeline, layout: pipelineLayout, setLayout: setLayout,
                           numBindings: numBindings, pushConstSize: pushConstSize)
@@ -1378,10 +1378,10 @@ proc takeDescriptorPool(): VkDescriptorPool =
   result = gDSetPool
 
 proc makeDescriptorSet(entry: PipelineEntry, buffers: openArray[VulkanBufferHandle]; offsets: seq[uint64] = @[]): tuple[pool: VkDescriptorPool, dset: VkDescriptorSet] =
-  ## 1 descriptor set trỏ đúng vào các buffer truyền vào. Set lấy từ pool
-  ## của session (takeDescriptorPool) - pool chỉ bị destroy ở sessionEnd()
-  ## sau khi fence xong, vì lệnh dispatch chưa chạy xong thì chưa được phép
-  ## giải phóng set (giống lý do KHÔNG được sessionRead() giữa chừng session).
+  ## One descriptor set pointing at the given buffers. The set comes from the
+  ## session's pool (takeDescriptorPool) - the pool is destroyed only in sessionEnd()
+  ## after the fence, because a set may not be freed before its dispatch has finished
+  ## (same reason sessionRead() must not be called in the middle of a session).
   let pool = takeDescriptorPool()
 
   var setLayoutVar = entry.setLayout
@@ -1397,8 +1397,8 @@ proc makeDescriptorSet(entry: PipelineEntry, buffers: openArray[VulkanBufferHand
   for i in 0 ..< buffers.len:
     let offB = if offsets.len > i: offsets[i] else: 0'u64
     let sz = buffers[i].sizeBytes
-    # Offset vượt size buffer trước đây âm thầm dùng range=4 → đọc rác im lặng.
-    # Fail-loud khi BYBY_VULKAN_STRICT=1; mặc định vẫn clamp nhưng log 1 lần.
+    # An offset past the buffer size used to silently use range=4 → silently read garbage.
+    # Fails loudly with BYBY_VULKAN_STRICT=1; by default it still clamps but logs once.
     if offB >= sz:
       if getEnv("BYBY_VULKAN_STRICT", "0") != "0":
         raise newException(CatchableError,
@@ -1482,7 +1482,7 @@ proc vulkanSessionEnd*(): bool =
   # Free multiBuf internal dummies only (not caller-owned AllocScratch).
   for h in gSessionInternalBufs: releaseBuffer(h)
   gSessionInternalBufs.setLen(0)
-  # Huy cac buffer bi sessionFree() giua session (an toan vi da wait fence xong).
+  # Destroy the buffers freed with sessionFree() during the session (safe, the fence has been waited on).
   for h in gSessionDeferredFree: releaseBuffer(h)
   gSessionDeferredFree.setLen(0)
   for h in gSessionStaging: releaseBuffer(h)
@@ -1492,15 +1492,15 @@ proc vulkanSessionEnd*(): bool =
 proc vulkanGetLastError*(): string = gVkLastError
 
 proc vulkanSessionCommitContinue*(): bool =
-  ## Tuong duong metalSessionCommitContinue: chot command buffer hien tai (cho GPU xong) roi mo
-  ## session moi de caller tiep tuc encode. Vulkan khong co "commit khong cho" trong driver nay.
+  ## Equivalent of metalSessionCommitContinue: closes the current command buffer (waits for the GPU) and opens
+  ## a new session so the caller can keep encoding. This driver has no "commit without waiting" on Vulkan.
   if not gSessionActive: return false
   if not vulkanSessionEnd(): return false
   result = vulkanSessionBegin()
 
 proc vulkanRecoverQueue*(): bool =
-  ## Vulkan khong co khai niem "queue bi poisoned" nhu MTLCommandQueue. Neu 1 session bi ket
-  ## (gSessionActive = true sau loi), huy no de session ke tiep mo lai duoc. Tra true = san sang.
+  ## Vulkan has no "poisoned queue" like MTLCommandQueue. If a session is stuck
+  ## (gSessionActive = true after an error), drop it so the next session can open. Returns true = ready.
   if gSessionActive:
     gSessionActive = false
     discard lib.vkEndCommandBuffer(gSessionCmdBuf)
@@ -1553,8 +1553,8 @@ proc registerInternalScratch*(h: VulkanBufferHandle) =
     gSessionInternalBufs.add(h)
 
 proc vulkanSessionRead*(h: VulkanBufferHandle, n: int): seq[float32] =
-  ## CHỈ được gọi SAU vulkanSessionEnd() đã hoàn tất (đã wait fence) - đọc
-  ## giữa chừng session chưa commit sẽ ra dữ liệu rác/cũ (bài học từ Metal).
+  ## ONLY call AFTER vulkanSessionEnd() has completed (fence waited) - reading
+  ## in the middle of an uncommitted session gives garbage/stale data (lesson from Metal).
   result = newSeq[float32](n)
   if n > 0:
     if h.deviceOnly: stagedRead(h, addr result[0], uint64(n * sizeof(float32)))
@@ -1562,7 +1562,7 @@ proc vulkanSessionRead*(h: VulkanBufferHandle, n: int): seq[float32] =
 
 proc vulkanSessionFree*(h: var VulkanBufferHandle) =
   if gSessionActive and (h.buf != nil or h.mem != nil):
-    gSessionDeferredFree.add(h)   # van co the nam trong command buffer dang ghi -> hoan huy
+    gSessionDeferredFree.add(h)   # may still be referenced by the command buffer being recorded -> deferred destroy
     h.buf = nil
     h.mem = nil
     return
@@ -2067,10 +2067,10 @@ proc vulkanSessionLayernormEnc*(x, gamma, beta: VulkanBufferHandle, y: var Vulka
 
 proc vulkanSessionMatmulEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int): bool =
   var pc = [int32(M), int32(K), int32(N)]
-  # THÊM: m==1 = GEMV - tile 16x16 ben duoi dispatch groupY=ceil(1/16)=1,
-  # tuc chi 1/16 invocation/workgroup ra ket qua dung (giong het bug da fix
-  # ben Metal matmul_kernel_t8, xem giai thich chi tiet o metal_shim.m).
-  # Dung shader matmul_gemv.comp (subgroupAdd, khong barrier) khi M=1.
+  # ADDED: m==1 = GEMV - the 16x16 tile below dispatches groupY=ceil(1/16)=1,
+  # i.e. only 1/16 of the invocations per workgroup produce a correct result (the same bug fixed
+  # in Metal matmul_kernel_t8, explained in metal_shim.m).
+  # Uses the matmul_gemv.comp shader (subgroupAdd, no barrier) when M=1.
   if M == 1:
     dispatchGeneric("matmul_gemv", [a, b, c], addr pc[0], 12, uint32(N), 1, 1)
   else:
@@ -2080,11 +2080,11 @@ proc vulkanSessionMatmulEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle
 
 proc vulkanSessionMatmulNTEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int;
                                bOffsetElems = 0): bool =
-  ## C(M x N) = A(M x K) @ B(N x K)^T - dung shader rieng matmul_nt.comp
-  ## (doc B theo layout [N,K] tu nhien, khong transpose CPU truoc).
+  ## C(M x N) = A(M x K) @ B(N x K)^T - uses the separate matmul_nt.comp shader
+  ## (reads B in its natural [N,K] layout, no CPU transpose first).
   ## bOffsetElems: B starts that many floats into its buffer.
   var pc = [int32(M), int32(K), int32(N), int32(bOffsetElems)]
-  # THÊM: m==1 GEMV, xem giai thich o vulkanSessionMatmulEnc trên.
+  # ADDED: m==1 GEMV, see the explanation in vulkanSessionMatmulEnc above.
   if M == 1:
     dispatchGeneric("matmul_nt_gemv", [a, b, c], addr pc[0], 16, uint32(N), 1, 1)
   else:
@@ -2103,36 +2103,36 @@ proc vulkanSessionAttentionFusedEnc*(q, k, v: VulkanBufferHandle, o, sMatrix: va
 proc vulkanSessionAttentionFusedBackwardEnc*(q, k, v, sMatrix, dy: VulkanBufferHandle,
                                               dq, dk, dv: var VulkanBufferHandle,
                                               B, H, S, D: int, scale: float32): bool =
-  ## Mirror attention_fused_backward_kernel (Metal) qua kernels/
-  ## attention_fused_backward.comp - xem chi tiet trong file .comp. Dispatch
-  ## 1 thread/(bh,ti): groupCount=(B*H,S,1) voi local_size=(1,1,1) trong
-  ## shader, GIONG HET dispatchThreads cua Metal (khong group toi uu gi).
+  ## Mirror of attention_fused_backward_kernel (Metal) through kernels/
+  ## attention_fused_backward.comp - see the .comp file for details. Dispatches
+  ## 1 thread/(bh,ti): groupCount=(B*H,S,1) with local_size=(1,1,1) in the
+  ## shader, SAME as Metal's dispatchThreads (no group optimisation).
   var pc = (B: int32(B), H: int32(H), S: int32(S), D: int32(D), scale: scale)
   dispatchGeneric("attention_fused_backward", [q, k, v, sMatrix, dy, dq, dk, dv], addr pc, 20,
                   uint32(B * H), uint32(S), 1)
 
 proc vulkanSessionAttentionDecodeGqaEnc*(q, k, v: VulkanBufferHandle, o, scores: var VulkanBufferHandle,
                                           H, S, D: int, scale: float32): bool =
-  ## Mirror attention_decode_gqa_kernel.cu (CUDA)/Metal - 1 workgroup(128
-  ## thread)/query head. CANH BAO: mirror tu ban CUDA CHUA CHAY PHAN CUNG
-  ## THAT luc viet - PHAI verify bang BYBY_VERIFY_ATTN_DECODE=1 (xem
-  ## nim_inference.nim) truoc khi tin dung ket qua tren may that.
+  ## Mirror of attention_decode_gqa_kernel.cu (CUDA)/Metal - 1 workgroup (128
+  ## threads)/query head. WARNING: mirrored from the CUDA version that HAD NOT RUN ON
+  ## REAL HARDWARE when written - verify with BYBY_VERIFY_ATTN_DECODE=1 (see
+  ## nim_inference.nim) before trusting its results on a real machine.
   var pc = (H: int32(H), S: int32(S), D: int32(D), scale: scale)
   dispatchGeneric("attention_decode_gqa", [q, k, v, o, scores], addr pc, 16,
                   uint32(H), 1, 1)
 
 const attnAllHeadsGlsl = staticRead(currentSourcePath().parentDir() / "kernels" / "attention_decode_all_heads.comp")
-  ## Nhung san ma GLSL luc compile Nim -> neu chua co file .spv thi tu bien dich
-  ## bang glslc luc chay (cache trong thu muc temp), khong bat buoc build tay.
-var gAttnAllHeadsSpv = ""        ## duong dan .spv da chot ("" = chua chot)
-var gAttnAllHeadsBroken = false  ## true = khong co .spv va glslc fail -> caller dung duong cu
+  ## The GLSL is embedded when Nim compiles -> without a .spv file it is compiled
+  ## with glslc at run time (cached in the temp directory), no manual build needed.
+var gAttnAllHeadsSpv = ""        ## path of the chosen .spv ("" = not chosen yet)
+var gAttnAllHeadsBroken = false  ## true = no .spv and glslc failed -> the caller uses the old path
 
 proc vulkanSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll: VulkanBufferHandle,
                                                o: var VulkanBufferHandle,
                                                H, HKV, D, S, maxSeqLen: int): bool =
-  ## Attention decode FUSED: TOAN BO H head trong DUNG 1 dispatch (1 workgroup/head).
-  ## Mirror attention_decode_all_heads_kernel (Metal). Tra false (KHONG raise) khi
-  ## khong chay duoc -> caller roi ve vong lap tung nhom head.
+  ## FUSED attention decode: ALL H heads in EXACTLY one dispatch (1 workgroup/head).
+  ## Mirror of attention_decode_all_heads_kernel (Metal). Returns false (does NOT raise) when it
+  ## cannot run -> the caller falls back to the per-head-group loop.
   if not gSessionActive or gAttnAllHeadsBroken: return false
   if q.buf == nil or kAll.buf == nil or vAll.buf == nil or o.buf == nil: return false
   if H <= 0 or HKV <= 0 or D <= 0 or D > 256 or S <= 0 or S > maxSeqLen: return false
@@ -2144,8 +2144,8 @@ proc vulkanSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll: VulkanBufferHandle,
       try:
         gAttnAllHeadsSpv = compileVulkanJitShader("attention_decode_all_heads", attnAllHeadsGlsl)
       except CatchableError as e:
-        stderr.writeLine "[vulkan] attention_decode_all_heads: khong co .spv va glslc fail (" &
-          e.msg.splitLines()[0] & ") -> dung duong cu tung head"
+        stderr.writeLine "[vulkan] attention_decode_all_heads: no .spv and glslc failed (" &
+          e.msg.splitLines()[0] & ") -> using the old per-head path"
         gAttnAllHeadsBroken = true
         return false
   var pc = [int32(H), int32(HKV), int32(D), int32(S), int32(maxSeqLen)]
@@ -2153,8 +2153,8 @@ proc vulkanSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll: VulkanBufferHandle,
                            uint32(H), 1, 1, 0, gAttnAllHeadsSpv)
 
 proc vulkanAvailable*(): bool =
-  ## Dùng cho detectBackend() bên gpubackend.nim - thử load+init, bắt lỗi
-  ## an toàn (KHÔNG raise ra ngoài) nếu máy không có Vulkan/MoltenVK.
+  ## Used by detectBackend() in gpubackend.nim - tries load+init and catches errors
+  ## safely (does NOT raise) when the machine has no Vulkan/MoltenVK.
   try:
     ensureInit()
     result = true
@@ -2162,8 +2162,8 @@ proc vulkanAvailable*(): bool =
     result = false
 
 proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle =
-  ## Ban byte tho (khac vulkanSessionUpload chi nhan seq[float32]) - dung
-  ## cho weight int4 da pack (wq), mirror openclSessionUploadBytes.
+  ## Raw-bytes variant (vulkanSessionUpload takes only seq[float32]) - used
+  ## for packed int4 weights (wq), mirrors openclSessionUploadBytes.
   ensureInit()
   let bytes = uint64(data.len)
   if gScratchDeviceLocal:
@@ -2177,17 +2177,17 @@ proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle =
   result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: bytes)
 
 proc vulkanSessionActivationEnc*(opCode: int, x: VulkanBufferHandle, y: var VulkanBufferHandle, n: int, p: float32 = 0'f32): bool =
-  ## PC layout phai khop struct PC {int op; int n; float p;} trong
-  ## activation.comp (12 byte) - truoc day chi day 8 byte (thieu p) nen
-  ## opcode 7 (pow) tren duong session khong bao gio nhan dung so mu.
+  ## The PC layout must match struct PC {int op; int n; float p;} in
+  ## activation.comp (12 bytes) - only 8 bytes were pushed before (p missing), so
+  ## opcode 7 (pow) on the session path never got the right exponent.
   var pc: tuple[op, n: int32, p: float32] = (int32(opCode), int32(n), p)
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("activation", [x, y], addr pc, 12, groups, 1, 1)
 # =======================================================================
-# HIGH-LEVEL ONE-SHOT WRAPPERS - mirror interface cua metal_backend.nim va
-# gpubackend.nim de cung cap API thong nhat cho Vulkan. Cac ham co shader
-# .comp san thi dung GPU qua session encoder; cac ham chua co shader rieng
-# van dung CPU fallback theo chinh sach cua caller.
+# HIGH-LEVEL ONE-SHOT WRAPPERS - mirror the interface of metal_backend.nim and
+# gpubackend.nim to give Vulkan a uniform API. Functions with a
+# .comp shader use the GPU through the session encoder; those without their own shader
+# still use the CPU fallback according to the caller's policy.
 
 proc vulkanSessionGatherEnc*(src, idx: VulkanBufferHandle, dst: var VulkanBufferHandle, n: int): bool =
   var pc = [int32(n)]
@@ -2214,7 +2214,7 @@ proc vulkanSessionDropoutMaskEnc*(mask: var VulkanBufferHandle, seed: uint32, p:
 proc vulkanSessionPermuteEnc*(src: VulkanBufferHandle, dst: var VulkanBufferHandle,
                                newStrides, oldStrides, dimsMap: seq[int32], n: int): bool =
   let ndim = newStrides.len
-  doAssert ndim <= 8, "vulkanSessionPermuteEnc: rank > 8 chưa hỗ trợ (mảng push-constant cố định 8)"
+  doAssert ndim <= 8, "vulkanSessionPermuteEnc: rank > 8 not supported (fixed 8-entry push-constant array)"
   var pc: tuple[newStrides: array[8, int32], oldStrides: array[8, int32],
                 dimsMap: array[8, int32], ndim: int32, n: int32]
   for i in 0 ..< 8:
@@ -2279,10 +2279,10 @@ proc vulkanMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
   vulkanSessionFree(bufC)
 
 proc vulkanActivation*(op: string, x: seq[float32], p: float32 = 0'f32): seq[float32] =
-  ## GPU THAT cho tat ca opcode - activation.comp da co san 0=relu,1=sigmoid,
-  ## 2=tanh,4=exp,5=log,6=sqrt,7=pow (voi push-constant p rieng cho pow).
-  ## KHONG fallback CPU cho bat ky op nao trong danh sach nay - neu dispatch
-  ## GPU that bai thi raise loi that (qua gpuCheck) thay vi am tham tinh CPU.
+  ## REAL GPU for every opcode - activation.comp already has 0=relu,1=sigmoid,
+  ## 2=tanh,4=exp,5=log,6=sqrt,7=pow (with its own push-constant p for pow).
+  ## NO CPU fallback for any op in this list - if the GPU dispatch
+  ## fails it raises a real error (through gpuCheck) instead of silently computing on the CPU.
   let opCode =
     case op
     of "relu": 0
@@ -2292,14 +2292,14 @@ proc vulkanActivation*(op: string, x: seq[float32], p: float32 = 0'f32): seq[flo
     of "log": 5
     of "sqrt": 6
     of "pow": 7
-    else: raise newException(ValueError, "vulkanActivation: op khong ho tro: " & op)
+    else: raise newException(ValueError, "vulkanActivation: unsupported op: " & op)
   let n = x.len
   gpuCheck(vulkanSessionBegin(), "vulkanActivation: session begin that bai")
   var bufX = vulkanSessionUpload(x)
   var bufY = vulkanSessionAllocScratch(n)
   let ok = vulkanSessionActivationEnc(opCode, bufX, bufY, n, p)
   gpuCheck(vulkanSessionEnd(), "vulkanActivation: session end that bai")
-  gpuCheck(ok, "vulkanActivation: dispatch GPU that bai cho op=" & op & " (khong fallback CPU)")
+  gpuCheck(ok, "vulkanActivation: GPU dispatch failed for op=" & op & " (no CPU fallback)")
   result = vulkanSessionRead(bufY, n)
   vulkanSessionFree(bufX)
   vulkanSessionFree(bufY)
@@ -2317,7 +2317,7 @@ proc vulkanSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
   vulkanSessionFree(bufY)
 
 proc vulkanLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] =
-  ## CPU fallback - chua co kernels/layernorm.comp (chi moi co rmsnorm.comp).
+  ## CPU fallback - there is no kernels/layernorm.comp yet (only rmsnorm.comp).
   result = newSeq[float32](rows * cols)
   for r in 0 ..< rows:
     let base = r * cols
@@ -2334,8 +2334,8 @@ proc vulkanLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float3
       result[base + c] = gamma[c] * (x[base + c] - mean) * invStd + beta[c]
 
 proc vulkanLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
-  ## CPU fallback - cong thuc chuan cua LayerNorm backward, giong ket qua
-  ## voi cudaLayernormBackward/metalLayernormBackward.
+  ## CPU fallback - the standard LayerNorm backward formula, same results
+  ## as cudaLayernormBackward/metalLayernormBackward.
   var dx = newSeq[float32](rows * cols)
   var dgamma = newSeq[float32](cols)
   var dbeta = newSeq[float32](cols)
@@ -2367,7 +2367,7 @@ proc vulkanLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int,
   result = (dx, dgamma, dbeta)
 
 proc vulkanEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] =
-  ## CPU fallback - phep gather don gian, khong can GPU cung nhanh.
+  ## CPU fallback - a simple gather, fast enough without the GPU.
   let num = indices.len
   result = newSeq[float32](num * dim)
   for i in 0 ..< num:
@@ -2376,7 +2376,7 @@ proc vulkanEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim
       result[i * dim + d] = table[idx * dim + d]
 
 proc vulkanApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
-  ## CPU fallback - cong thuc y het vecop_apflu trong cuda kernels/vecop.ptx:
+  ## CPU fallback - exactly the vecop_apflu formula in cuda kernels/vecop.ptx:
   ## x>0 -> x*(1+alpha*x); x<=0 -> beta*x*exp(x).
   result = newSeq[float32](x.len)
   for i in 0 ..< x.len:
@@ -2387,7 +2387,7 @@ proc vulkanApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
       result[i] = beta * v * exp(v)
 
 proc vulkanApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float32] =
-  ## CPU fallback - dao ham cua APFLU: x>0 -> dy*(1+2*alpha*x);
+  ## CPU fallback - the APFLU derivative: x>0 -> dy*(1+2*alpha*x);
   ## x<=0 -> dy*beta*exp(x)*(1+x).
   result = newSeq[float32](x.len)
   for i in 0 ..< x.len:
@@ -2398,9 +2398,9 @@ proc vulkanApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float3
       result[i] = dy[i] * beta * exp(v) * (1.0'f32 + v)
 
 proc vulkanAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
-  ## Dung that GPU qua kernels/attention_fused.comp (session Enc) - mask
-  ## KHONG duoc dung toi (giong het cudaAttentionFused/metalAttentionFused,
-  ## shader tu lam causal mask ben trong).
+  ## Real GPU through kernels/attention_fused.comp (session Enc) - the mask
+  ## is NOT used (same as cudaAttentionFused/metalAttentionFused,
+  ## the shader applies the causal mask itself).
   let qkvLen = B * H * S * D
   let sLen = B * H * S * S
   gpuCheck(vulkanSessionBegin(), "vulkanAttentionFused: session begin that bai")
@@ -2421,16 +2421,16 @@ proc vulkanAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: 
   vulkanSessionFree(bufS)
 
 proc vulkanAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
-  ## SUA: dung that GPU qua kernels/attention_fused_backward.comp (session
-  ## Enc, mirror 1:1 metal_attention_fused_backward - xem giai thich trong
-  ## file .comp), KHONG con la vong lap CPU thuan nup danh GPU nhu truoc.
-  ## Cung gioi han S<=256 nhu ban Metal (mang local softmaxW[256]/
-  ## dSoftmax[256] trong shader) - kiem tra tuong minh o day, GIONG HET cach
-  ## metal_shim.m tra ve 0/false khi S>256, de bao loi ro rang thay vi doc/
-  ## ghi tran mang trong shader.
+  ## CHANGED: real GPU through kernels/attention_fused_backward.comp (session
+  ## Enc, a 1:1 mirror of metal_attention_fused_backward - see the explanation in the
+  ## .comp file), NO longer a pure CPU loop pretending to be GPU.
+  ## Same S<=256 limit as the Metal version (local arrays softmaxW[256]/
+  ## dSoftmax[256] in the shader) - checked explicitly here, SAME as
+  ## metal_shim.m returning 0/false when S>256, to report a clear error instead of reading/
+  ## writing past the shader arrays.
   if S > 256:
     raise newException(ValueError,
-      "vulkanAttentionFusedBackward: S=" & $S & " vuot gioi han 256 cua kernel (mirror gioi han cua ban Metal)")
+      "vulkanAttentionFusedBackward: S=" & $S & " exceeds the kernel limit of 256 (same limit as the Metal version)")
   let qkvLen = B * H * S * D
   let sLen = B * H * S * S
   gpuCheck(vulkanSessionBegin(), "vulkanAttentionFusedBackward: session begin that bai")
@@ -2439,10 +2439,10 @@ proc vulkanAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S,
   var bufV = vulkanSessionUpload(v)
   var bufS = vulkanSessionUpload(s_matrix)
   var bufDy = vulkanSessionUpload(dy)
-  # dq/dk/dv: shader dung "+=" (dq) / atomic CAS-add (dk, dv) -> PHAI
-  # zero-init truoc khi dispatch, GIONG HET memset trong metal_shim.m -
-  # dung vulkanSessionUpload voi seq zero thay vi vulkanSessionAllocScratch
-  # (khong dam bao zero) de chac chan buffer sach truoc khi shader cong don.
+  # dq/dk/dv: the shader uses "+=" (dq) / atomic CAS-add (dk, dv) -> they MUST be
+  # zero-initialised before dispatch, SAME as the memset in metal_shim.m -
+  # vulkanSessionUpload with a zero seq instead of vulkanSessionAllocScratch
+  # (not guaranteed zero) makes sure the buffers are clean before the shader accumulates.
   var bufDq = vulkanSessionUpload(newSeq[float32](qkvLen))
   var bufDk = vulkanSessionUpload(newSeq[float32](qkvLen))
   var bufDv = vulkanSessionUpload(newSeq[float32](qkvLen))
@@ -2461,11 +2461,11 @@ proc vulkanAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S,
   vulkanSessionFree(bufDk)
   vulkanSessionFree(bufDv)
 # =======================================================================
-# GPU HOÁ THẬT (vòng 2): GATHER / ARGMAX-INDEX / COMPARE / DROPOUT-RNG
-# Shader: kernels/gather.comp, argmax.comp, compare.comp, dropout_rng.comp
-# - compile tay bằng glslc trước khi chạy (xem ghi chú getOrCreatePipeline
-# ở trên: tự tìm file kernels/<shaderName>.spv theo tên). Cùng session
-# Begin/Enc/End/Read pattern như vulkanVecOp/vulkanMatmul ở trên.
+# REAL GPU PORT (round 2): GATHER / ARGMAX-INDEX / COMPARE / DROPOUT-RNG
+# Shaders: kernels/gather.comp, argmax.comp, compare.comp, dropout_rng.comp
+# - compiled by hand with glslc before running (see the note on getOrCreatePipeline
+# above: it looks for kernels/<shaderName>.spv by name). Same session
+# Begin/Enc/End/Read pattern as vulkanVecOp/vulkanMatmul above.
 # =======================================================================
 
 proc vulkanGather*(src: seq[float32], idx: seq[int32]): seq[float32] =
@@ -2486,7 +2486,7 @@ proc vulkanGather*(src: seq[float32], idx: seq[int32]): seq[float32] =
   vulkanSessionFree(bufSrc); vulkanSessionFree(bufIdx); vulkanSessionFree(bufDst)
 
 proc vulkanArgmaxIndex*(x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] =
-  ## argmax.comp: local_size_x=1024, 1 workgroup / cặp (o,i), yêu cầu
+  ## argmax.comp: local_size_x=1024, 1 workgroup / (o,i) pair, requires
   ## dimSize <= 1024.
   let pairs = outer * inner
   gpuCheck(vulkanSessionBegin(), "vulkanArgmaxIndex: session begin that bai")
@@ -2500,7 +2500,7 @@ proc vulkanArgmaxIndex*(x: seq[float32], outer, dimSize, inner: int): tuple[val:
   gpuCheck(ok, "vulkanArgmaxIndex: dispatch that bai")
   let outVal = vulkanSessionRead(bufVal, pairs)
   var outIdx = newSeq[int32](pairs)
-  let idxF = vulkanSessionRead(bufIdx, pairs)  # đọc lại dạng float32 rồi reinterpret bytes
+  let idxF = vulkanSessionRead(bufIdx, pairs)  # read back as float32, then reinterpret the bytes
   if pairs > 0: copyMem(addr outIdx[0], unsafeAddr idxF[0], pairs * sizeof(int32))
   vulkanSessionFree(bufX); vulkanSessionFree(bufVal); vulkanSessionFree(bufIdx)
   result = (val: outVal, idx: outIdx)
@@ -2535,14 +2535,14 @@ proc vulkanDropoutMask*(n: int, p: float32, seed: uint32): seq[float32] =
   vulkanSessionFree(bufMask)
 
 # =======================================================================
-# GPU HOÁ THẬT (vòng 3) - GIỐNG TORCH: permute/split/concat không còn build
-# mảng chỉ số O(n) trên CPU. permute.comp/split_slice.comp/concat_gather.comp
-# tự giải mã chỉ số trên GPU từ bảng nhỏ O(rank)/O(numTensors).
+# REAL GPU PORT (round 3) - LIKE TORCH: permute/split/concat no longer build
+# O(n) index arrays on the CPU. permute.comp/split_slice.comp/concat_gather.comp
+# decode the indices on the GPU from a small O(rank)/O(numTensors) table.
 # =======================================================================
 
 proc vulkanPermute*(src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] =
   let ndim = newStrides.len
-  doAssert ndim <= 8, "vulkanPermute: rank > 8 chưa hỗ trợ (mảng push-constant cố định 8)"
+  doAssert ndim <= 8, "vulkanPermute: rank > 8 not supported (fixed 8-entry push-constant array)"
   gpuCheck(vulkanSessionBegin(), "vulkanPermute: session begin that bai")
   var bufSrc = vulkanSessionUpload(src)
   var bufDst = vulkanSessionAllocScratch(n)
@@ -2574,9 +2574,9 @@ proc vulkanSplitSlice*(src: seq[float32], dimTotal, thisSize, offset, inner, n: 
 
 proc vulkanConcat*(flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq[int32],
                     totalDim, inner, n: int): seq[float32] =
-  ## SPIR-V không có mảng con trỏ device -> dùng 1 buffer nguồn ĐÃ NỐI PHẲNG
-  ## (flatSrc, host chỉ memcpy nối tiếp - KHÔNG tính chỉ số per-element) +
-  ## bảng nhỏ O(numTensors) (srcBase/srcDimSize/srcDimOffset).
+  ## SPIR-V has no array of device pointers -> one FLATTENED source buffer
+  ## (flatSrc, the host only concatenates with memcpy - NO per-element index computation) +
+  ## a small O(numTensors) table (srcBase/srcDimSize/srcDimOffset).
   let numTensors = srcBase.len
   gpuCheck(vulkanSessionBegin(), "vulkanConcat: session begin that bai")
   var bufSrc = vulkanSessionUpload(flatSrc)
@@ -2601,8 +2601,8 @@ proc vulkanConcat*(flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq
   vulkanSessionFree(bufOff); vulkanSessionFree(bufDst)
 
 # ── MicroVM launch (GLSL interpreter) ───────────────────────
-# Yêu cầu: micro_vm.spv đã load (compile micro_vm.comp).
-# Dùng dispatchGeneric pattern nếu pipeline "micro_vm" đã đăng ký.
+# Requires: micro_vm.spv loaded (compile micro_vm.comp).
+# Uses the dispatchGeneric pattern if the "micro_vm" pipeline is registered.
 
 proc vulkanLaunchMicroVm*(code: seq[uint32]; memF32: var seq[float32];
                           nThreads: int; tgFloats: int = 1): bool =
@@ -2706,9 +2706,9 @@ proc vulkanSessionJitMultiBufEnc*(kernelName, source: string;
     if b.buf.buf != nil:
       bufs[b.idx] = b.buf
       # GLSL: 0=MemF32, 1=MemU8, 2=Lut, 3=Input, 4=MemU32
-      # Caller offElems: float/u32 = element index; MemU8 = byte offset/4 neu theo
+      # Caller offElems: float/u32 = element index; MemU8 = byte offset/4 when following
       # quy uoc Metal (float*4). Weight/LUT thuong off=0.
-      # offElems = chi so float32 (khop Metal setBuffer offset/4). Weight U8 luon 0.
+      # offElems = float32 index (matches the Metal setBuffer offset/4). Weight U8 is always 0.
       offs[b.idx] = uint64(b.offElems) * uint64(sizeof(float32))
   let useCache = getEnv("BYBY_VULKAN_DISPATCH_CACHE", "1") != "0"
   var dummy: VulkanBufferHandle
