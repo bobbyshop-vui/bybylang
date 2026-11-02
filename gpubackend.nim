@@ -1256,8 +1256,12 @@ proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHa
     return vulkanSessionMatmulNTEnc(a.vulkanHandle, b.vulkanHandle, c.vulkanHandle, M, K, N,
       bOffsetElems)
   of gbCpu:
-    if bOffsetElems != 0: return false
-    c.cpuData = cpu.matmulNT(cpuTake(a, M * K), cpuTake(b, N * K), M, K, N)
+    let bLen = N * K
+    if bOffsetElems < 0 or bLen < 0 or bOffsetElems > b.cpuData.len or
+        bLen > b.cpuData.len - bOffsetElems:
+      return false
+    c.cpuData = cpu.matmulNT(cpuTake(a, M * K),
+      b.cpuData[bOffsetElems ..< bOffsetElems + bLen], M, K, N)
     return true
   else:
     return false
@@ -2483,6 +2487,8 @@ type
     ## CUDA fields kept as stubs for binary/layout compatibility only.
     cudaWq*, cudaScales*, cudaZeros*: CudaResidentTensor
     fallbackFp32*: SessionHandle    ## CPU fallback: weights dequantized once
+    cpuWq*: seq[uint8]
+    cpuScales*, cpuZeros*: seq[float32]
     cudaQ4Ready*: bool              ## legacy flag; always false (CUDA removed)
 
 proc residentPrepareQ4*(w: ResidentWeightHandle; M = 1): bool =
@@ -2528,27 +2534,12 @@ proc residentUploadQ4*(backend: GpuBackend, wq: seq[uint8], scales, zeros: seq[f
   of gbCuda:
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
+  of gbCpu:
+    result.cpuWq = wq
+    result.cpuScales = scales
+    result.cpuZeros = zeros
   else:
-    # CPU: dequantize ONCE (not every token) and upload a
-    # resident fp32 [K, N] transposed copy, through the shared sessionUpload/sessionMatmul.
-    let bytesPerRow = (k + 1) div 2
-    var wT = newSeq[float32](k * n)
-    var lut: array[16, float32]
-    for row in 0 ..< n:
-      let rowByteOff = row * bytesPerRow
-      let rowGroupOff = row * nGroupsPerRow
-      var g = -1
-      for c in 0 ..< k:
-        let gNew = if groupSize > 0: c div groupSize else: 0
-        if gNew != g:
-          g = gNew
-          let sc = scales[rowGroupOff + g]
-          let zp = zeros[rowGroupOff + g]
-          for kk in 0 ..< 16: lut[kk] = (float32(kk) - zp) * sc
-        let byteIdx = rowByteOff + c div 2
-        let nibble = if c mod 2 == 0: wq[byteIdx] and 0x0F'u8 else: (wq[byteIdx] shr 4) and 0x0F'u8
-        wT[c * n + row] = lut[int(nibble)]
-    result.fallbackFp32 = sessionUpload(chosen, wT)
+    discard
 
 proc sessionWrapHostRange*(backend: GpuBackend; data: pointer; bytes: int): tuple[h: SessionHandle, offset: int] =
   ## Read-only GPU buffer over long-lived host memory (a model mmap) without
@@ -2580,6 +2571,14 @@ proc sessionUploadPrivatePtr*(backend: GpuBackend; data: pointer; bytes: int): S
   of gbVulkan:
     result.vulkanHandle = vulkanSessionUploadBytesPrivate(
       toOpenArray(cast[ptr UncheckedArray[uint8]](data), 0, bytes - 1))
+  of gbCpu:
+    if bytes < 0 or bytes mod sizeof(float32) != 0:
+      raise newException(ValueError, "CPU session upload size must be a non-negative multiple of float32")
+    if bytes > 0 and data == nil:
+      raise newException(ValueError, "CPU session upload pointer cannot be nil")
+    result.cpuData = newSeq[float32](bytes div sizeof(float32))
+    if bytes > 0:
+      copyMem(addr result.cpuData[0], data, bytes)
   else: discard
 
 proc residentUploadQ4Mapped*(backend: GpuBackend; wq: pointer; wqBytes: int;
@@ -2675,9 +2674,14 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
   of gbCuda:
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
+  of gbCpu:
+    if w.cpuWq.len == 0 or w.cpuScales.len == 0 or w.cpuZeros.len == 0:
+      return false
+    c.cpuData = cpu.matmulQ4(cpuTake(a, M * w.k), w.cpuWq, w.cpuScales, w.cpuZeros,
+      M, w.k, w.n, w.groupSize, w.nGroupsPerRow)
+    return true
   else:
-    # CPU: reuses the shared sessionMatmul on the resident fp32 copy.
-    return sessionMatmul(chosen, a, w.fallbackFp32, c, M, w.k, w.n)
+    return false
 
 proc residentFreeQ4*(w: var ResidentWeightHandle) =
   ## Frees resident weights - call only when unloading the model/exiting,
@@ -2697,6 +2701,9 @@ proc residentFreeQ4*(w: var ResidentWeightHandle) =
     var f = w.fallbackFp32
     sessionFree(w.kind, f)
     w.fallbackFp32 = f
+    w.cpuWq = @[]
+    w.cpuScales = @[]
+    w.cpuZeros = @[]
 
 proc linearPlusAttentionSession*(backend: GpuBackend, q, k, v: seq[float32],
                                   B, H, T, D: int, scale: float32): seq[float32] =
