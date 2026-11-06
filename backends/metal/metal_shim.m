@@ -2741,13 +2741,23 @@ static id<MTLBinaryArchive> gJitArchive = nil;
 static NSString* gJitArchivePath = nil;
 static dispatch_once_t gJitArchiveOnce;
 
+static BOOL metal_jit_info_logging_enabled(void) {
+    static dispatch_once_t once;
+    static BOOL enabled = YES;
+    dispatch_once(&once, ^{
+        const char* env = getenv("BYBY_METAL_JIT_LOG");
+        if (env && env[0] == '0' && env[1] == '\0') enabled = NO;
+    });
+    return enabled;
+}
+
 static void metal_jit_archive_save(void) {
     if (!gJitArchive || !gJitArchivePath) return;
     static dispatch_once_t warnOnce;
     @autoreleasepool {
         NSError* err = nil;
         if ([gJitArchive serializeToURL:[NSURL fileURLWithPath:gJitArchivePath] error:&err]) {
-            NSLog(@"[metal_jit] archive saved %@", gJitArchivePath);
+            if (metal_jit_info_logging_enabled()) NSLog(@"[metal_jit] archive saved %@", gJitArchivePath);
         } else {
             /* serializeToURL is Apple-silicon only; on Intel it returns NO + a nil
                error. Warn only once so every run is not spammed. */
@@ -2801,7 +2811,7 @@ static void metal_jit_archive_init(void) {
             }
             gJitArchivePath = path;
             atexit(metal_jit_archive_save);
-            NSLog(@"[metal_jit] archive %@ (%@)", loaded ? @"loaded" : @"new", path);
+            if (metal_jit_info_logging_enabled()) NSLog(@"[metal_jit] archive %@ (%@)", loaded ? @"loaded" : @"new", path);
         }
     }
 }
@@ -2862,7 +2872,7 @@ int metal_jit_compile(const char* source, const char* kernelName) {
             return 0;
         }
         gJitPipelines[name] = pso;
-        NSLog(@"[metal_jit] OK kernel=%@", name);
+        if (metal_jit_info_logging_enabled()) NSLog(@"[metal_jit] OK kernel=%@", name);
         return 1;
     }
 }
