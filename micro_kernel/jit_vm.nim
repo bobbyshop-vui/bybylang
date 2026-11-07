@@ -17,6 +17,7 @@
 
 import std/[tables, strutils, strformat, times, os, pegs, hashes]
 import ./session_vm
+import ../probe
 when defined(macosx):
   import ./session_vm_dispatch
   # the GPU backend lives in vendor/bybylang/gpubackend (same bybylang package)
@@ -614,6 +615,7 @@ when defined(macosx):
       # Use the fallback key (no GPU needed) instead of raising - the result is memoized by program content.
       return fallbackWordsKey(words)
     let h = byby.sessionUploadPrivate(be, host)
+    if unlikely(firProbeOn): probePipeline(HashKernelName, buildHashProgram().words)
     var ok = sessionPipeline(HashKernelName)
     ok = ok and sessionBindBuffer(1, h.metalHandle) and
          sessionBindBuffer(2, h.metalHandle) and sessionBindBuffer(3, h.metalHandle)
@@ -661,6 +663,11 @@ proc programKey*(p: VmProgram; tag = ""): string =
     result.add '_'
     result.add sanitizeTag(tag)
 
+  if unlikely(firProbeOn):
+    probePipeline("jit_" & result, p.words)
+    probePipeline("jit_vk_" & result, p.words)
+    probePipeline("vkvm_" & result, p.words)
+
 proc programKeyNoSession*(p: VmProgram; tag = ""): string =
   ## LIKE programKey but NEVER opens a session (safe INSIDE a session, e.g. encodeMicroVm).
   ## A program hashed on the GPU before reuses that key (same kernel name); otherwise the fallback.
@@ -671,6 +678,11 @@ proc programKeyNoSession*(p: VmProgram; tag = ""): string =
   if tag.len > 0:
     result.add '_'
     result.add sanitizeTag(tag)
+
+  if unlikely(firProbeOn):
+    probePipeline("jit_" & result, p.words)
+    probePipeline("jit_vk_" & result, p.words)
+    probePipeline("vkvm_" & result, p.words)
 
 # ── Compile hook (Metal) — needs a C bridge ──────────────────────
 ## Like tinygrad's MetalCompiler: source → compiled library → pipeline name.

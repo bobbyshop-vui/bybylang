@@ -1,0 +1,12 @@
+#version 450
+// APFLU: x>0 -> x*(1+alpha*x); x<=0 -> beta*x*exp(x). Same formula as vecop_apflu (CUDA).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufX { float x[]; };
+layout(std430, binding = 1) writeonly buffer BufY { float y[]; };
+layout(push_constant) uniform PC { float alpha; float beta; int n; } pc;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pc.n)) return;
+    float v = x[id];
+    y[id] = v > 0.0 ? v * (1.0 + pc.alpha * v) : pc.beta * v * exp(v);
+}

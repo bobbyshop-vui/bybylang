@@ -12,6 +12,7 @@
 ##   NIMFORMERS_CPU_BLOCK_NC / _KC / _MC
 
 import std/os
+import ../../probe
 
 const
   CpuBackendDir = currentSourcePath().parentDir
@@ -360,6 +361,10 @@ proc rope*(x: var seq[float32], cosT, sinT: openArray[float32], T, H, D: int) =
 
 proc vmRun*(code: openArray[uint32], mem: var seq[float32],
             input: openArray[float32], nThreads, tgFloats, tgSize: int): bool =
+  if unlikely(firProbeOn):
+    probeBackend("cpu")
+    probeVmLaunch(code, (if mem.len > 0: cast[pointer](addr mem[0]) else: nil),
+      mem.len, input.len, nThreads, tgFloats, tgSize)
   if code.len == 0 or mem.len == 0 or nThreads <= 0:
     cpuLastError = "invalid CPU VM arguments"
     return false

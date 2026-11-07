@@ -1,0 +1,19 @@
+#version 450
+// One invocation per row: stats[2r] = mean, stats[2r+1] = 1/sqrt(var+eps).
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer BufX { float x[]; };
+layout(std430, binding = 1) writeonly buffer BufStats { float stats[]; };
+layout(push_constant) uniform PC { int rows; int cols; float eps; } pc;
+void main() {
+    uint r = gl_GlobalInvocationID.x;
+    if (r >= uint(pc.rows)) return;
+    int base = int(r) * pc.cols;
+    float mean = 0.0;
+    for (int c = 0; c < pc.cols; c++) mean += x[base + c];
+    mean /= float(pc.cols);
+    float variance = 0.0;
+    for (int c = 0; c < pc.cols; c++) { float d = x[base + c] - mean; variance += d * d; }
+    variance /= float(pc.cols);
+    stats[2 * r] = mean;
+    stats[2 * r + 1] = 1.0 / sqrt(variance + pc.eps);
+}

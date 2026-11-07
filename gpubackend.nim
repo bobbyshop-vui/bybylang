@@ -11,6 +11,8 @@
 # If an explicitly chosen backend is unavailable or fails, it falls back
 # to the CPU so the program always gives a correct result instead of crashing.
 import std/[strutils, math]
+import ./probe
+export probe
 from std/os import getEnv
 import ./backends/cpu/cpu_backend as cpu
 import backends/metal/metal_backend
@@ -884,8 +886,95 @@ type
     metalHandle*: MetalBufferHandle  # Metal
     cudaHandle*: CudaResidentTensor  # CUDA
     vulkanHandle*: VulkanBufferHandle  # Vulkan
+    probeIdentity*: uint64         # Probe-only session identity; survives seq relocation.
+    probeBytes*: int               # Known allocation extent for opaque GPU buffers.
     cpuData*: seq[float32]           # CPU host buffer
     cpuIndices*: seq[int32]          # CPU integer buffer (embedding/gather)
+
+proc probeRaw(h: SessionHandle): pointer =
+  case h.kind
+  of gbMetal: h.metalHandle
+  of gbVulkan, gbCuda: cast[pointer](h.vulkanHandle.buf)
+  else:
+    if h.cpuData.len > 0: cast[pointer](unsafeAddr h.cpuData[0])
+    elif h.cpuIndices.len > 0: cast[pointer](unsafeAddr h.cpuIndices[0])
+    else: nil
+
+proc probeByteSize*(h: SessionHandle): int =
+  case h.kind
+  of gbCpu: max(h.cpuData.len, h.cpuIndices.len)*4
+  of gbVulkan, gbCuda: int(h.vulkanHandle.sizeBytes)
+  else: h.probeBytes
+
+proc probeBufferRef*(h: SessionHandle): string =
+  let identity = if h.probeIdentity != 0: h.probeIdentity else: probeIdentity(probeRaw(h))
+  probeBuffer(identity, probeByteSize(h))
+
+proc probeValue*(h: SessionHandle): string =
+  probeBufferRef(h) & "@0:" & $probeByteSize(h)
+
+proc probeValue*(be: GpuBackend): string =
+  ## `$GpuBackend` already yields the canonical lowercase name.
+  let name = $normalizeBackend(be)
+  probeBackend(name)
+  name
+
+proc probeBackendValue*(be: GpuBackend) =
+  discard probeValue(be)
+
+proc probeHandleRef*(h: SessionHandle; offsetElems = 0; elems = -1): string =
+  ## Buffer reference for a port: identity@byteOffset:byteCount.
+  let bytes =
+    if elems >= 0: elems*4
+    elif offsetElems == 0: probeByteSize(h)
+    else: max(0, probeByteSize(h) - offsetElems*4)
+  probeBufferRef(h) & "@" & $(offsetElems*4) & ":" & $bytes
+
+proc probeBytesResult*(h: var SessionHandle; bytes: int) =
+  h.probeBytes = max(h.probeBytes, bytes)
+  discard probeBufferRef(h)
+
+proc probeTensorAttrs*(dtype, tensor: string; shape: openArray[int]): string =
+  "dtype=" & dtype & ",tensor=" & probeQuote(tensor) & ",shape=" & probeShape(shape)
+
+proc probePrepare*(h: var SessionHandle; origin = "observed") =
+  if h.probeIdentity == 0:
+    h.probeIdentity = if origin == "observed": probeIdentity(probeRaw(h)) else: probeNewIdentity()
+  probeAlias(probeRaw(h), h.probeIdentity)
+  discard probeBuffer(h.probeIdentity, probeByteSize(h), origin)
+
+proc probeRefresh*(h: SessionHandle) =
+  if h.probeIdentity != 0: probeAlias(probeRaw(h), h.probeIdentity)
+  discard probeBufferRef(h)
+
+proc probeName*(h: SessionHandle; name, dtype: string; shape: openArray[int]; offset = 0; bytes = -1) =
+  if unlikely(firProbeOn):
+    probeNamed(probeBufferRef(h), name, dtype, shape, offset,
+      (if bytes < 0: probeByteSize(h) else: bytes))
+
+proc probeRole*(h: SessionHandle; role: string; offset = 0; bytes = -1) =
+  if unlikely(firProbeOn):
+    probeRoleRecord(probeBufferRef(h), role, offset,
+      (if bytes < 0: probeByteSize(h)-offset else: bytes))
+
+proc probeRoleScalar*(h: SessionHandle; role: string; offset, value: int) =
+  if unlikely(firProbeOn): probeScalar(probeBufferRef(h), role, offset, value)
+
+proc probeCode*(h: SessionHandle; words: openArray[uint32]) =
+  if unlikely(firProbeOn):
+    let identity = if h.probeIdentity != 0: h.probeIdentity else: probeIdentity(probeRaw(h))
+    probeCode(identity, words)
+
+proc probeCodeProgram*(h: SessionHandle): string =
+  let identity = if h.probeIdentity != 0: h.probeIdentity else: probeIdentity(probeRaw(h))
+  if h.kind == gbCpu:
+    var words = newSeq[uint32](h.cpuData.len)
+    if words.len > 0: copyMem(addr words[0], unsafeAddr h.cpuData[0], words.len*4)
+    return probeProgram(words)
+  let program = probeCodeProgram(identity)
+  if program != "none": return program
+  probeEvent("note kind=missing_words api=sessionMicroVmEnc")
+  "none"
 
 proc cpuTake(h: SessionHandle; n: int): seq[float32] =
   result = newSeq[float32](max(n, 0))
@@ -923,7 +1012,7 @@ proc ensureGpuInit*(backend: GpuBackend): bool =
   else:
     return true
 
-proc sessionBegin*(backend: GpuBackend): bool =
+proc sessionBegin*(backend: GpuBackend): bool {.probed.} =
   ## Starts a session - creates the command buffer for the chosen backend
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -947,7 +1036,7 @@ proc sessionBegin*(backend: GpuBackend): bool =
     return false
 
 proc sessionMicroVmEnc*(backend: GpuBackend, code, mem: SessionHandle,
-                        nThreads, tgFloats, tgSize: int): bool =
+                        nThreads, tgFloats, tgSize: int): bool {.probed.} =
   ## Generic bytecode VM dispatch. Vulkan uses its SPIR-V interpreter; Metal
   ## continues through its encoder/JIT path in mamba2_ssm_gpu.nim.
   var chosen = backend
@@ -965,7 +1054,7 @@ proc sessionMicroVmEnc*(backend: GpuBackend, code, mem: SessionHandle,
   false
 
 proc sessionJitPrewarm*(backend: GpuBackend;
-                        jobs: openArray[tuple[name, source: string]]) =
+                        jobs: openArray[tuple[name, source: string]]) {.probed.} =
   ## Compile a batch of shaders before the hot path starts. Vulkan shells out
   ## to glslc per kernel, so this runs them concurrently; other backends have
   ## no on-disk shader step and ignore the request.
@@ -976,22 +1065,22 @@ proc sessionJitPrewarm*(backend: GpuBackend;
     vulkanJitPrewarm(jobs)
 
 proc sessionCooperativeGemmJobs*(backend: GpuBackend):
-    seq[tuple[name, source: string]] =
+    seq[tuple[name, source: string]] {.probed.} =
   ## Shaders behind sessionFp4GemmTensorCore / sessionMatmulNTAccelerated, for
   ## sessionJitPrewarm. Empty when no cooperative route is available.
   if normalizeBackend(backend) == gbVulkan: vulkanCoopPrewarmJobs() else: @[]
 
-proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool =
+proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool {.probed.} =
   ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
   normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
 
-proc sessionTensorCoreRequired*(backend: GpuBackend): bool =
+proc sessionTensorCoreRequired*(backend: GpuBackend): bool {.probed.} =
   ## True when every prefill GEMM (M > 1) must run on the tensor cores
   ## (Vulkan dGPU with KHR_cooperative_matrix, see BYBY_VULKAN_TENSOR_CORES).
   normalizeBackend(backend) == gbVulkan and vulkanTensorCoreRequired()
 
 proc sessionJitMicroVmEnc*(backend: GpuBackend, kernelName, source: string,
-                           mem: SessionHandle, nThreads, tgSize: int; tgFloats = 1024): bool =
+                           mem: SessionHandle, nThreads, tgSize: int; tgFloats = 1024): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -1000,7 +1089,7 @@ proc sessionJitMicroVmEnc*(backend: GpuBackend, kernelName, source: string,
       nThreads, tgSize, tgFloats)
   false
 
-proc sessionUpload*(backend: GpuBackend, data: seq[float32]): SessionHandle =
+proc sessionUpload*(backend: GpuBackend, data: seq[float32]): SessionHandle {.probed.} =
   ## Uploads data to the GPU in the current session
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -1023,7 +1112,7 @@ proc sessionUpload*(backend: GpuBackend, data: seq[float32]): SessionHandle =
   else:
     discard
 
-proc sessionUploadBorrowed*(backend: GpuBackend, data: var seq[float32]): SessionHandle =
+proc sessionUploadBorrowed*(backend: GpuBackend, data: var seq[float32]): SessionHandle {.probed.} =
   ## Session-scoped upload whose host sequence must remain alive through
   ## sessionRead/sessionFree. Metal can bind aligned Shared host storage
   ## without a second full-size copy; other backends retain their normal path.
@@ -1045,7 +1134,7 @@ proc sessionUploadBorrowed*(backend: GpuBackend, data: var seq[float32]): Sessio
   else:
     discard
 
-proc sessionUploadPrivate*(backend: GpuBackend, data: openArray[float32]): SessionHandle =
+proc sessionUploadPrivate*(backend: GpuBackend, data: openArray[float32]): SessionHandle {.probed.} =
   ## Private-storage variant of sessionUpload - ONLY for RESIDENT weights
   ## (uploaded ONCE when the model loads, never read/written by the CPU afterwards) - currently used
   ## by beResidentUploadFp32 (int8/int4-symmetric/tied-embedding weights through
@@ -1076,7 +1165,7 @@ proc sessionUploadPrivate*(backend: GpuBackend, data: openArray[float32]): Sessi
   else:
     discard
 
-proc sessionUploadIndices*(backend: GpuBackend, data: seq[int32]): SessionHandle =
+proc sessionUploadIndices*(backend: GpuBackend, data: seq[int32]): SessionHandle {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -1096,7 +1185,7 @@ proc cuAllocScratch*(n: int): CudaResidentTensor =
   ## CUDA removed — stub.
   raise newException(CatchableError, "CUDA removed - use Vulkan sessionAllocScratch")
 
-proc sessionAllocHeap*(backend: GpuBackend, totalElems: int): pointer =
+proc sessionAllocHeap*(backend: GpuBackend, totalElems: int): pointer {.probed.} =
   ## NEW: allocates one large region ONCE (device level) so that
   ## sessionAllocFromHeap() can suballocate many CHEAP child buffers from it - for
   ## cases needing many buffers of the same size/lifetime (typically the resident
@@ -1119,7 +1208,7 @@ proc sessionAllocHeap*(backend: GpuBackend, totalElems: int): pointer =
   else:
     return nil
 
-proc sessionAllocFromHeap*(backend: GpuBackend, heap: pointer, n: int): SessionHandle =
+proc sessionAllocFromHeap*(backend: GpuBackend, heap: pointer, n: int): SessionHandle {.probed.} =
   ## Suballocates one child buffer (n float32 elements) from a heap allocated with
   ## sessionAllocHeap(). If heap=nil (backend without MTLHeap), returns an
   ## "empty" handle (metalHandle=nil) - the caller MUST check it and fall back
@@ -1144,7 +1233,7 @@ proc sessionAllocFromHeap*(backend: GpuBackend, heap: pointer, n: int): SessionH
   else:
     discard
 
-proc sessionFreeHeap*(backend: GpuBackend, heap: var pointer) =
+proc sessionFreeHeap*(backend: GpuBackend, heap: var pointer) {.probed.} =
   ## Frees the heap - call ONLY when ALL child buffers suballocated from it
   ## are no longer used (like ARC MTLHeap: child buffers hold their own __bridge_retained,
   ## so freeing the heap does not destroy them, but NO more suballocation is possible
@@ -1162,7 +1251,7 @@ proc sessionFreeHeap*(backend: GpuBackend, heap: var pointer) =
   else:
     discard
 
-proc sessionAllocScratch*(backend: GpuBackend, n: int): SessionHandle =
+proc sessionAllocScratch*(backend: GpuBackend, n: int): SessionHandle {.probed.} =
   ## Allocates an output buffer in the session
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -1188,7 +1277,7 @@ proc sessionAllocScratch*(backend: GpuBackend, n: int): SessionHandle =
 # ENCODE OPS VÀO SESSION
 # ─────────────────────────────────────────────────────────────
 
-proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool =
+proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int): bool {.probed.} =
   ## Encodes a matmul into the session: C(M x N) = A(M x K) @ B(K x N)
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -1223,7 +1312,7 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
     return false
 
 proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int;
-                      bOffsetElems = 0): bool =
+                      bOffsetElems = 0): bool {.probed.} =
   ## Encodes matmul-NT into the session: C(M x N) = A(M x K) @ B(N x K)^T.
   ## bOffsetElems: B starts that many floats into its buffer (a weight
   ## wrapped in place by sessionWrapHostRange).
@@ -1267,7 +1356,7 @@ proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHa
     return false
 
 proc sessionMatmulNTAccelerated*(backend: GpuBackend, a, b: SessionHandle,
-    c: var SessionHandle; M, K, N: int): bool =
+    c: var SessionHandle; M, K, N: int): bool {.probed.} =
   ## Inference opt-in to FP16 tensor inputs with FP32 accumulation. Ordinary
   ## sessionMatmulNT retains its FP32 contract for training and exact callers.
   if normalizeBackend(backend) == gbVulkan:
@@ -1278,7 +1367,7 @@ proc sessionMatmulNTAccelerated*(backend: GpuBackend, a, b: SessionHandle,
   sessionMatmulNT(backend, a, b, c, M, K, N)
 
 proc sessionMatmulNTFp16Coop*(backend: GpuBackend, a, b: SessionHandle,
-    c: var SessionHandle; M, K, N: int): bool =
+    c: var SessionHandle; M, K, N: int): bool {.probed.} =
   ## Try only the Vulkan FP16-input/FP32-accumulate cooperative matrix path.
   ## False lets inference choose its existing MSL/VM fallback without first
   ## silently executing a second FP32 matmul.
@@ -1289,7 +1378,7 @@ proc sessionMatmulNTFp16Coop*(backend: GpuBackend, a, b: SessionHandle,
     c.vulkanHandle, M, K, N)
 
 proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
-    c: var SessionHandle; M, K, N: int): bool =
+    c: var SessionHandle; M, K, N: int): bool {.probed.} =
   ## False means the caller must use its packed FP4 microkernel.
   if normalizeBackend(backend) != gbVulkan: return false
   if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
@@ -1297,7 +1386,7 @@ proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
     c.vulkanHandle, M, K, N)
 
 proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
-    c: var SessionHandle; M, K, N: int): bool =
+    c: var SessionHandle; M, K, N: int): bool {.probed.} =
   ## Only the tiled FP4 cooperative kernel (for parity checks); false if it
   ## cannot run on this device/shape.
   if normalizeBackend(backend) != gbVulkan: return false
@@ -1306,21 +1395,21 @@ proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
     c.vulkanHandle, M, K, N)
 
 proc sessionMatmulNTTiledEnc*(backend: GpuBackend, a, w: SessionHandle,
-    c: var SessionHandle; M, K, N: int): bool =
+    c: var SessionHandle; M, K, N: int): bool {.probed.} =
   ## Only the tiled FP32-weight cooperative kernel (for parity checks).
   if normalizeBackend(backend) != gbVulkan: return false
   if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
   vulkanSessionMatmulNTTiledEnc(a.vulkanHandle, w.vulkanHandle, c.vulkanHandle, M, K, N)
 
-proc sessionSetF32GemmTiled*(backend: GpuBackend; enabled: bool) =
+proc sessionSetF32GemmTiled*(backend: GpuBackend; enabled: bool) {.probed.} =
   ## Let sessionMatmulNTAccelerated / sessionMatmulNTFp16Coop prefer the tiled kernel.
   if normalizeBackend(backend) == gbVulkan: vulkanSetF32GemmTiled(enabled)
 
-proc sessionSetFp4GemmTiled*(backend: GpuBackend; enabled: bool) =
+proc sessionSetFp4GemmTiled*(backend: GpuBackend; enabled: bool) {.probed.} =
   ## Let sessionFp4GemmTensorCore prefer the tiled kernel (after a parity check).
   if normalizeBackend(backend) == gbVulkan: vulkanSetFp4GemmTiled(enabled)
 
-proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, rows, cols: int): bool =
+proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, rows, cols: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -1348,7 +1437,7 @@ proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle
     return false
 
 proc sessionLayernormEnc*(backend: GpuBackend, x, gamma, beta: SessionHandle, y: var SessionHandle,
-                           rows, cols: int, eps: float32): bool =
+                           rows, cols: int, eps: float32): bool {.probed.} =
   ## Encodes layernorm into the current session.
   ## Metal: metal_layernorm_enc (already in the shim, now bound to Nim).
   ## CUDA: cuLayernormR already existed and ALREADY launched asynchronously on
@@ -1381,7 +1470,7 @@ proc sessionLayernormEnc*(backend: GpuBackend, x, gamma, beta: SessionHandle, y:
     return false
 
 proc sessionRmsnormEnc*(backend: GpuBackend, x, gamma: SessionHandle, y: var SessionHandle,
-                         rows, cols: int, eps: float32): bool =
+                         rows, cols: int, eps: float32): bool {.probed.} =
   ## Encodes RMSNorm (no mean subtraction, no beta - unlike layernorm) into the current
   ## session. Mirror of sessionLayernormEnc above.
   ## Metal: metalSessionRmsnormEnc (metal_backend.nim - returns false when the build
@@ -1415,7 +1504,7 @@ proc sessionRmsnormEnc*(backend: GpuBackend, x, gamma: SessionHandle, y: var Ses
     return false
 
 proc sessionAttentionFusedEnc*(backend: GpuBackend, q, k, v: SessionHandle, o, sMatrix: var SessionHandle,
-                                B, H, S, D: int, scale: float32): bool =
+                                B, H, S, D: int, scale: float32): bool {.probed.} =
   ## Encodes attention_fused into the current session.
   ## Metal: metal_attention_fused_enc (newly written).
   ## CUDA: cuAttentionFusedR (newly written, mirrors cudaLayernormR - launches async
@@ -1457,7 +1546,7 @@ proc sessionAttentionFusedEnc*(backend: GpuBackend, q, k, v: SessionHandle, o, s
     return false
 
 proc sessionAttentionDecodeGqaEnc*(backend: GpuBackend, q, k, v: SessionHandle, o, scores: var SessionHandle,
-                                    H, S, D: int, scale: float32): bool =
+                                    H, S, D: int, scale: float32): bool {.probed.} =
   ## NEW for single-token decode with GQA - UNLIKE sessionAttentionFusedEnc
   ## q has only H*D elements (one row/head, the new token) and k/v have S*D elements
   ## SHARED by all H heads (one GQA KV-head pair), not B*H*S*D as in
@@ -1518,7 +1607,7 @@ proc sessionAttentionDecodeGqaEnc*(backend: GpuBackend, q, k, v: SessionHandle, 
     return false
 
 proc sessionAttentionDecodeAllHeadsEnc*(backend: GpuBackend, q, kAll, vAll: SessionHandle, o: var SessionHandle,
-                                         H, HKV, D, S, maxSeqLen: int): bool =
+                                         H, HKV, D, S, maxSeqLen: int): bool {.probed.} =
   ## NEW: FUSED attention decode for all H heads in EXACTLY one dispatch,
   ## replacing the CPU loop "for hkv in 0..<HKV: copyInto+matmulNT+softmax+
   ## matmul+copyInto" (H*5 separate dispatches). kAll/vAll MUST be buffers
@@ -1565,7 +1654,7 @@ proc sessionAttentionDecodeAllHeadsEnc*(backend: GpuBackend, q, kAll, vAll: Sess
   else:
     return false
 
-proc sessionPacesCommandBuffers*(backend: GpuBackend): bool =
+proc sessionPacesCommandBuffers*(backend: GpuBackend): bool {.probed.} =
   ## True when long GPU work should be split into time-bounded command buffers
   ## (the macOS watchdog kills one that runs for seconds on an Intel/AMD Mac,
   ## and Vulkan drivers have timeouts too). False on Apple Silicon, whose
@@ -1584,7 +1673,7 @@ proc sessionPacesCommandBuffers*(backend: GpuBackend): bool =
   else:
     return false
 
-proc sessionFlashAttentionPrepare*(backend: GpuBackend, D: int): string =
+proc sessionFlashAttentionPrepare*(backend: GpuBackend, D: int): string {.probed.} =
   ## Picks the prefill flash-attention kernel for head dim D; call it OUTSIDE a
   ## session (Vulkan checks its kernels against a reference first). Returns
   ## "coop" (Vulkan tensor cores), "scalar" (Vulkan/Metal FP32), "cpu", or ""
@@ -1611,7 +1700,7 @@ proc sessionFlashAttentionPrepare*(backend: GpuBackend, D: int): string =
 
 proc sessionFlashAttentionPrefillEnc*(backend: GpuBackend, q, kAll, vAll: SessionHandle,
                                       o: var SessionHandle, T, H, HKV, D, pos, maxSeqLen: int,
-                                      scale: float32): bool =
+                                      scale: float32): bool {.probed.} =
   ## Causal prefill flash attention in one dispatch: o[T, H, D] =
   ## softmax(q K^T * scale) V with row t attending cache positions 0 .. pos + t.
   ## q/o position-major [T, H, D]; kAll/vAll [HKV, maxSeqLen, D] already hold
@@ -1663,7 +1752,7 @@ proc sessionFlashAttentionPrefillEnc*(backend: GpuBackend, q, kAll, vAll: Sessio
     return false
 
 proc sessionKvScatterEnc*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
-                          T, HKV, D, pos, maxSeqLen: int): bool =
+                          T, HKV, D, pos, maxSeqLen: int): bool {.probed.} =
   ## KV cache append for T new positions: dst[h, pos + t, :] = src[t, h, :]
   ## (src = the K or V projection [T, HKV, D], dst = [HKV, maxSeqLen, D]).
   var chosen = backend
@@ -1688,7 +1777,7 @@ proc sessionKvScatterEnc*(backend: GpuBackend, src: SessionHandle, dst: var Sess
   else:
     return false
 
-proc sessionMamba2SsdPrepare*(backend: GpuBackend, N, D, Q: int): string =
+proc sessionMamba2SsdPrepare*(backend: GpuBackend, N, D, Q: int): string {.probed.} =
   ## Picks and parity-checks the chunked Mamba2 SSD/FLA prefill pipelines for
   ## (d_state N, head dim D, chunk length Q), outside any session. Returns
   ## "coop" (tensor cores), "scalar" (FP32 tiles) or "" (unavailable; keep the
@@ -1699,7 +1788,7 @@ proc sessionMamba2SsdPrepare*(backend: GpuBackend, N, D, Q: int): string =
 proc sessionMamba2SsdPrefillEnc*(backend: GpuBackend, arena: SessionHandle,
     T, H, G, N, D, Q, C, cDim: int,
     offConv, offDt, offCum, offALog, offDSkip,
-    offYPre, offStates, offSloc: int, cont: bool): bool =
+    offYPre, offStates, offSloc: int, cont: bool): bool {.probed.} =
   ## Encodes the whole chunked SSD pass (cumsum, FLA intra-chunk, chunk states,
   ## combine, inter-chunk: five dispatches) over one float32 arena, replacing
   ## the Mamba2 sequence scan for this layer. Offsets are float32 indices into
@@ -1712,7 +1801,7 @@ proc sessionMamba2SsdPrefillEnc*(backend: GpuBackend, arena: SessionHandle,
   vulkanSessionMamba2SsdPrefillEnc(arena.vulkanHandle, T, H, G, N, D, Q, C, cDim,
     offConv, offDt, offCum, offALog, offDSkip, offYPre, offStates, offSloc, cont)
 
-proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var SessionHandle, n: int): bool =
+proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var SessionHandle, n: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -1761,7 +1850,7 @@ proc sessionVecOp*(backend: GpuBackend, op: string, a, b: SessionHandle, c: var 
     return false
 
 proc sessionRope*(backend: GpuBackend, x: SessionHandle, cosT, sinT: SessionHandle,
-                   T, Hn, D: int): bool =
+                   T, Hn, D: int): bool {.probed.} =
   ## In-place rotate_half RoPE, encoded into the open session. Currently ONLY
   ## implemented on Metal (see metal_rope_enc in metal_shim.m). On
   ## CUDA it returns false on purpose - the caller (fusedNormQKVRoPE) MUST
@@ -1792,7 +1881,7 @@ proc sessionRope*(backend: GpuBackend, x: SessionHandle, cosT, sinT: SessionHand
   else:
     return false
 
-proc sessionScale*(backend: GpuBackend, x: SessionHandle, scalar: float32, n: int): bool =
+proc sessionScale*(backend: GpuBackend, x: SessionHandle, scalar: float32, n: int): bool {.probed.} =
   ## NEW (BYBY_MERGE_QKV_ATTN_SESSION): in-place scalar multiply (x *= s)
   ## INSIDE the open session. Used to apply attn.scale to Q on the GPU
   ## (instead of reading Q back, scaling on the CPU and uploading again) - required to merge
@@ -1833,7 +1922,7 @@ proc sessionScale*(backend: GpuBackend, x: SessionHandle, scalar: float32, n: in
     return false
 
 proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
-                       srcOffsetElems, dstOffsetElems, n: int): bool =
+                       srcOffsetElems, dstOffsetElems, n: int): bool {.probed.} =
   ## dst[dstOffsetElems ..< +n] = src[srcOffsetElems ..< +n], device-to-device,
   ## encoded into the open session.
   ## NEW srcOffsetElems: extracts a slice from a large SOURCE buffer
@@ -1869,12 +1958,12 @@ proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionH
     return false
 
 proc sessionCopyInto*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
-                       dstOffsetElems, n: int): bool =
+                       dstOffsetElems, n: int): bool {.probed.} =
   ## Keeps the old overload (srcOffsetElems=0) - callers that already worked
   ## (e.g. merge oProj) need no change, 100% backward compatible.
   sessionCopyInto(backend, src, dst, 0, dstOffsetElems, n)
 
-proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: var SessionHandle, n: int, p: float32 = 0.0'f32): bool =
+proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: var SessionHandle, n: int, p: float32 = 0.0'f32): bool {.probed.} =
   ## CHANGED: added parameter p (default 0.0, old call sites unchanged) + more
   ## opCodes for sqrt/exp/log/pow (4/5/6/7) - before, only
   ## relu/sigmoid/tanh/apflu (0-3) were mapped, so "gpu sqrt/exp/log/pow" in a
@@ -1927,7 +2016,7 @@ proc sessionActivation*(backend: GpuBackend, op: string, x: SessionHandle, y: va
     return false
 
 proc sessionApfluEnc*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, n: int,
-                       alpha, beta: float32): bool =
+                       alpha, beta: float32): bool {.probed.} =
   ## APFLU forward through a session. Metal: the kernel currently supports ONLY
   ## alpha=0.1/beta=1.0 (see the immediate metalApflu) - returns false otherwise
   ## so the caller falls back to immediate (correct, no silent error).
@@ -1947,10 +2036,8 @@ proc sessionApfluEnc*(backend: GpuBackend, x: SessionHandle, y: var SessionHandl
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
-    # No real apflu.comp shader for Vulkan yet (the immediate vulkanApflu currently
-    # also runs a CPU fallback, not a new bug) - returns false so the
-    # caller falls back to immediate; NO untested kernel invented.
-    return false
+    if y.vulkanHandle.buf == nil: y.vulkanHandle = vulkanSessionAllocScratch(n)
+    return vulkanSessionApfluEnc(x.vulkanHandle, y.vulkanHandle, n, alpha, beta)
   of gbCpu:
     y.cpuData = cpu.apflu(cpuTake(x, n), alpha, beta)
     return true
@@ -1958,7 +2045,7 @@ proc sessionApfluEnc*(backend: GpuBackend, x: SessionHandle, y: var SessionHandl
     return false
 
 proc sessionApfluBackwardEnc*(backend: GpuBackend, x, dy: SessionHandle, dx: var SessionHandle, n: int,
-                               alpha, beta: float32): bool =
+                               alpha, beta: float32): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -1975,14 +2062,15 @@ proc sessionApfluBackwardEnc*(backend: GpuBackend, x, dy: SessionHandle, dx: var
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
-    return false
+    if dx.vulkanHandle.buf == nil: dx.vulkanHandle = vulkanSessionAllocScratch(n)
+    return vulkanSessionApfluBackwardEnc(x.vulkanHandle, dy.vulkanHandle, dx.vulkanHandle, n, alpha, beta)
   of gbCpu:
     dx.cpuData = cpu.apfluBackward(cpuTake(x, n), cpuTake(dy, n), alpha, beta)
     return true
   else:
     return false
 
-proc sessionGatherEnc*(backend: GpuBackend, src, idx: SessionHandle, dst: var SessionHandle, n: int): bool =
+proc sessionGatherEnc*(backend: GpuBackend, src, idx: SessionHandle, dst: var SessionHandle, n: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2007,7 +2095,7 @@ proc sessionGatherEnc*(backend: GpuBackend, src, idx: SessionHandle, dst: var Se
   else:
     return false
 
-proc sessionCompareEnc*(backend: GpuBackend, a, b: SessionHandle, mask: var SessionHandle, op, n: int): bool =
+proc sessionCompareEnc*(backend: GpuBackend, a, b: SessionHandle, mask: var SessionHandle, op, n: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2034,7 +2122,7 @@ proc sessionCompareEnc*(backend: GpuBackend, a, b: SessionHandle, mask: var Sess
   else:
     return false
 
-proc sessionDropoutMaskEnc*(backend: GpuBackend, mask: var SessionHandle, n: int, p: float32, seed: uint32): bool =
+proc sessionDropoutMaskEnc*(backend: GpuBackend, mask: var SessionHandle, n: int, p: float32, seed: uint32): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2061,7 +2149,7 @@ proc sessionDropoutMaskEnc*(backend: GpuBackend, mask: var SessionHandle, n: int
     return false
 
 proc sessionArgmaxIndexEnc*(backend: GpuBackend, x: SessionHandle, val, idx: var SessionHandle,
-                             outer, dimSize, inner: int): bool =
+                             outer, dimSize, inner: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2091,7 +2179,7 @@ proc sessionArgmaxIndexEnc*(backend: GpuBackend, x: SessionHandle, val, idx: var
     return false
 
 proc sessionPermuteEnc*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
-                         newStrides, oldStrides, dimsMap: SessionHandle, ndim, n: int): bool =
+                         newStrides, oldStrides, dimsMap: SessionHandle, ndim, n: int): bool {.probed.} =
   ## newStrides/oldStrides/dimsMap: ALREADY uploaded (sessionUploadIndices) by the
   ## caller - small O(rank) tables, not re-uploaded on each call here.
   var chosen = backend
@@ -2107,10 +2195,8 @@ proc sessionPermuteEnc*(backend: GpuBackend, src: SessionHandle, dst: var Sessio
       return false
   of gbVulkan:
     if dst.vulkanHandle.buf == nil: dst.vulkanHandle = vulkanSessionAllocScratch(n)
-    # The Vulkan Enc takes a seq[int32] directly (uploaded internally each time, rank<=8 so cheap)
-    # - NOT an uploaded buffer like Metal/CUDA, slightly different because
-    # dispatchGeneric embeds the table in the push constants of the call.
-    return false
+    return vulkanSessionPermuteBufEnc(src.vulkanHandle, newStrides.vulkanHandle,
+      oldStrides.vulkanHandle, dimsMap.vulkanHandle, dst.vulkanHandle, ndim, n)
   of gbCpu:
     dst.cpuData = cpu.permute(cpuTake(src, n), cpuTakeIndices(newStrides, ndim),
       cpuTakeIndices(oldStrides, ndim), cpuTakeIndices(dimsMap, ndim), n)
@@ -2119,7 +2205,7 @@ proc sessionPermuteEnc*(backend: GpuBackend, src: SessionHandle, dst: var Sessio
     return false
 
 proc sessionSplitSliceEnc*(backend: GpuBackend, src: SessionHandle, dst: var SessionHandle,
-                            dimTotal, thisSize, offset, inner, n: int): bool =
+                            dimTotal, thisSize, offset, inner, n: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2146,7 +2232,7 @@ proc sessionSplitSliceEnc*(backend: GpuBackend, src: SessionHandle, dst: var Ses
     return false
 
 proc sessionLayernormBackwardEnc*(backend: GpuBackend, dy, x, gamma, beta: SessionHandle,
-                                   dx, dgamma, dbeta: var SessionHandle, rows, cols: int, eps: float32): bool =
+                                   dx, dgamma, dbeta: var SessionHandle, rows, cols: int, eps: float32): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2164,9 +2250,11 @@ proc sessionLayernormBackwardEnc*(backend: GpuBackend, dy, x, gamma, beta: Sessi
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
-    # The immediate vulkanLayernormBackward currently uses a CPU fallback (no real
-    # layernorm_backward.comp) - returns false, NO untested shader invented.
-    return false
+    if dx.vulkanHandle.buf == nil: dx.vulkanHandle = vulkanSessionAllocScratch(rows * cols)
+    if dgamma.vulkanHandle.buf == nil: dgamma.vulkanHandle = vulkanSessionAllocScratch(cols)
+    if dbeta.vulkanHandle.buf == nil: dbeta.vulkanHandle = vulkanSessionAllocScratch(cols)
+    return vulkanSessionLayernormBackwardEnc(dy.vulkanHandle, x.vulkanHandle, gamma.vulkanHandle,
+      dx.vulkanHandle, dgamma.vulkanHandle, dbeta.vulkanHandle, rows, cols, eps)
   of gbCpu:
     let r = cpu.layernormBackward(cpuTake(dy, rows * cols), cpuTake(x, rows * cols),
       cpuTake(gamma, cols), cpuTake(beta, cols), rows, cols, eps)
@@ -2178,7 +2266,7 @@ proc sessionLayernormBackwardEnc*(backend: GpuBackend, dy, x, gamma, beta: Sessi
     return false
 
 proc sessionAttentionFusedBackwardEnc*(backend: GpuBackend, q, k, v, sMatrix, dy: SessionHandle,
-                                        dq, dk, dv: var SessionHandle, B, H, S, D: int, scale: float32): bool =
+                                        dq, dk, dv: var SessionHandle, B, H, S, D: int, scale: float32): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2215,7 +2303,7 @@ proc sessionAttentionFusedBackwardEnc*(backend: GpuBackend, q, k, v, sMatrix, dy
     return false
 
 proc sessionEmbeddingLookupEnc*(backend: GpuBackend, table, indices: SessionHandle, y: var SessionHandle,
-                                 vocab, dim, numIndices: int): bool =
+                                 vocab, dim, numIndices: int): bool {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2230,9 +2318,8 @@ proc sessionEmbeddingLookupEnc*(backend: GpuBackend, table, indices: SessionHand
     # CUDA removed — chosen is remapped to gbVulkan before case
     raise newException(CatchableError, "CUDA backend removed; use Vulkan")
   of gbVulkan:
-    # The immediate vulkanEmbeddingLookup currently uses a CPU fallback (no
-    # real embedding.comp) - returns false.
-    return false
+    if y.vulkanHandle.buf == nil: y.vulkanHandle = vulkanSessionAllocScratch(numIndices * dim)
+    return vulkanSessionEmbeddingLookupEnc(table.vulkanHandle, indices.vulkanHandle, y.vulkanHandle, dim, numIndices)
   of gbCpu:
     y.cpuData = cpu.embeddingLookup(table.cpuData, cpuTakeIndices(indices, numIndices), vocab, dim)
     return true
@@ -2243,7 +2330,7 @@ proc sessionEmbeddingLookupEnc*(backend: GpuBackend, table, indices: SessionHand
 # KẾT THÚC SESSION - COMMIT + WAIT
 # ─────────────────────────────────────────────────────────────
 
-proc sessionEnd*(backend: GpuBackend): bool =
+proc sessionEnd*(backend: GpuBackend): bool {.probed.} =
   ## Ends the session - commits all ops and waits
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -2265,7 +2352,7 @@ proc sessionEnd*(backend: GpuBackend): bool =
   else:
     return false
 
-proc sessionCommitContinue*(backend: GpuBackend): bool =
+proc sessionCommitContinue*(backend: GpuBackend): bool {.probed.} =
   ## NEW: "commitAndContinue" (following Apple's MPSCommandBuffer / PyTorch MPS
   ## SyncType::COMMIT_ADAPTIVE) - commits the current buffer WITHOUT WAITING and opens
   ## a new buffer right away to keep encoding in the SAME logical "session". Call periodically
@@ -2290,7 +2377,7 @@ proc sessionCommitContinue*(backend: GpuBackend): bool =
   else:
     return false
 
-proc sessionRecoverQueue*(backend: GpuBackend): bool =
+proc sessionRecoverQueue*(backend: GpuBackend): bool {.probed.} =
   ## NEW: call right after sessionEnd() returns false - recreates the
   ## "poisoned" MTLCommandQueue (see the details in
   ## metalRecoverQueue/metal_recover_queue). WITHOUT this call after a failed
@@ -2314,7 +2401,7 @@ proc sessionRecoverQueue*(backend: GpuBackend): bool =
   else:
     return false
 
-proc sessionGetLastError*(backend: GpuBackend): string =
+proc sessionGetLastError*(backend: GpuBackend): string {.probed.} =
   ## NEW: the REAL NSError/error description of the last failed sessionEnd()
   ## (see metal_shim.h::metal_get_last_session_error) - call ONLY
   ## right after sessionEnd() returns false, before opening another
@@ -2336,7 +2423,7 @@ proc sessionGetLastError*(backend: GpuBackend): string =
   else:
     return ""
 
-proc sessionRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] =
+proc sessionRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] {.probed.} =
   ## Reads data from the GPU back to the CPU after sessionEnd
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -2361,7 +2448,7 @@ proc sessionRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] =
   else:
     return @[]
 
-proc sessionFree*(backend: GpuBackend, h: var SessionHandle) =
+proc sessionFree*(backend: GpuBackend, h: var SessionHandle) {.probed.} =
   ## Frees a buffer in the session
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -2491,7 +2578,48 @@ type
     cpuScales*, cpuZeros*: seq[float32]
     cudaQ4Ready*: bool              ## legacy flag; always false (CUDA removed)
 
-proc residentPrepareQ4*(w: ResidentWeightHandle; M = 1): bool =
+proc probeQ4Buffers(w: ResidentWeightHandle): array[3, string] =
+  var handles: array[3, SessionHandle]
+  for h in handles.mitems: h.kind = w.kind
+  handles[0].metalHandle = w.metalWq; handles[1].metalHandle = w.metalScales; handles[2].metalHandle = w.metalZeros
+  handles[0].vulkanHandle = w.vulkanWq; handles[1].vulkanHandle = w.vulkanScales; handles[2].vulkanHandle = w.vulkanZeros
+  let sizes = [w.n*((w.k+1) div 2), w.n*w.nGroupsPerRow*4, w.n*w.nGroupsPerRow*4]
+  for i in 0 .. 2:
+    handles[i].probeBytes = sizes[i]
+    let raw = if w.kind == gbCpu:
+      (case i
+       of 0: (if w.cpuWq.len > 0: cast[pointer](unsafeAddr w.cpuWq[0]) else: nil)
+       of 1: (if w.cpuScales.len > 0: cast[pointer](unsafeAddr w.cpuScales[0]) else: nil)
+       else: (if w.cpuZeros.len > 0: cast[pointer](unsafeAddr w.cpuZeros[0]) else: nil))
+      else: probeRaw(handles[i])
+    result[i] = probeBuffer(probeIdentity(raw), sizes[i], "upload")
+
+proc probeValue*(w: ResidentWeightHandle): string =
+  let b = probeQ4Buffers(w)
+  b[0] & "@" & $w.wqOffset & ":" & $(w.n*((w.k+1) div 2))
+
+proc probeWeightRef*(w: ResidentWeightHandle): string = probeValue(w)
+
+proc probeWeightAttrs*(w: ResidentWeightHandle): string =
+  "k=" & $w.k & ",n=" & $w.n & ",group=" & $w.groupSize &
+    ",groupsPerRow=" & $w.nGroupsPerRow
+
+proc probeName*(w: ResidentWeightHandle; name, dtype: string; shape: openArray[int]) =
+  if unlikely(firProbeOn):
+    let b = probeQ4Buffers(w)
+    probeNamed(b[0], name, dtype, shape, w.wqOffset, w.n*((w.k+1) div 2))
+    probeNamed(b[1], name & ".scales", "f32", [w.n, w.nGroupsPerRow], 0, w.n*w.nGroupsPerRow*4)
+    probeNamed(b[2], name & ".zeros", "f32", [w.n, w.nGroupsPerRow], 0, w.n*w.nGroupsPerRow*4)
+
+proc probeBytesResult*(w: var ResidentWeightHandle; bytes: int) =
+  if unlikely(firProbeOn):
+    discard probeQ4Buffers(w)
+
+proc probePrepare*(w: var ResidentWeightHandle; origin = "upload") =
+  if unlikely(firProbeOn):
+    discard probeQ4Buffers(w)
+
+proc residentPrepareQ4*(w: ResidentWeightHandle; M = 1): bool {.probed.} =
   ## Opt-in preparation from inference. The ordinary Q4 session API reuses
   ## the selected plan; training and unsupported devices retain their kernel.
   if w.kind == gbMetal:
@@ -2504,7 +2632,7 @@ proc residentPrepareQ4*(w: ResidentWeightHandle; M = 1): bool =
   false
 
 proc residentUploadQ4*(backend: GpuBackend, wq: seq[uint8], scales, zeros: seq[float32],
-                        k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle =
+                        k, n, groupSize, nGroupsPerRow: int): ResidentWeightHandle {.probed.} =
   ## Uploads packed int4 weights to the GPU ONCE. Call when the model loads
   ## (loadLlamaWeightsL), keep the result, do NOT call it again per token.
   var chosen = backend
@@ -2541,7 +2669,7 @@ proc residentUploadQ4*(backend: GpuBackend, wq: seq[uint8], scales, zeros: seq[f
   else:
     discard
 
-proc sessionWrapHostRange*(backend: GpuBackend; data: pointer; bytes: int): tuple[h: SessionHandle, offset: int] =
+proc sessionWrapHostRange*(backend: GpuBackend; data: pointer; bytes: int): tuple[h: SessionHandle, offset: int] {.probed.} =
   ## Read-only GPU buffer over long-lived host memory (a model mmap) without
   ## copying, on GPUs that share system memory. `data` may sit anywhere in
   ## the mapping: the buffer starts at the enclosing page and `offset` is the
@@ -2561,7 +2689,7 @@ proc sessionWrapHostRange*(backend: GpuBackend; data: pointer; bytes: int): tupl
     result.offset = r.offset
   else: discard
 
-proc sessionUploadPrivatePtr*(backend: GpuBackend; data: pointer; bytes: int): SessionHandle =
+proc sessionUploadPrivatePtr*(backend: GpuBackend; data: pointer; bytes: int): SessionHandle {.probed.} =
   ## GPU-only copy straight from host memory (VRAM on a dGPU), without an
   ## intermediate Nim seq.
   result.kind = normalizeBackend(backend)
@@ -2583,7 +2711,7 @@ proc sessionUploadPrivatePtr*(backend: GpuBackend; data: pointer; bytes: int): S
 
 proc residentUploadQ4Mapped*(backend: GpuBackend; wq: pointer; wqBytes: int;
                              scales, zeros: openArray[float32];
-                             k, n, groupSize, nGroupsPerRow: int): tuple[w: ResidentWeightHandle, zeroCopy: bool] =
+                             k, n, groupSize, nGroupsPerRow: int): tuple[w: ResidentWeightHandle, zeroCopy: bool] {.probed.} =
   ## residentUploadQ4 for packed weights that live in a model mmap. On GPUs
   ## that share system memory (Apple Silicon, Intel iGPU) the GPU buffer wraps
   ## the pages holding wq in place, at any offset (w.wqOffset); otherwise wq
@@ -2621,7 +2749,7 @@ proc residentUploadQ4Mapped*(backend: GpuBackend; wq: pointer; wqBytes: int;
   result.w = w
 
 proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHandle,
-                       c: var SessionHandle, M: int): bool =
+                       c: var SessionHandle, M: int): bool {.probed.} =
   ## Encodes the matmul C(M x N) = A(M x K) @ Wq(K x N) into the open session, using
   ## the resident weights uploaded with residentUploadQ4. K/N/groupSize come from w.
   var chosen = backend
@@ -2683,7 +2811,7 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
   else:
     return false
 
-proc residentFreeQ4*(w: var ResidentWeightHandle) =
+proc residentFreeQ4*(w: var ResidentWeightHandle) {.probed.} =
   ## Frees resident weights - call only when unloading the model/exiting,
   ## NOT between tokens.
   case w.kind

@@ -6,6 +6,8 @@
 ##         vulkanKernelDispatch) + 1-buffer vulkanSessionJitMicroVmEnc.
 ## CUDA was removed — every non-macOS path goes through Vulkan.
 
+import ../probe
+
 when defined(macosx):
   type MetalBufferHandle* = pointer
 
@@ -29,10 +31,12 @@ when defined(macosx):
     importc: "metal_enc_max_tg_threads", header: "metal_shim.h".}
 
   proc sessionPipeline*(kernelName: string): bool =
-    metal_enc_pipeline(kernelName.cstring) != 0
+    result = metal_enc_pipeline(kernelName.cstring) != 0
+    if result and unlikely(firProbeOn): probeEncoderPipeline(kernelName, "metal")
 
   proc sessionBindBuffer*(index: int; buf: MetalBufferHandle; offsetBytes = 0): bool =
-    metal_enc_bind_buffer(index.cint, buf, offsetBytes.cint) != 0
+    result = metal_enc_bind_buffer(index.cint, buf, offsetBytes.cint) != 0
+    if result and unlikely(firProbeOn): probeEncoderBind(index, buf, max(0, offsetBytes))
 
   proc sessionBindInt*(index: int; v: int): bool =
     metal_enc_bind_int(index.cint, v.cint) != 0
@@ -49,13 +53,18 @@ when defined(macosx):
     ## fence. This is an encoder barrier, not a CPU/GPU wait.
     if metal_enc_dispatch_threads(nThreads.cint, 1, 1, tgSize.cint, 1, 1) == 0:
       return false
+    if unlikely(firProbeOn):
+      let actualTg = if tgSize > 0: min(tgSize, int(metal_enc_max_tg_threads()))
+                     else: int(metal_enc_simd_width())
+      probeEncoderDispatch(nThreads, actualTg)
     metal_enc_barrier() != 0
 
   proc sessionBarrier*(): bool =
     metal_enc_barrier() != 0
 
   proc sessionSetThreadgroupBytes*(index: int; nBytes: int): bool =
-    metal_enc_set_threadgroup_bytes(index.cint, nBytes.cint) != 0
+    result = metal_enc_set_threadgroup_bytes(index.cint, nBytes.cint) != 0
+    if result and unlikely(firProbeOn): probeEncoderTgBytes(nBytes)
 
   proc sessionSimdWidth*(): int =
     ## NEW: reads the REAL threadExecutionWidth of the bound pipeline
@@ -92,16 +101,21 @@ else:
 import ../backends/vulkan/vulkan_driver as vkDrv
 
 proc sessionPipelineVk*(name, glslSrc: string): bool =
-  vkDrv.vulkanJitBegin(name, glslSrc)
+  result = vkDrv.vulkanJitBegin(name, glslSrc)
+  if result and unlikely(firProbeOn): probeEncoderPipeline(name, "vulkan")
 
 proc sessionBindBufferVk*(idx: int; buf: vkDrv.VulkanBufferHandle; offElems = 0): bool =
-  vkDrv.vulkanBindBuf(idx, buf, offElems)
+  result = vkDrv.vulkanBindBuf(idx, buf, offElems)
+  if result and unlikely(firProbeOn):
+    probeEncoderBind(idx, cast[pointer](buf.buf), offElems*4, int(buf.sizeBytes))
 
 proc sessionDispatchVk*(nThreads, tgSize: int; tgBytes = 0): bool =
-  vkDrv.vulkanKernelDispatch(nThreads, tgSize, tgBytes)
+  result = vkDrv.vulkanKernelDispatch(nThreads, tgSize, tgBytes)
+  if result and unlikely(firProbeOn): probeEncoderDispatch(nThreads, tgSize, tgBytes)
 
 proc sessionSetThreadgroupBytesVk*(index, nBytes: int): bool =
-  vkDrv.vulkanSetThreadgroupBytes(index, nBytes)
+  result = vkDrv.vulkanSetThreadgroupBytes(index, nBytes)
+  if result and unlikely(firProbeOn): probeEncoderTgBytes(nBytes)
 
 proc sessionMaxTgThreadsVk*(): int =
   vkDrv.vulkanMaxTgThreads()

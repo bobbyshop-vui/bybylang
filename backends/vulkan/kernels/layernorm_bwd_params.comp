@@ -1,0 +1,20 @@
+#version 450
+// One invocation per column: dgamma[c] = sum_r dy*xhat, dbeta[c] = sum_r dy.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer BufDy { float dy[]; };
+layout(std430, binding = 1) readonly buffer BufX { float x[]; };
+layout(std430, binding = 2) readonly buffer BufStats { float stats[]; };
+layout(std430, binding = 3) writeonly buffer BufDg { float dgamma[]; };
+layout(std430, binding = 4) writeonly buffer BufDb { float dbeta[]; };
+layout(push_constant) uniform PC { int rows; int cols; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= uint(pc.cols)) return;
+    float g = 0.0, b = 0.0;
+    for (int r = 0; r < pc.rows; r++) {
+        float xh = (x[r * pc.cols + int(c)] - stats[2 * r]) * stats[2 * r + 1];
+        float d = dy[r * pc.cols + int(c)];
+        g += d * xh; b += d;
+    }
+    dgamma[c] = g; dbeta[c] = b;
+}

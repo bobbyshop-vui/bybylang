@@ -2770,6 +2770,45 @@ proc vulkanSessionPermuteEnc*(src: VulkanBufferHandle, dst: var VulkanBufferHand
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("permute", [src, dst], addr pc, uint32(sizeof(pc)), groups, 1, 1)
 
+proc vulkanSessionPermuteBufEnc*(src, newStrides, oldStrides, dimsMap: VulkanBufferHandle,
+                                  dst: var VulkanBufferHandle, ndim, n: int): bool =
+  ## Same as vulkanSessionPermuteEnc but the stride tables are uploaded index buffers.
+  var pc = [int32(ndim), int32(n)]
+  let groups = uint32((n + 255) div 256)
+  dispatchGeneric("permute_buf", [src, newStrides, oldStrides, dimsMap, dst], addr pc[0], 8, groups, 1, 1)
+
+proc vulkanSessionEmbeddingLookupEnc*(table, idx: VulkanBufferHandle, dst: var VulkanBufferHandle,
+                                       dim, numIndices: int): bool =
+  let n = numIndices * dim
+  var pc = [int32(dim), int32(n)]
+  let groups = uint32((n + 255) div 256)
+  dispatchGeneric("embedding", [table, idx, dst], addr pc[0], 8, groups, 1, 1)
+
+proc vulkanSessionApfluEnc*(x: VulkanBufferHandle, y: var VulkanBufferHandle, n: int,
+                             alpha, beta: float32): bool =
+  var pc: tuple[alpha, beta: float32, n: int32] = (alpha, beta, int32(n))
+  let groups = uint32((n + 255) div 256)
+  dispatchGeneric("apflu", [x, y], addr pc, 12, groups, 1, 1)
+
+proc vulkanSessionApfluBackwardEnc*(x, dy: VulkanBufferHandle, dx: var VulkanBufferHandle, n: int,
+                                     alpha, beta: float32): bool =
+  var pc: tuple[alpha, beta: float32, n: int32] = (alpha, beta, int32(n))
+  let groups = uint32((n + 255) div 256)
+  dispatchGeneric("apflu_bwd", [x, dy, dx], addr pc, 12, groups, 1, 1)
+
+proc vulkanSessionLayernormBackwardEnc*(dy, x, gamma: VulkanBufferHandle,
+                                         dx, dgamma, dbeta: var VulkanBufferHandle,
+                                         rows, cols: int, eps: float32): bool =
+  var stats = vulkanSessionAllocScratch(2 * rows)
+  registerInternalScratch(stats)
+  var pcs: tuple[rows, cols: int32, eps: float32] = (int32(rows), int32(cols), eps)
+  if not dispatchGeneric("layernorm_bwd_stats", [x, stats], addr pcs, 12, uint32((rows + 63) div 64), 1, 1): return false
+  var pc2 = [int32(rows), int32(cols)]
+  if not dispatchGeneric("layernorm_bwd_dx", [dy, x, gamma, stats, dx], addr pc2[0], 8,
+                         uint32((rows + 63) div 64), 1, 1): return false
+  dispatchGeneric("layernorm_bwd_params", [dy, x, stats, dgamma, dbeta], addr pc2[0], 8,
+                  uint32((cols + 63) div 64), 1, 1)
+
 proc vulkanSessionSplitSliceEnc*(src: VulkanBufferHandle, dst: var VulkanBufferHandle,
                                   dimTotal, thisSize, offset, inner, n: int): bool =
   var pc = [int32(dimTotal), int32(thisSize), int32(offset), int32(inner), int32(n)]

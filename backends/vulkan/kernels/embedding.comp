@@ -1,0 +1,14 @@
+#version 450
+// Embedding lookup: dst[row*dim + d] = table[idx[row]*dim + d].
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer BufTable { float table[]; };
+layout(std430, binding = 1) readonly buffer BufIdx { int idx[]; };
+layout(std430, binding = 2) writeonly buffer BufDst { float dst[]; };
+layout(push_constant) uniform PC { int dim; int n; } pc;
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= uint(pc.n)) return;
+    int row = int(id) / pc.dim;
+    int d = int(id) % pc.dim;
+    dst[id] = table[idx[row] * pc.dim + d];
+}
