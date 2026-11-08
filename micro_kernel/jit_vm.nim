@@ -75,6 +75,7 @@ type LowerState = object
   pc, loopDepth, indent: int
   usesU, usesIn: bool
   glsl: bool
+  ctrlBuf: bool         ## grid control words live in their own buffer (slot 5), selected by the 0xFFFFFFFF sentinel
   od: bool              ## uses one-dispatch ops (persistent kernel) -> the kernel has its own prologue
   vtgModes: seq[uint32] ## mode stack of the open OP_VTG_BEGIN blocks
 
@@ -104,6 +105,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     let off = st.imm(p)
     if st.glsl:
       st.body.add st.ind() & &"R[{a}] = memF32[uint(R[{b}]) + {off}u];"
+    elif st.ctrlBuf:
+      st.body.add st.ind() & &"R[{a}] = ldShared(memF32 + (uint)R[{b}] + {off}u);"
     else:
       st.body.add st.ind() & &"R[{a}] = memF32[(uint)R[{b}] + {off}u];"
   of OP_STORE_F32:
@@ -267,12 +270,18 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.body.add st.ind() & &"R[{a}] = lut[U[{b}] + {k}u];"
   of OP_U_LOAD_IN:
     let k = st.imm(p)
-    st.body.add st.ind() & &"R[{a}] = inF32[U[{b}] + {k}u];"
+    if st.ctrlBuf and not st.glsl:
+      st.body.add st.ind() & &"R[{a}] = ldShared(inF32 + U[{b}] + {k}u);"
+    else:
+      st.body.add st.ind() & &"R[{a}] = inF32[U[{b}] + {k}u];"
   of OP_U_LOAD_IN4:
     let k = st.imm(p)
     if st.glsl:
       st.body.add st.ind() & &"{{ vec4 v4 = vec4(inF32[U[{b}] + {k}u], inF32[U[{b}] + {k}u + 1u], inF32[U[{b}] + {k}u + 2u], inF32[U[{b}] + {k}u + 3u]);" &
         &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
+    elif st.ctrlBuf:
+      st.body.add st.ind() & &"{{ R[{a}] = ldShared(inF32 + U[{b}] + {k}u); R[{a}+1] = ldShared(inF32 + U[{b}] + {k}u + 1u);" &
+        &" R[{a}+2] = ldShared(inF32 + U[{b}] + {k}u + 2u); R[{a}+3] = ldShared(inF32 + U[{b}] + {k}u + 3u); }}"
     else:
       st.body.add st.ind() & &"{{ float4 v4 = *(device const float4*)(inF32 + U[{b}] + {k}u);" &
         &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
@@ -281,7 +290,10 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.body.add st.ind() & &"memF32[U[{b}] + {k}u] = R[{a}];"
   of OP_U_LOAD_F32:
     let k = st.imm(p)
-    st.body.add st.ind() & &"R[{a}] = memF32[U[{b}] + {k}u];"
+    if st.ctrlBuf and not st.glsl:
+      st.body.add st.ind() & &"R[{a}] = ldShared(memF32 + U[{b}] + {k}u);"
+    else:
+      st.body.add st.ind() & &"R[{a}] = memF32[U[{b}] + {k}u];"
   of OP_U_ATOMIC_ADD:
     let k = st.imm(p)
     if st.glsl:
@@ -305,7 +317,11 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & "/* OP_GRID_BARRIER is not supported in GLSL yet */ return;"
     else:
       st.body.add st.ind() & "{"
-      st.body.add st.ind() & &"  device atomic_uint* gbc = (device atomic_uint*)((device uint*)memF32_ + {ctrl}u);"
+      if ctrl == 0xFFFFFFFF'u32:
+        st.ctrlBuf = true
+        st.body.add st.ind() & "  device atomic_uint* gbc = (device atomic_uint*)ctrl_;"
+      else:
+        st.body.add st.ind() & &"  device atomic_uint* gbc = (device atomic_uint*)((device uint*)memF32_ + {ctrl}u);"
       st.body.add st.ind() & "  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);"
       st.body.add st.ind() & "  gbEpoch += 1u;"
       st.body.add st.ind() & "  if (gLid == 0u) {"
@@ -323,7 +339,11 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.od = true
     if not st.glsl:
       st.body.add st.ind() & "if (gLid == 0u) {"
-      st.body.add st.ind() & &"  device atomic_uint* gbc = (device atomic_uint*)((device uint*)memF32_ + {ctrl}u);"
+      if ctrl == 0xFFFFFFFF'u32:
+        st.ctrlBuf = true
+        st.body.add st.ind() & "  device atomic_uint* gbc = (device atomic_uint*)ctrl_;"
+      else:
+        st.body.add st.ind() & &"  device atomic_uint* gbc = (device atomic_uint*)((device uint*)memF32_ + {ctrl}u);"
       st.body.add st.ind() & "  const uint gbDone = atomic_fetch_add_explicit(gbc + 1, 1u, memory_order_relaxed);"
       st.body.add st.ind() & "  if (gbDone + 1u == gNtg) {"
       st.body.add st.ind() & "    atomic_fetch_or_explicit(gbc + 3, atomic_fetch_add_explicit(gbc + 2, 0u, memory_order_relaxed), memory_order_relaxed);"
@@ -356,19 +376,22 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.od = true
     st.vtgModes.add a
     if a == 1:
-      # V=32 < tgs: each physical TG runs tgs/32 virtual threadgroups in parallel (sub), each sub with its own tgF32 region.
-      # FIXED loop count (uniform across the TG) so the barriers inside stay aligned.
+      # Sub-threadgroup mode: virtual threadgroups of S lanes (S = param >> 20, 0 means 32; S divides the
+      # physical size) run side by side, tgs/S per physical TG, each with its own tgF32 region of
+      # (param & 0xFFFFF) floats. FIXED loop count (uniform across the TG) so the barriers inside stay aligned.
+      let sub = (if (prm shr 20) == 0'u32: 32'u32 else: prm shr 20)
+      let stride = prm and 0xFFFFF'u32
       st.body.add st.ind() & "{"
-      st.body.add st.ind() & &"  const uint vSubs = gTgs / 32u;"
-      st.body.add st.ind() & "  const uint vSub = gLid / 32u;"
+      st.body.add st.ind() & &"  const uint vSubs = gTgs / {sub}u;"
+      st.body.add st.ind() & &"  const uint vSub = gLid / {sub}u;"
       st.body.add st.ind() & &"  const uint vTrip = ({nVirt}u + gNtg * vSubs - 1u) / (gNtg * vSubs);"
       st.body.add st.ind() & "  for (uint vIt = 0u; vIt < vTrip; ++vIt) {"
       st.body.add st.ind() & &"    const uint vRaw = (vIt * gNtg + gTgid) * vSubs + vSub;"
       st.body.add st.ind() & &"    const bool vact = vRaw < {nVirt}u;"
       st.body.add st.ind() & &"    const uint tgid = vact ? vRaw : ({nVirt}u - 1u);"
-      st.body.add st.ind() & "    const uint lid = gLid & 31u;"
-      st.body.add st.ind() & "    const uint tid = tgid * 32u + lid;"
-      st.body.add st.ind() & &"    threadgroup float* tgF32 = tgF32_ + vSub * {prm}u;"
+      st.body.add st.ind() & &"    const uint lid = gLid & {sub - 1}u;"
+      st.body.add st.ind() & &"    const uint tid = tgid * {sub}u + lid;"
+      st.body.add st.ind() & &"    threadgroup float* tgF32 = tgF32_ + vSub * {stride}u;"
       st.body.add st.ind() & "    float R[32]; for (int i=0;i<32;++i) R[i]=0.f; R[0] = (float)tid;"
       st.body.add st.ind() & "    uint U[32]; for (int i=0;i<32;++i) U[i]=0u;"
       st.indent += 2
@@ -420,6 +443,11 @@ proc closeBlocks(st: var LowerState) =
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
   var st = LowerState(indent: 2)
+  # A chain kernel (grid control buffer) reads data other threadgroups wrote during the same
+  # dispatch; those loads go through relaxed atomics, which are served from the coherent level.
+  for i in 0 ..< p.words.len - 1:
+    if (p.words[i] and 0xFF'u32) in [OP_GRID_BARRIER, OP_GRID_EPILOGUE] and p.words[i+1] == 0xFFFFFFFF'u32:
+      st.ctrlBuf = true
   st.lowerAll(p)
   st.closeBlocks()
   if st.od:
@@ -443,13 +471,20 @@ proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
 #include <metal_stdlib>
 using namespace metal;
 
+inline float ldShared(device const float* p) {
+  return as_type<float>(atomic_load_explicit((device const atomic_uint*)p, memory_order_relaxed));
+}
+inline float ldShared(device float* p) {
+  return as_type<float>(atomic_load_explicit((device atomic_uint*)p, memory_order_relaxed));
+}
+
 // Auto-JIT (one-dispatch persistent kernel) from bytecode — do not edit
 kernel void """ & kernelName & """(
     device float*       memF32_ [[buffer(1)]],
     device const uchar* memU8_  [[buffer(2)]],
     device const float* lut_    [[buffer(3)]],
     device const float* inF32_  [[buffer(4)]],
-    threadgroup float*  tgF32_  [[threadgroup(0)]],
+""" & (if st.ctrlBuf: "    device uint*        ctrl_   [[buffer(5)]],\n" else: "") & """    threadgroup float*  tgF32_  [[threadgroup(0)]],
     uint tid  [[thread_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],

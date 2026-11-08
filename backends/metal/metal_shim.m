@@ -2753,6 +2753,11 @@ static BOOL metal_jit_info_logging_enabled(void) {
 
 static void metal_jit_archive_save(void) {
     if (!gJitArchive || !gJitArchivePath) return;
+    /* Serializing the archive goes through the external Metal compiler and can
+       take minutes on Intel GPUs (where the call ultimately reports that it is
+       unsupported). Recordings and short runs may opt out explicitly. */
+    const char* saveEnv = getenv("BYBY_METAL_JIT_ARCHIVE_SAVE");
+    if (saveEnv && saveEnv[0] == '0' && saveEnv[1] == '\0') return;
     static dispatch_once_t warnOnce;
     @autoreleasepool {
         NSError* err = nil;

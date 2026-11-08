@@ -934,6 +934,11 @@ proc probeBytesResult*(h: var SessionHandle; bytes: int) =
   h.probeBytes = max(h.probeBytes, bytes)
   discard probeBufferRef(h)
 
+proc probeUploadRecorded*(h: SessionHandle): bool =
+  ## True when the backend driver already emitted this upload's transfer.
+  let identity = if h.probeIdentity != 0: h.probeIdentity else: probeIdentity(probeRaw(h))
+  probeDriverRecorded(identity)
+
 proc probeTensorAttrs*(dtype, tensor: string; shape: openArray[int]): string =
   "dtype=" & dtype & ",tensor=" & probeQuote(tensor) & ",shape=" & probeShape(shape)
 

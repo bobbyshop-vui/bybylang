@@ -246,6 +246,53 @@ The VM instruction API is exported by `vendor/bybylang/micro_kernel` and re-expo
 
 The DSL header is `micro kernel NAME INPUT -> OUTPUT threads N tg N out N:` and its indented body accepts `emit...` instruction calls. `threads` is the dispatch thread count, `tg` the threadgroup size, and `out` the output element count. Choose counts and guard memory accesses so every dispatched thread stays in bounds. This path currently requires Metal or Vulkan; it raises for CPU/unsupported backends. For more complex kernels, import `vendor/bybylang/bybylang`, create the `VmProgram` in Nim, and call `executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)` directly.
 
+### Control flow and scopes
+
+`emitForBegin`/`emitForEnd`, `emitIfBegin`/`emitIfEnd` and `emitVtgBegin`/`emitVtgEnd` open and close scopes, and **scopes nest in any combination**: an `if` inside an `if`, an `if` inside a `for`, a `for` inside a `vtg`, and so on. The condition of `emitIfBegin cond` is `R[cond] != 0.0` (build it with `emitCmpLt`). Rules:
+
+- Every `*Begin` needs its matching `*End`, closed innermost first.
+- Keep barriers (`emitBarrierTg`, `emitGridBarrier`) outside `if` bodies, because every thread of the threadgroup must reach them.
+- A `for` count must be uniform across the threadgroup when a barrier is inside it.
+
+```text
+micro kernel pick INPUT -> OUTPUT threads 8 tg 8 out 8:
+  emitULid 0
+  emitLoadConstF32 1 2.0'f32
+  emitLoadConstF32 2 4.0'f32
+  emitCmpLt 3 0 1                 # R3 = (lid < 2)
+  emitIfBegin 3
+    emitCmpLt 4 0 2               # R4 = (lid < 4)
+    emitIfBegin 4                 # nested if
+      emitLoadConstF32 5 3.0'f32
+    emitIfEnd
+  emitIfEnd
+  emitUStoreF32 5 0 0
+  emitHalt
+```
+
+Nested scopes run on Metal, Vulkan and the CPU backend.
+
+### Wide input load
+
+`emitULoadIn4 rd ub off` loads `R[rd..rd+3]` from four consecutive input floats at `U[ub]+off` in one 16-byte access (`rd + 3 <= 31`). The address must be a multiple of 4 floats.
+
+### Grid control buffer
+
+`emitGridBarrier ctrl` and `emitGridEpilogue ctrl` take the float index of a four-word control block (`cnt, done, err, lastErr`) inside the memory buffer. Passing the sentinel `0xFFFFFFFF` as `ctrl` instead puts the control block in its own buffer at Metal slot 5 (`ctrl_`). A kernel that uses the sentinel reads data written by other threadgroups through relaxed atomic loads (`ldShared`), so it sees them within the same dispatch. GLSL (Vulkan) does not support the grid barrier yet.
+
+### Virtual threadgroups
+
+`emitVtgBegin mode nVirt param` runs `nVirt` virtual threadgroups on the physical grid. Mode `0` is the plain form, mode `2` is the guard form. Mode `1` (sub-threadgroups) packs several virtual threadgroups into one physical threadgroup, and its `param` is `(S << 20) | stride`:
+
+- `S` is the lanes per virtual threadgroup (`0` means 32). It must be a power of two that divides the physical threadgroup size.
+- `stride` (low 20 bits) is the threadgroup-memory floats of each virtual threadgroup.
+
+`param` values below `1 << 20` keep their old meaning (`S = 32`, `stride = param`).
+
+### CPU backend
+
+The CPU VM keeps byte (`u8`), look-up table, input and float memory in separate arrays (`nimf_cpu_vm_run_slots`), so a program sees the same slot layout as on the GPU. `nimf_cpu_vm_run` is kept and treats one float arena as every slot. An out-of-range index reports an error instead of reading another slot.
+
 ---
 
 ## 6. Low-level hardware-simulation commands

@@ -115,6 +115,10 @@ NIMF_CPU_HIDDEN void nimf_cpu_rope(float* x, float* cos_t, float* sin_t,
 NIMF_CPU_HIDDEN int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
                     float* in_f32, int in_len, int n_threads,
                     int tg_floats, int tg_size, char* err, int err_len);
+NIMF_CPU_HIDDEN int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
+                    const uint8_t* packed, int packed_len, const float* lut, int lut_len,
+                    const float* in_f32, int in_len, int n_threads,
+                    int tg_floats, int tg_size, char* err, int err_len);
 
 #ifdef __cplusplus
 }

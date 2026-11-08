@@ -1,16 +1,17 @@
-## Structure-only dispatch recorder (`fprobe 2`).
+## Dispatch recorder (`fprobe 2`), with optional exact upload data sidecar.
 ##
 ## One `op` line is written per kernel launch: a fixed shape
 ##   op oN tag=NAME in=(port=bX@byte:bytes,...) out=(...) attrs(...)
 ##      impl=session:PROC | impl=micro:HASH | impl=ext:OP parent=... prog=...
-## The writer never accepts tensor payloads. Uploads record sizes and names; only a host
-## table of at most `probeSmallLimit` words (the stride and axis tables of a permute) is kept
-## as `data=` hex words, because the kernel that replaces the launch needs them.
+## Text records contain structure, sampled fingerprints and short tables. With
+## BYBY_FIR_PROBE_DATA=1, host upload bytes stream to a separate binary file so
+## unnamed auxiliary buffers can be replayed without hooks in model code.
 ##
 ## Enabled with BYBY_FIR_PROBE=<path>; step selection with
 ## BYBY_FIR_PROBE_STEPS=decode:N,prefill:M. When disabled every hook is one
 ## predictable boolean test.
 import std/[os, strutils, tables, json, macros, exitprocs, locks]
+import ./probe_data
 
 const
   probeBuild = "nim-" & NimVersion
@@ -42,11 +43,15 @@ type
     programIds: Table[seq[uint32], int]
     pipelineWords: Table[string, seq[uint32]]
     codeWords: Table[uint64, seq[uint32]]
+    vmArenas: Table[uint64, bool]
+    driverUploads: Table[uint64, bool]
     drafts: Table[int, OpDraft]
     encoderPipeline: string
     encoderBindings: Table[int, EncoderBinding]
     encoderTgBytes: int
     nextOp, nextDisp, nextTransfer, nextAutoFlush: int
+    captureFile: File
+    captureOpen: bool
     seenStep, selectedStep, insideStep: bool
     decodeLimit, prefillLimit, decodeSeen, prefillSeen: int
   ProbeState = ref ProbeStateObj
@@ -173,6 +178,31 @@ proc probeSmallData*[T](data: openArray[T]): string =
     " data=" & parts.join(",")
   else:
     ""
+
+proc probeCapture*(data: pointer; bytes: int): string =
+  ## Fingerprints are cheap; optional exact bytes also preserve auxiliary uploads
+  ## (composite arenas, LUTs, adapters) that need not exist in a checkpoint.
+  if not firProbeOn or data == nil or bytes <= 0: return ""
+  probeLocked()
+  if not capturing(): return ""
+  result = " fingerprint=" & fingerprint(data, bytes)
+  if getEnv("BYBY_FIR_PROBE_DATA", "0") != "1": return
+  # An optional positive cap omits large payloads; fingerprints remain available
+  # for checkpoint matching. Zero (the default) keeps the full auxiliary data.
+  let limit = try: parseInt(getEnv("BYBY_FIR_PROBE_DATA_MAX", "0"))
+              except ValueError: -1
+  if limit > 0 and bytes > limit: return
+  if not state.captureOpen:
+    state.captureFile = open(state.path & ".data", fmWrite)
+    state.captureOpen = true
+  let offset = state.captureFile.getFilePos()
+  if state.captureFile.writeBuffer(data, bytes) != bytes:
+    raise newException(IOError, "cannot write FIR probe upload data")
+  state.captureFile.flushFile()
+  result.add " capture=" & $offset & ":" & $bytes
+
+proc probeCapture*[T](data: openArray[T]): string =
+  if data.len > 0: probeCapture(unsafeAddr data[0], data.len*sizeof(T)) else: ""
 
 proc probeWordHashValue(words: openArray[uint32]): uint64 =
   result = 0xcbf29ce484222325'u64
@@ -382,6 +412,9 @@ proc firProbeStop*() =
   if firProbeOn:
     probeFlush()
     firProbeOn = false
+  if state.captureOpen:
+    state.captureFile.close()
+    state.captureOpen = false
 
 proc firProbeShutdown() {.noconv.} =
   probeLocked()
@@ -391,6 +424,7 @@ proc firProbeShutdown() {.noconv.} =
   finally:
     firProbeOn = false
     if state != nil:
+      if state.captureOpen: state.captureFile.close()
       GC_unref(cast[ProbeState](state))
       state = nil
 
@@ -413,6 +447,8 @@ proc firProbeStart*(path: string; steps = "") =
     state = cast[ptr ProbeStateObj](owned)
   state.events.setLen(0); state.buffers.setLen(0)
   state.identities.clear(); state.rawIdentities.clear()
+  state.vmArenas.clear()
+  state.driverUploads.clear()
   state.programs.setLen(0); state.programIds.clear(); state.drafts.clear()
   # Prepared JIT pipelines and code buffers may outlive a recording. Preserve
   # their bytecode registries across start/stop; neither contains tensor data.
@@ -470,22 +506,65 @@ proc probeCpuContext*(arena: string): string =
 
 proc probeCpuRestore*(previous: string) = cpuArena = previous
 
-proc probeVmLaunch*(code: openArray[uint32]; base: pointer; memLen, inputLen, nThreads, tgFloats, tgSize: int) =
+proc probeVmLaunch*(code: openArray[uint32]; base: pointer; memLen, inputLen, nThreads, tgFloats, tgSize: int; inputBase: pointer = nil) =
   probeLocked()
   let arena = if cpuArena.len > 0: cpuArena else:
     probeBuffer(probeIdentity(base), memLen*4, "arena")
+  let identity = probeIdentity(base)
+  if cpuArena.len == 0 and not state.vmArenas.hasKey(identity):
+    state.vmArenas[identity] = true
+    probeEvent("upload t" & $state.nextTransfer & " dst=" & arena & "@0:" & $(memLen*4) &
+      probeCapture(base, memLen*4) & " op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
+    inc state.nextTransfer
   let program = probeProgram(code)
+  var bindings = "bind=(mem:" & arena & "@0:" & $(memLen*4)
+  if inputLen > 0:
+    let inputId = probeBuffer(probeIdentity(inputBase), inputLen*4, "upload")
+    probeEvent("upload t" & $state.nextTransfer & " dst=" & inputId & "@0:" & $(inputLen*4) &
+      probeCapture(inputBase, inputLen*4) & " op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
+    inc state.nextTransfer
+    bindings.add ",input:" & inputId & "@0:" & $(inputLen*4)
+  bindings.add ')'
   probeEvent("disp d" & $state.nextDisp & " prog=" & program & " nThreads=" & $nThreads &
     " tgSize=" & $tgSize & " tgFloats=" & $tgFloats & " tgbytes=" & $(tgFloats*4) &
-    " mem=" & $memLen & " bind=(mem:" & arena & "@0:" & $(memLen*4) &
-    ") input=" & $inputLen & " op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
-  if inputLen > 0: probeEvent("note kind=vm_input detail=\"host input values omitted; replay needs external input\"")
+    " mem=" & $memLen & " " & bindings &
+    " input=" & $inputLen & " op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
   inc state.nextDisp
 
 proc probeTransfer*(kind, args: string) =
   probeLocked()
   probeEvent(kind & " t" & $state.nextTransfer & args & " op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
   inc state.nextTransfer
+
+proc probeUploaded*(raw, data: pointer; bytes: int) =
+  ## Driver uploads also cover callers that bypass the semantic SessionHandle API.
+  if not firProbeOn or raw == nil or bytes <= 0: return
+  probeLocked()
+  let identity = probeNewIdentity()
+  probeAlias(raw, identity)
+  state.driverUploads[identity] = true
+  let id = probeBuffer(identity, bytes, "upload")
+  if capturing():
+    var small = ""
+    if data != nil and bytes mod 4 == 0 and bytes <= probeSmallLimit*4:
+      small = probeSmallData(toOpenArray(cast[ptr UncheckedArray[uint32]](data), 0, bytes div 4-1))
+    probeTransfer("upload", " dst=" & id & "@0:" & $bytes & small & probeCapture(data, bytes))
+
+proc probeCpuView*(base: pointer; elements: int): string =
+  ## CPU multi-buffer launches retain allocation identity and subrange aliases.
+  probeLocked()
+  let identity = probeIdentity(base)
+  result = probeBuffer(identity, elements*4, "arena")
+  if not state.vmArenas.hasKey(identity):
+    state.vmArenas[identity] = true
+    if capturing():
+      probeTransfer("upload", " dst=" & result & "@0:" & $(elements*4) & probeCapture(base, elements*4))
+
+proc probeDriverRecorded*(identity: uint64): bool =
+  ## The driver hook already emitted the transfer for this upload.
+  if not firProbeOn or state == nil: return false
+  probeLocked()
+  state.driverUploads.hasKey(identity)
 
 proc probeValue*(x: float32): string = probeFloat(x)
 proc probeValue*(x: float64): string = probeFloat(x)
@@ -594,16 +673,24 @@ macro probed*(fn: untyped): untyped =
     let tgFloatsId = newIdentNode("tgFloats")
     if apiName == "sessionUploadPrivatePtr":
       post.add quote do:
+        if result.kind == gbCpu: probePrepare(result, "upload")
         probeBytesResult(result, `bytesId`)
-        probeTransfer("upload", " dst=" & probeValue(result))
+        if result.kind == gbCpu or not probeUploadRecorded(result):
+          probeTransfer("upload", " dst=" & probeValue(result) & probeCapture(`dataId`, `bytesId`))
     elif apiName.startsWith("sessionUpload"):
       post.add quote do:
+        if result.kind == gbCpu: probePrepare(result, "upload")
         probeBytesResult(result, `dataId`.len*4)
-        probeTransfer("upload", " dst=" & probeValue(result) & probeSmallData(`dataId`))
+        if result.kind == gbCpu or not probeUploadRecorded(result):
+          probeTransfer("upload", " dst=" & probeValue(result) & probeSmallData(`dataId`) & probeCapture(`dataId`))
     if apiName == "sessionAllocScratch":
-      post.add quote do: probeBytesResult(result, `nId`*4)
+      post.add quote do:
+        probePrepare(result, "alloc")
+        probeBytesResult(result, `nId`*4)
     if apiName == "sessionAllocFromHeap":
-      post.add quote do: probeBytesResult(result, `nId`*4)
+      post.add quote do:
+        probePrepare(result, "alloc")
+        probeBytesResult(result, `nId`*4)
     if apiName in ["sessionMicroVmEnc", "sessionJitMicroVmEnc"]:
       post.add quote do:
         if result and mem.kind != gbCpu:

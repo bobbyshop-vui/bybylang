@@ -1,5 +1,6 @@
 # metal_backend.nim - Metal GPU backend wrapper (compiled on macOS only).
 import std/os
+import ../../probe
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 
 when defined(macosx):
@@ -557,14 +558,16 @@ when defined(macosx):
   proc metalSessionUpload*(data: seq[float32]): MetalBufferHandle =
     discard metalInit()  # CHANGED: safe for a resident upload BEFORE the first session begin
     var d = data
-    metal_upload_c(addr d[0], cint(d.len))
+    result = metal_upload_c(addr d[0], cint(d.len))
+    if unlikely(firProbeOn): probeUploaded(result, addr d[0], d.len*4)
 
   proc metalSessionUploadBorrowed*(data: var seq[float32]): MetalBufferHandle =
     ## Session-only path. Caller owns `data` until session read/free completes;
     ## C tries a page-aligned Shared no-copy mapping and otherwise copies.
     if data.len == 0: return nil
     discard metalInit()
-    metal_upload_borrowed_c(addr data[0], cint(data.len))
+    result = metal_upload_borrowed_c(addr data[0], cint(data.len))
+    if unlikely(firProbeOn): probeUploaded(result, addr data[0], data.len*4)
 
   proc metalSessionAllocScratch*(n: int): MetalBufferHandle =
     metal_alloc_scratch_c(cint(n))
@@ -613,7 +616,8 @@ when defined(macosx):
   proc metalUploadBytes*(data: openArray[uint8]): MetalBufferHandle =
     discard metalInit()
     if data.len == 0: return nil
-    metal_upload_bytes_c(unsafeAddr data[0], cint(data.len))
+    result = metal_upload_bytes_c(unsafeAddr data[0], cint(data.len))
+    if unlikely(firProbeOn): probeUploaded(result, unsafeAddr data[0], data.len)
 
   proc metalUploadPrivate*(data: openArray[float32]): MetalBufferHandle =
     ## Private-storage variant of metalSessionUpload - ONLY for resident
@@ -621,27 +625,31 @@ when defined(macosx):
     ## that the CPU never reads/writes after the upload.
     discard metalInit()
     if data.len == 0: return nil
-    metal_upload_private_c(unsafeAddr data[0], cint(data.len))
+    result = metal_upload_private_c(unsafeAddr data[0], cint(data.len))
+    if unlikely(firProbeOn): probeUploaded(result, unsafeAddr data[0], data.len*4)
 
   proc metalUploadBytesPrivate*(data: seq[uint8]): MetalBufferHandle =
     ## Private-storage variant of metalUploadBytes - for resident wq (packed Q4).
     discard metalInit()
     if data.len == 0: return nil
     var d = data
-    metal_upload_bytes_private_c(addr d[0], cint(d.len))
+    result = metal_upload_bytes_private_c(addr d[0], cint(d.len))
+    if unlikely(firProbeOn): probeUploaded(result, addr d[0], d.len)
 
   proc metalUploadBytesPrivatePtr*(data: pointer; bytes: int): MetalBufferHandle =
     ## metalUploadBytesPrivate straight from caller memory (e.g. a model mmap),
     ## without first copying it into a Nim seq.
     discard metalInit()
     if data == nil or bytes <= 0 or bytes > high(cint): return nil
-    metal_upload_bytes_private_c(cast[ptr uint8](data), cint(bytes))
+    result = metal_upload_bytes_private_c(cast[ptr uint8](data), cint(bytes))
+    if unlikely(firProbeOn): probeUploaded(result, data, bytes)
 
   proc metalWrapHostNoCopy*(data: pointer; bytes: int): MetalBufferHandle =
     ## See metal_wrap_host_nocopy: nil means copy with metalUploadBytesPrivatePtr.
     discard metalInit()
     if data == nil or bytes <= 0: return nil
-    metal_wrap_host_nocopy_c(data, csize_t(bytes))
+    result = metal_wrap_host_nocopy_c(data, csize_t(bytes))
+    if unlikely(firProbeOn): probeUploaded(result, data, bytes)
 
   proc getpagesize(): cint {.importc, header: "<unistd.h>".}
 

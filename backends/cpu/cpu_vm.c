@@ -38,7 +38,7 @@ enum {
     OP_GRID_BARRIER = 0x93, OP_BASE_F32 = 0x94, OP_BASE_U8 = 0x95,
     OP_BASE_LUT = 0x96, OP_BASE_IN = 0x97, OP_U_LOAD_META = 0x98,
     OP_VTG_BEGIN = 0x99, OP_VTG_END = 0x9A, OP_LOAD_VACT = 0x9B,
-    OP_GRID_EPILOGUE = 0x9C, OP_U_LOAD_U32 = 0x9D
+    OP_GRID_EPILOGUE = 0x9C, OP_U_LOAD_U32 = 0x9D, OP_U_LOAD_IN4 = 0x9E
 };
 
 typedef struct {
@@ -71,7 +71,7 @@ static int extra_words(uint32_t op) {
     case OP_TG_LOAD_F32: case OP_TG_STORE_F32:
     case OP_U_CONST: case OP_U_ADDK: case OP_U_MULK: case OP_U_ANDK:
     case OP_U_SHRK: case OP_U_SHLK: case OP_U_LOAD_U8: case OP_U_LOAD_U32:
-    case OP_U_LOAD_CONSTF: case OP_U_LOAD_IN: case OP_U_STORE_F32:
+    case OP_U_LOAD_CONSTF: case OP_U_LOAD_IN: case OP_U_LOAD_IN4: case OP_U_STORE_F32:
     case OP_U_LOAD_F32: case OP_U_ATOMIC_ADD: case OP_U_LOAD_META:
     case OP_GRID_BARRIER: case OP_GRID_EPILOGUE:
         return 1;
@@ -125,8 +125,10 @@ static int check_idx(int64_t idx, int len, const char* what, char* err, int err_
 }
 
 /* Main interpreter. */
-int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
-                    float* in_f32, int in_len, int n_threads,
+int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
+                    const uint8_t* packed, int packed_len,
+                    const float* lut, int lut_len,
+                    const float* in_f32, int in_len, int n_threads,
                     int tg_floats, int tg_size, char* err, int err_len) {
     if (err && err_len > 0) err[0] = '\0';
     if (!code || n_words <= 0 || !mem || mem_len <= 0 || n_threads <= 0 ||
@@ -205,8 +207,8 @@ int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
                 uint32_t off = code[npc++];
                 int64_t idx = (int64_t)(uint32_t)t->r[b] + (int64_t)off + (int64_t)t->base_u8;
-                if (!check_idx(idx, mem_len * 4, "load_u8", err, err_len)) { result = -1; goto done; }
-                t->r[a] = (float)((const uint8_t*)mem)[idx];
+                if (!check_idx(idx, packed_len, "load_u8", err, err_len)) { result = -1; goto done; }
+                t->r[a] = (float)packed[idx];
                 break;
             }
             case OP_LOAD_CONST: {
@@ -258,8 +260,9 @@ int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
             }
             case OP_LUT_U8: {
                 int64_t idx = (int64_t)(uint32_t)t->r[b] + (int64_t)t->base_lut;
-                if (!check_idx(idx, mem_len, "lut_u8", err, err_len)) { result = -1; goto done; }
-                t->r[a] = mem[idx];
+                idx = (int64_t)((uint32_t)t->r[b] & 255u) + (int64_t)t->base_lut;
+                if (!check_idx(idx, lut_len, "lut_u8", err, err_len)) { result = -1; goto done; }
+                t->r[a] = lut[idx];
                 break;
             }
             case OP_FOR_BEGIN: {
@@ -346,24 +349,24 @@ int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
                 uint32_t off = code[npc++];
                 int64_t idx = (int64_t)t->u[b] + (int64_t)off + (int64_t)t->base_u8;
-                if (!check_idx(idx, mem_len * 4, "u_load_u8", err, err_len)) { result = -1; goto done; }
-                t->u[a] = (uint32_t)((const uint8_t*)mem)[idx];
+                if (!check_idx(idx, packed_len, "u_load_u8", err, err_len)) { result = -1; goto done; }
+                t->u[a] = (uint32_t)packed[idx];
                 break;
             }
             case OP_U_LOAD_U32: {
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
                 uint32_t off = code[npc++];
                 int64_t idx = (int64_t)t->u[b] + (int64_t)off + (int64_t)t->base_u8;
-                if (!check_idx(idx, mem_len * 4 - 3, "u_load_u32", err, err_len)) { result = -1; goto done; }
-                uint32_t v; memcpy(&v, ((const uint8_t*)mem) + idx, sizeof(v)); t->u[a] = v;
+                if (!check_idx(idx, packed_len - 3, "u_load_u32", err, err_len)) { result = -1; goto done; }
+                uint32_t v; memcpy(&v, packed + idx, sizeof(v)); t->u[a] = v;
                 break;
             }
             case OP_U_LOAD_CONSTF: {
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
                 uint32_t off = code[npc++];
                 int64_t idx = (int64_t)t->u[b] + (int64_t)off + (int64_t)t->base_lut;
-                if (!check_idx(idx, mem_len, "u_load_constf", err, err_len)) { result = -1; goto done; }
-                t->r[a] = mem[idx];
+                if (!check_idx(idx, lut_len, "u_load_constf", err, err_len)) { result = -1; goto done; }
+                t->r[a] = lut[idx];
                 break;
             }
             case OP_U_LOAD_IN: {
@@ -380,6 +383,14 @@ int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
                 int64_t idx = (int64_t)t->u[b] + (int64_t)off + (int64_t)t->base_f32;
                 if (!check_idx(idx, mem_len, "u_store_f32", err, err_len)) { result = -1; goto done; }
                 mem[idx] = t->r[a];
+                break;
+            }
+            case OP_U_LOAD_IN4: {
+                if (npc >= n_words || a > 28) { result = -1; snprintf(err, (size_t)err_len, "CPU VM invalid load_in4"); goto done; }
+                uint32_t off = code[npc++];
+                int64_t idx = (int64_t)t->u[b] + off + (int64_t)t->base_in;
+                if (!check_idx(idx, input_len - 3, "u_load_in4", err, err_len)) { result = -1; goto done; }
+                for (int j = 0; j < 4; ++j) t->r[a+j] = input[idx+j];
                 break;
             }
             case OP_U_LOAD_F32: {
@@ -404,8 +415,8 @@ int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
                 uint32_t off = code[npc++];
                 int64_t idx = (int64_t)t->u[b] + (int64_t)off + (int64_t)t->base_lut;
-                if (!check_idx(idx, mem_len, "u_load_meta", err, err_len)) { result = -1; goto done; }
-                uint32_t v; memcpy(&v, &mem[idx], sizeof(v)); t->u[a] = v;
+                if (!check_idx(idx, lut_len, "u_load_meta", err, err_len)) { result = -1; goto done; }
+                uint32_t v; memcpy(&v, &lut[idx], sizeof(v)); t->u[a] = v;
                 break;
             }
             case OP_BASE_F32: t->base_f32 = t->u[a]; break;
@@ -457,4 +468,13 @@ done:
     free(threads);
     free(tg);
     return result;
+}
+
+/* Preserve the original single-arena API and its aliases. */
+int nimf_cpu_vm_run(uint32_t* code, int n_words, float* mem, int mem_len,
+                    float* input, int input_len, int n_threads,
+                    int tg_floats, int tg_size, char* err, int err_len) {
+    return nimf_cpu_vm_run_slots(code, n_words, mem, mem_len,
+        (const uint8_t*)mem, mem_len*4, mem, mem_len, input, input_len,
+        n_threads, tg_floats, tg_size, err, err_len);
 }

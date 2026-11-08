@@ -8,6 +8,7 @@ import std/os
 import std/math
 import std/[osproc, hashes, strutils, sets, algorithm, monotimes, times]
 import vulkan_caps
+import ../../probe
 export vulkan_caps.VulkanCaps
 
 type
@@ -1548,6 +1549,9 @@ proc vulkanRecoverQueue*(): bool =
   result = true
 
 proc vulkanSessionUpload*(data: seq[float32]): VulkanBufferHandle =
+  defer:
+    if unlikely(firProbeOn) and data.len > 0:
+      probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len*4)
   ensureInit()
   let bytes = uint64(data.len * sizeof(float32))
   if gScratchDeviceLocal:
@@ -1636,6 +1640,8 @@ proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
     raise newException(CatchableError, "resident Vulkan upload failed: " & gVkLastError)
 
 proc vulkanImportHostBuffer*(data: pointer; bytes: int): VulkanBufferHandle =
+  defer:
+    if unlikely(firProbeOn): probeUploaded(cast[pointer](result.buf), data, bytes)
   ## Storage buffer over caller memory (a model mmap) without copying, on an
   ## iGPU with VK_EXT_external_memory_host. `data` must be aligned to the
   ## driver's import alignment and readable up to the next multiple of it; the
@@ -1713,11 +1719,15 @@ proc vulkanImportHostRange*(data: pointer; bytes: int): tuple[h: VulkanBufferHan
   if result.h.buf == nil: result.offset = 0
 
 proc vulkanSessionUploadPrivate*(data: openArray[float32]): VulkanBufferHandle =
-  uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil),
+  result = uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil),
     uint64(data.len * sizeof(float32)))
+  if unlikely(firProbeOn) and data.len > 0:
+    probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len*4)
 
 proc vulkanSessionUploadBytesPrivate*(data: openArray[uint8]): VulkanBufferHandle =
-  uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil), uint64(data.len))
+  result = uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil), uint64(data.len))
+  if unlikely(firProbeOn) and data.len > 0:
+    probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len)
 
 proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
                       pushConstBytes: pointer, pushConstSize: uint32,
@@ -2707,6 +2717,9 @@ proc vulkanAvailable*(): bool =
     result = false
 
 proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle =
+  defer:
+    if unlikely(firProbeOn) and data.len > 0:
+      probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len)
   ## Raw-bytes variant (vulkanSessionUpload takes only seq[float32]) - used
   ## for packed int4 weights (wq), mirrors openclSessionUploadBytes.
   ensureInit()

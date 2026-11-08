@@ -13,6 +13,7 @@
 
 import std/os
 import ../../probe
+import ../../micro_kernel/slot_layout
 
 const
   CpuBackendDir = currentSourcePath().parentDir
@@ -153,6 +154,10 @@ proc nimf_cpu_vm_run(code: ptr uint32, nWords: cint, mem: ptr float32,
                      memLen: cint, inF32: ptr float32, inLen: cint,
                      nThreads, tgFloats, tgSize: cint, err: cstring,
                      errLen: cint): cint {.importc, cdecl.}
+proc nimf_cpu_vm_run_slots(code: ptr uint32, nWords: cint, mem: ptr float32, memLen: cint,
+                     packed: pointer, packedLen: cint, lut: ptr float32, lutLen: cint,
+                     input: ptr float32, inputLen: cint, nThreads, tgFloats, tgSize: cint,
+                     err: cstring, errLen: cint): cint {.importc, cdecl.}
 
 # ---------------------------------------------------------------------
 # Nim-friendly wrappers
@@ -364,7 +369,8 @@ proc vmRun*(code: openArray[uint32], mem: var seq[float32],
   if unlikely(firProbeOn):
     probeBackend("cpu")
     probeVmLaunch(code, (if mem.len > 0: cast[pointer](addr mem[0]) else: nil),
-      mem.len, input.len, nThreads, tgFloats, tgSize)
+      mem.len, input.len, nThreads, tgFloats, tgSize,
+      (if input.len > 0: cast[pointer](unsafeAddr input[0]) else: nil))
   if code.len == 0 or mem.len == 0 or nThreads <= 0:
     cpuLastError = "invalid CPU VM arguments"
     return false
@@ -372,6 +378,92 @@ proc vmRun*(code: openArray[uint32], mem: var seq[float32],
   let rc = nimf_cpu_vm_run(unsafeAddr code[0], cint(code.len), addr mem[0],
     cint(mem.len),
     (if input.len > 0: unsafeAddr input[0] else: nil), cint(input.len),
+    cint(nThreads), cint(tgFloats), cint(tgSize), err.cstring, cint(err.len))
+  if rc != 0:
+    cpuLastError = $err
+    return false
+  cpuLastError.setLen(0)
+  true
+
+proc vmRunSlots*(code: openArray[uint32]; arena: var seq[float32];
+                 offsets, sizes: array[5, int]; nThreads, tgFloats, tgSize: int): bool =
+  ## All domains may alias arbitrary ranges of one resident arena. No copies.
+  if code.len == 0 or arena.len == 0: return false
+  let access = vmAccess(code)
+  if access.virtual or access.grid:
+    cpuLastError = "CPU slot VM does not implement virtual threadgroups or device grid control"
+    return false
+  if access.atomic and offsets[4] >= 0 and offsets[4] != offsets[0]:
+    cpuLastError = "CPU slot VM requires MemU32 to alias MemF32"
+    return false
+  var pointers: array[5, ptr float32]
+  for i in 0 .. 4:
+    if offsets[i] < 0: continue
+    if sizes[i] <= 0 or offsets[i] > arena.len-sizes[i]:
+      cpuLastError = "CPU VM slot outside arena"
+      return false
+    pointers[i] = addr arena[offsets[i]]
+  if pointers[0] == nil:
+    pointers[0] = addr arena[0]
+  if unlikely(firProbeOn):
+    probeBackend("cpu")
+    var bindings = "bind=("
+    let buffer = probeBuffer(probeIdentity(addr arena[0]), arena.len*4, "arena")
+    for i in 0 .. 4:
+      if offsets[i] < 0: continue
+      if bindings.len > 6: bindings.add ','
+      bindings.add ["mem", "u8", "lut", "input", "u32"][i] & ":" & buffer & "@" &
+        $(offsets[i]*4) & ":" & $(sizes[i]*4)
+    bindings.add ')'
+    probeGpuDispatch(probeProgram(code), "", nThreads, tgSize, tgFloats*4, bindings)
+  var err = newString(512)
+  let rc = nimf_cpu_vm_run_slots(unsafeAddr code[0], cint(code.len), pointers[0],
+    cint(if sizes[0] > 0: sizes[0] else: arena.len), pointers[1], cint(sizes[1]*4),
+    pointers[2], cint(sizes[2]), pointers[3], cint(sizes[3]), cint(nThreads),
+    cint(tgFloats), cint(tgSize), err.cstring, cint(err.len))
+  if rc != 0:
+    cpuLastError = $err
+    return false
+  cpuLastError.setLen(0)
+  true
+
+type CpuVmView* = object
+  base*: ptr float32
+  offset*, elements*, allocationElements*: int
+
+proc vmRunBound*(code: openArray[uint32]; views: array[5, CpuVmView];
+                 nThreads, tgFloats, tgSize: int): bool =
+  ## Execute the same VM over independent resident buffers, preserving aliases.
+  if code.len == 0: return false
+  let access = vmAccess(code)
+  if access.virtual or access.grid:
+    cpuLastError = "CPU slot VM does not implement virtual threadgroups or device grid control"
+    return false
+  var pointers: array[5, ptr float32]
+  var sizes: array[5, int]
+  var bindings = "bind=("
+  for i, view in views:
+    if view.base == nil: continue
+    if view.offset < 0 or view.elements <= 0 or view.offset > view.allocationElements-view.elements:
+      cpuLastError = "CPU VM view outside allocation"
+      return false
+    pointers[i] = cast[ptr float32](cast[uint](view.base)+uint(view.offset*4))
+    sizes[i] = view.elements
+    if unlikely(firProbeOn):
+      let buffer = probeCpuView(view.base, view.allocationElements)
+      if bindings.len > 6: bindings.add ','
+      bindings.add ["mem", "u8", "lut", "input", "u32"][i] & ":" & buffer &
+        "@" & $(view.offset*4) & ":" & $(view.elements*4)
+  if access.atomic and pointers[4] != nil and pointers[4] != pointers[0]:
+    cpuLastError = "CPU slot VM requires MemU32 to alias MemF32"
+    return false
+  if unlikely(firProbeOn):
+    bindings.add ')'
+    probeBackend("cpu")
+    probeGpuDispatch(probeProgram(code), "", nThreads, tgSize, tgFloats*4, bindings)
+  var err = newString(512)
+  let rc = nimf_cpu_vm_run_slots(unsafeAddr code[0], cint(code.len), pointers[0], cint(sizes[0]),
+    pointers[1], cint(sizes[1]*4), pointers[2], cint(sizes[2]), pointers[3], cint(sizes[3]),
     cint(nThreads), cint(tgFloats), cint(tgSize), err.cstring, cint(err.len))
   if rc != 0:
     cpuLastError = $err
