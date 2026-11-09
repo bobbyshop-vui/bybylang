@@ -18,6 +18,57 @@ nim c -d:release -o:bybylang bybylang.nim
 
 `--aot=<path>` generates `<path>.nim`, compiles it with Nim, and produces the binary `<path>`.
 
+### Diagnostics: errors, `warn`, `error`, `traceback`
+
+**Compile errors point at your `.bybylang` source**, in the style of clang. The compiler tags every generated Nim line with the source line it came from and translates Nim's messages back:
+
+```text
+prog.bybylang:1:11: error: expected: ')', but got: 'echo'
+x = (1 + 2
+          ^
+1 error(s) generated.
+```
+
+- The exit status is `1`, and there is no Nim stack trace. Pass `-v` to also see the compiler log and the stack trace, `--raw-nim` to print Nim's own output as well, `--nim-warnings` to report Nim warnings of the generated code, and `-Werror` to treat warnings as errors.
+- Messages like `expected ')'` are found by Nim at the token after the mistake. The caret is placed at the end of the previous statement, where the mistake is.
+- A missing `import` is reported on the `import` line.
+- The compiler log (`[INFO]`, `[DEBUG]`) is off by default. `-v` turns on info and `-vv` debug.
+
+**Reporting from a program.** Three statements work in BybyLang code and report the `.bybylang` file and line (they go to stderr):
+
+```text
+warn "buffer is larger than the tile"     # prog.bybylang:12: warning: buffer is ...   (keeps running)
+traceback "unexpected state"              # prints the call stack and the note        (keeps running)
+error "model.fir is truncated"            # prog.bybylang:14: error: ...  then exits with status 1
+```
+
+`traceback` lists the BybyLang functions that were active, oldest first, then the line of the `traceback` statement. Using it makes the compiler build the program with Nim stack frames (`--stackTrace:on`), so only programs that use it pay for them.
+
+**Reporting from a Nim library.** `import diag` (the module sits next to `bybylang.nim`) and call the same three words. They report the Nim file and line of the call:
+
+```nim
+import diag
+
+proc loadTable(path: string) =
+  if not fileExists(path):
+    warn "table missing, using the default"     # tables.nim:5:  warning: ...
+  if corrupted:
+    traceback "corrupted table"                 # prints the stack, continues
+    error "cannot continue"                     # prints, then raises BybyError
+```
+
+| Symbol | Meaning |
+| --- | --- |
+| `warn(msg)`, `diagWarn(msg, file, line)` | Print a warning. |
+| `error(msg)`, `diagError(msg, file, line)` | Print an error and raise `BybyError` (an uncaught `BybyError` exits with status 1 and prints nothing more). |
+| `traceback(msg = "")`, `diagTraceback(msg, file, line)` | Print the call stack; the program continues. Frames need `--stackTrace:on`. |
+| `diagEmit(severity, file, line, col, msg, source, caretLen, notes)` | Print one clang-style diagnostic, with the source line and a caret when `source` and `col` are given. |
+| `gDiagWarnings`, `gDiagErrors`, `gDiagWarningsAsErrors` | Counters and the `-Werror` switch. |
+
+Colors are used only on a terminal and are off when `NO_COLOR` is set.
+
+---
+
 ---
 
 ## 1. General syntax

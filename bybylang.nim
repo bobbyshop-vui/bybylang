@@ -35,6 +35,7 @@ import ./backends/cpu/cpu_backend as cpu
 import ./micro_kernel
 import ./backends/metal/metal_backend
 import ./backends/vulkan/vulkan_driver
+import ./diag as dg
 export gpubackend, micro_kernel, metal_backend, vulkan_driver
 
 # --------------------------
@@ -45,7 +46,7 @@ type
     tlDebug, tlInfo, tlWarn, tlError
 
 var gTraceEnabled = true
-var gTraceLevel = tlInfo
+var gTraceLevel = tlWarn   # -v: info, -vv: debug
 
 proc currentTime(): string =
   let t = getTime()
@@ -107,6 +108,8 @@ type
     sym: string
     text: string
     indent: int
+    file: string   ## source file the line came from (as given on the command line / import)
+    line: int      ## 1-based line number in `file`
     
 # --------------------------
 # Simulated RAM / bus / pins
@@ -170,19 +173,26 @@ proc resolveImports(filename: string, visited: var seq[string]): seq[Token] =
   visited.add(absPath)
 
   if not fileExists(filename):
-    traceError("Import file not found: " & filename)
-    echo "[ERROR] import: file not found: ", filename
+    dg.diagEmit(dg.dsError, "", 0, 0, "file not found: " & filename)
     return
 
   traceInfo("Resolving imports for: " & filename)
+  var lineNo = 0
   for line in lines(filename):
-    let t = tokenizeLine(line)
+    inc lineNo
+    var t = tokenizeLine(line)
+    t.file = filename
+    t.line = lineNo
     if t.sym == "import":
       var target = stripQuotes(t.text)
       if not target.endsWith(".bybylang"):
         target &= ".bybylang"
       if not fileExists(target):
         target = filename.parentDir() / target
+      if not fileExists(target):
+        dg.diagEmit(dg.dsError, filename, lineNo, t.indent + 1,
+          "cannot find imported file '" & stripQuotes(t.text) & "'", line, line.strip().len)
+        continue
       result.add(resolveImports(target, visited))
     else:
       result.add(t)
@@ -195,6 +205,26 @@ proc tokenizeFile(filename: string): seq[Token] =
   let result = resolveImports(filename, visited)
   traceInfo("Total tokens: " & $result.len)
   return result
+
+# --------------------------
+# Source mapping: every generated Nim line gets a trailing `#bb:<line>:<file>` comment, so an
+# error reported by Nim can be translated back to the .bybylang line that produced it.
+# --------------------------
+var gSrcFiles: seq[string] = @[]
+
+proc srcFileIndex(file: string): int =
+  let at = gSrcFiles.find(file)
+  if at >= 0: return at
+  gSrcFiles.add file
+  gSrcFiles.high
+
+proc tagLines(lines: var seq[string]; from0: int; tok: Token) =
+  if tok.line <= 0: return
+  let marker = " #bb:" & $tok.line & ":" & $srcFileIndex(tok.file)
+  for i in max(from0, 0) ..< lines.len:
+    let l = lines[i]
+    if l.len == 0 or '\n' in l or " #bb:" in l or l.strip().startsWith("#"): continue
+    lines[i] = l & marker
 
 # --------------------------
 # Line classification shared by the code generator.
@@ -267,6 +297,18 @@ proc assignTarget(line: string): string =
     return ""
   let left = line[0 ..< eq].strip()
   if left.isNimIdent: left else: ""
+
+proc diagStatement(line: string): string =
+  ## "warn", "error" or "traceback" when `line` is that statement ("" otherwise).
+  ## `error = 3` or `warn.x` are ordinary Nim and stay untouched.
+  for word in ["warn", "error", "traceback"]:
+    if line == word:
+      return (if word == "traceback": word else: "")
+    if line.startsWith(word & " "):
+      let rest = line[word.len..^1].strip()
+      if rest.len > 0 and (rest[0] in {'"', '$', '_'} or rest[0].isAlphaAscii):
+        return word
+  ""
 
 proc isTypeSection(line: string): bool =
   line == "type" or line.startsWith("type ")
@@ -1370,9 +1412,15 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
     return
 
   let blockIndent = tokens[first].indent
+  var tagMark = 0
+  var tagTok: Token
 
   while idx < tokens.len and (tokens[idx].isTrivia or tokens[idx].indent >= blockIndent):
     let tk = tokens[idx]
+    # Lines produced by the previous token belong to that token.
+    tagLines(result, tagMark, tagTok)
+    tagMark = result.len
+    tagTok = tk
 
     if tk.indent > blockIndent:
       idx.inc
@@ -1528,6 +1576,17 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
         result.add(indent & "tranPulse(" & words[3] & ", \"" & words[^1] & "\")")
         idx.inc
 
+      elif diagStatement(line) != "":
+        # warn "text" / error "text" / traceback ["note"]: pass the .bybylang position along.
+        let word = diagStatement(line)
+        let rest = line[word.len..^1].strip()
+        let where = ", " & dg.escapeLiteral(tk.file) & ", " & $tk.line & ")"
+        case word
+        of "warn": result.add(indent & "diagWarn(" & rest & where)
+        of "error": result.add(indent & "diagError(" & rest & where)
+        else: result.add(indent & "diagTraceback(" & (if rest.len > 0: rest else: "\"\"") & where)
+        idx.inc
+
       elif isTypeSection(line):
         result.add(genRawBlock(tokens, idx, indent, blockIndent))
 
@@ -1554,6 +1613,112 @@ proc genBlock(tokens: seq[Token], idx: var int, indent: string,
       else:
         result.add(indent & line)
         idx.inc
+  tagLines(result, tagMark, tagTok)
+# --------------------------
+# Translate Nim's diagnostics on the generated file back to .bybylang positions
+# --------------------------
+var rawNimOutput = false        ## --raw-nim: also print Nim's own output
+var showNimWarnings = false     ## --nim-warnings: report Nim warnings of the generated code
+
+type NimDiag = object
+  path, sev, msg: string
+  line, col: int
+  notes: seq[string]
+
+proc parseNimOutput(output: string): seq[NimDiag] =
+  for raw in output.splitLines:
+    let ln = raw.strip(trailing = true)
+    var matched = false
+    let lp = ln.find('(')
+    let rp = if lp > 0: ln.find(')', lp) else: -1
+    if lp > 0 and rp > lp and rp + 2 < ln.len and ln[rp + 1] == ' ':
+      let inside = ln[lp + 1 ..< rp].split(", ")
+      let colon = ln.find(':', rp + 2)
+      if inside.len == 2 and colon > rp:
+        try:
+          result.add NimDiag(path: ln[0 ..< lp], line: parseInt(inside[0]), col: parseInt(inside[1]),
+                             sev: ln[rp + 2 ..< colon], msg: ln[colon + 1 .. ^1].strip())
+          matched = true
+        except ValueError: discard
+    if not matched and result.len > 0 and ln.strip().len > 0 and
+        not ln.startsWith("Hint:") and not ln.allCharsInSet({'.', ' '}):
+      result[^1].notes.add ln.strip()
+
+var gSrcCache = initTable[string, seq[string]]()
+
+proc sourceLines(file: string): seq[string] =
+  if file notin gSrcCache:
+    gSrcCache[file] = if fileExists(file): readFile(file).splitLines else: @[]
+  gSrcCache[file]
+
+proc markerOf(nimLine: string): tuple[line, file: int] =
+  ## Parse the trailing `#bb:<line>:<file>` marker; (0, -1) when there is none.
+  let at = nimLine.rfind(" #bb:")
+  if at < 0: return (0, -1)
+  let parts = nimLine[at + 5 .. ^1].split(':')
+  try: (parseInt(parts[0]), parseInt(parts[1])) except ValueError: (0, -1)
+
+proc stripMarker(nimLine: string): string =
+  let at = nimLine.rfind(" #bb:")
+  if at < 0: nimLine else: nimLine[0 ..< at]
+
+proc reportNimOutput(output, nimFile: string): int =
+  ## Print the diagnostics that belong to the generated file as clang-style messages on the
+  ## .bybylang source. Returns the number of errors shown.
+  let nimLines = readFile(nimFile).splitLines
+  for d in parseNimOutput(output):
+    let ours = d.path.extractFilename == nimFile.extractFilename
+    let isError = d.sev == "Error"
+    if not isError and not (ours and showNimWarnings and d.sev == "Warning"): continue
+    if not ours:
+      # an error inside a library module: no .bybylang position exists
+      dg.diagEmit(dg.dsError, d.path, d.line, d.col, d.msg, notes = d.notes)
+      inc result
+      continue
+    var at = d.line
+    var mk = if at >= 1 and at <= nimLines.len: markerOf(nimLines[at - 1]) else: (0, -1)
+    var useEnd = false
+    # "expected ')'" and indentation errors are found at the token AFTER the mistake: blame the
+    # end of the previous statement, like a C compiler does.
+    if at >= 1 and at <= nimLines.len and
+        (d.msg.startsWith("expected") or d.msg.startsWith("invalid indentation")):
+      let gen = stripMarker(nimLines[at - 1])
+      let genIndent = gen.len - gen.strip(trailing = false).len
+      var got = ""
+      let gotAt = d.msg.find("but got: '")
+      if gotAt >= 0: got = d.msg[gotAt + 10 .. ^1].strip(chars = {'\''})
+      if (got.len > 0 and gen.strip().startsWith(got)) or d.col <= genIndent + 1:
+        var j = at - 1
+        while j >= 1 and markerOf(nimLines[j - 1]).file < 0: dec j
+        if j >= 1:
+          mk = markerOf(nimLines[j - 1])
+          useEnd = true
+    if mk.file < 0:
+      var j = at
+      while j >= 1 and markerOf(nimLines[j - 1]).file < 0: dec j
+      if j >= 1: mk = markerOf(nimLines[j - 1])
+    if mk.file < 0 or mk.file >= gSrcFiles.len:
+      dg.diagEmit(dg.dsError, "(generated)", d.line, d.col, d.msg, notes = d.notes)
+      inc result
+      continue
+    let file = gSrcFiles[mk.file]
+    let src = sourceLines(file)
+    let srcText = if mk.line >= 1 and mk.line <= src.len: src[mk.line - 1] else: ""
+    let srcIndent = srcText.len - srcText.strip(trailing = false).len
+    var col = srcIndent + 1
+    var width = max(1, srcText.strip().len)
+    if useEnd:
+      col = srcText.strip(leading = false).len + 1
+      width = 1
+    elif at >= 1 and at <= nimLines.len:
+      let gen = stripMarker(nimLines[at - 1])
+      let genIndent = gen.len - gen.strip(trailing = false).len
+      if gen.strip() == srcText.strip():
+        col = min(max(srcIndent + (d.col - genIndent), srcIndent + 1), srcText.len)
+        width = 1
+    dg.diagEmit(dg.dsError, file, mk.line, col, d.msg, srcText, width, d.notes)
+    inc result
+
 # --------------------------
 # Generate Nim code + compile to binary release
 # --------------------------
@@ -1565,6 +1730,7 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
   # output so functions can use the types.
   var funcHeaders = initOrderedTable[string, string]()
   var funcBodiesLocal = initOrderedTable[string, seq[Token]]()
+  var funcTokens = initTable[string, Token]()
   var declTokens: seq[Token] = @[]
   var mainTokens: seq[Token] = @[]
   var idx = 0
@@ -1586,6 +1752,7 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
       if fname in funcBodiesLocal:
         traceWarn("Function redefined: " & fname)
       funcHeaders[fname] = t.text
+      funcTokens[fname] = t
       funcBodiesLocal[fname] = body
       traceDebug("Found function: " & fname & " with " & $body.len & " body tokens")
     elif t.indent == 0 and t.sym == "other" and
@@ -1605,6 +1772,7 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
   var code = newSeq[string]()
   code.add("import strutils, sequtils")
   code.add("import bybylang")
+  code.add("import diag")
   # NEW: collects ALL "import nim \"X\"" from every token (including files
   # imported through resolveImports - the nimimport tokens survive
   # resolution) - emitted ONCE at the top
@@ -1680,7 +1848,9 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
   traceInfo("Generating " & $funcBodiesLocal.len & " functions")
   for k, v in funcBodiesLocal:
     code.add("")
-    code.add("proc " & functionSignature(funcHeaders[k]) & " =")
+    var header = @["proc " & functionSignature(funcHeaders[k]) & " ="]
+    tagLines(header, 0, funcTokens[k])
+    code.add(header[0])
     var localVars = functionParams(funcHeaders[k]) & @["result"]
     var bidx = 0
     let bodyLines = genBlock(v, bidx, "  ", funcNames, localVars)
@@ -1700,21 +1870,31 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
 
   writeFile(nimFile, code.join("\n"))
   traceInfo("Generated " & $code.len & " lines of Nim code")
-  echo "[INFO] Generated Nim code to ", nimFile
   
   let nimcacheDir = getEnv("BYBYLANG_NIMCACHE").strip()
   let nimcacheArg = if nimcacheDir.len > 0:
       " --nimcache:" & quoteShell(nimcacheDir)
     else: ""
-  let cmd = "nim c -d:release --path:" & quoteShell(getAppDir()) & nimcacheArg &
-    " -o:" & quoteShell(outFile) & " " & quoteShell(nimFile)
+  # `traceback` needs Nim stack frames, which -d:release drops; turn them on only when it is used.
+  var usesTraceback = false
+  for t in tokens:
+    if t.sym == "other" and (t.text == "traceback" or t.text.startsWith("traceback ")):
+      usesTraceback = true
+  let stackFlags = if usesTraceback: " --stackTrace:on --lineTrace:on" else: ""
+  let cmd = "nim c -d:release --hints:off --colors:off" & stackFlags & " --path:" & quoteShell(getAppDir()) &
+    nimcacheArg & " -o:" & quoteShell(outFile) & " " & quoteShell(nimFile)
   traceInfo("Compiling with: " & cmd)
   let res = execCmdEx(cmd)
-  echo res.output
+  if rawNimOutput: echo res.output
+  let shown = reportNimOutput(res.output, nimFile)
   if res.exitCode != 0:
-    raise newException(CatchableError,
-      "AOT compile failed with exit code " & $res.exitCode)
-  echo "[INFO] Built executable: ", outFile
+    if shown == 0 and not rawNimOutput:
+      # Nim failed without a diagnostic we can place: show what it said.
+      dg.diagEmit(dg.dsError, "", 0, 0, "Nim failed to build the generated code (exit " &
+        $res.exitCode & ")", notes = @[res.output.strip()])
+    stderr.writeLine $max(shown, 1) & " error(s) generated."
+    quit(1)
+  traceInfo("Built executable: " & outFile)
 
 # --------------------------
 # Main
@@ -1729,6 +1909,16 @@ proc main() =
       ignoreErrors = true
     elif a == "--quiet":
       quietMode = true
+    elif a == "-v" or a == "--verbose":
+      gTraceLevel = tlInfo
+    elif a == "-vv":
+      gTraceLevel = tlDebug
+    elif a == "--raw-nim":
+      rawNimOutput = true
+    elif a == "--nim-warnings":
+      showNimWarnings = true
+    elif a == "-Werror":
+      dg.gDiagWarningsAsErrors = true
     elif a.startsWith("--aot="):
       aotFile = a.split('=')[1]
     elif a == "--help" or a == "-h":
@@ -1738,6 +1928,10 @@ proc main() =
       echo "  --aot=FILE          Compile to executable FILE"
       echo "  --ignore-errors     Ignore non-fatal errors"
       echo "  --quiet             Suppress informational output"
+      echo "  -v, -vv             Verbose compiler log (info / debug)"
+      echo "  --raw-nim           Also print the Nim compiler's own output"
+      echo "  --nim-warnings      Report Nim warnings of the generated code"
+      echo "  -Werror             Treat warnings as errors"
       echo "  --help, -h          Show this help"
       quit(0)
     elif i == 0 or inputFile == "":
@@ -1755,6 +1949,9 @@ proc main() =
   traceDebug("Arguments: " & $args)
 
   let tokens = tokenizeFile(inputFile)
+  if dg.gDiagErrors > 0 and not ignoreErrors:
+    stderr.writeLine $dg.gDiagErrors & " error(s) generated."
+    quit(1)
   traceInfo("Tokenization complete, " & $tokens.len & " tokens")
 
   if aotFile != "":
@@ -1766,4 +1963,10 @@ proc main() =
   traceInfo("BybyLang finished")
 
 when isMainModule:
-  main()
+  try:
+    main()
+  except CatchableError as e:
+    # A compiler failure is reported as a diagnostic; the Nim stack trace only with -v.
+    dg.diagEmit(dg.dsError, "", 0, 0, e.msg)
+    if gTraceLevel <= tlInfo: stderr.writeLine e.getStackTrace()
+    quit(1)
