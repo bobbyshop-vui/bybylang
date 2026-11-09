@@ -15,7 +15,7 @@
 ## The existing kernels (matmul_q4, vecop, ...) are UNCHANGED — the production hot path.
 ## JIT is only for micro-VM programs / custom logic.
 
-import std/[tables, strutils, strformat, times, os, pegs, hashes]
+import std/[tables, sets, strutils, strformat, times, os, pegs, hashes]
 import ./session_vm
 import ../probe
 when defined(macosx):
@@ -618,6 +618,18 @@ var gHashKernelReady = false
 var gWordsKey = initTable[seq[uint32], string]()
   ## key computed from the bytecode CONTENT (exact word match) -> each program is hashed only ONCE.
 
+var gProbeRecorded: HashSet[string]  ## pipeline names whose bytecode the recorder already holds
+
+proc recordPipelines(key: string; words: seq[uint32]) =
+  ## Hand the bytecode of a compiled kernel to the recorder, whether or not a trace is running.
+  ## A trace started after the model was compiled would otherwise find no bytecode (`missing_words`).
+  ## Done once per kernel name, so repeated lookups stay cheap.
+  if key in gProbeRecorded: return
+  gProbeRecorded.incl key
+  probePipeline("jit_" & key, words)
+  probePipeline("jit_vk_" & key, words)
+  probePipeline("vkvm_" & key, words)
+
 proc fallbackWordsKey(words: seq[uint32]): string =
   ## Key that needs NO GPU/session: used while INSIDE a session (Metal does not allow nested sessions,
   ## so a separate session for GPU hashing is impossible). std hash + length; prefix 'S' to tell it apart.
@@ -650,7 +662,9 @@ when defined(macosx):
       # Use the fallback key (no GPU needed) instead of raising - the result is memoized by program content.
       return fallbackWordsKey(words)
     let h = byby.sessionUploadPrivate(be, host)
-    if unlikely(firProbeOn): probePipeline(HashKernelName, buildHashProgram().words)
+    if HashKernelName notin gProbeRecorded:
+      gProbeRecorded.incl HashKernelName
+      probePipeline(HashKernelName, buildHashProgram().words)
     var ok = sessionPipeline(HashKernelName)
     ok = ok and sessionBindBuffer(1, h.metalHandle) and
          sessionBindBuffer(2, h.metalHandle) and sessionBindBuffer(3, h.metalHandle)
@@ -698,10 +712,7 @@ proc programKey*(p: VmProgram; tag = ""): string =
     result.add '_'
     result.add sanitizeTag(tag)
 
-  if unlikely(firProbeOn):
-    probePipeline("jit_" & result, p.words)
-    probePipeline("jit_vk_" & result, p.words)
-    probePipeline("vkvm_" & result, p.words)
+  recordPipelines(result, p.words)
 
 proc programKeyNoSession*(p: VmProgram; tag = ""): string =
   ## LIKE programKey but NEVER opens a session (safe INSIDE a session, e.g. encodeMicroVm).
@@ -714,10 +725,7 @@ proc programKeyNoSession*(p: VmProgram; tag = ""): string =
     result.add '_'
     result.add sanitizeTag(tag)
 
-  if unlikely(firProbeOn):
-    probePipeline("jit_" & result, p.words)
-    probePipeline("jit_vk_" & result, p.words)
-    probePipeline("vkvm_" & result, p.words)
+  recordPipelines(result, p.words)
 
 # ── Compile hook (Metal) — needs a C bridge ──────────────────────
 ## Like tinygrad's MetalCompiler: source → compiled library → pipeline name.

@@ -231,9 +231,25 @@ proc probeCodeProgram*(identity: uint64): string =
   if state.codeWords.hasKey(identity): return probeProgram(state.codeWords[identity])
   "none"
 
+proc probeEnsureState() =
+  ## Allocate the lock and the recorder state without starting a trace, so kernels compiled
+  ## BEFORE `firProbeStart` still leave their bytecode in the registry.
+  if not recorderLockReady:
+    initLock(recorderLock)
+    recorderLockReady = true
+  if state == nil:
+    acquire(recorderLock)
+    if state == nil:
+      let owned = ProbeState()
+      GC_ref(owned)
+      state = cast[ptr ProbeStateObj](owned)
+    release(recorderLock)
+
 proc probePipeline*(name: string; words: openArray[uint32]) =
+  ## Safe to call whether or not a trace is running: the registry survives start/stop, so a
+  ## trace started after the model was compiled still finds the bytecode.
+  probeEnsureState()
   probeLocked()
-  # Called even on a warm JIT cache; this table belongs to the recorder.
   state.pipelineWords[name] = @words
 
 proc probePipelineProgram*(name: string): string =
