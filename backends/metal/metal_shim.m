@@ -9,6 +9,7 @@
 #include <sys/sysctl.h>
 #include <math.h>
 #include <os/lock.h>
+#include <objc/message.h>
 
 // ─────────────────────────────────────────────────────────────
 // matmul_q4 kernel A/B TEST (NEW): change only the 2 lines below to
@@ -35,6 +36,9 @@
 // ─────────────────────────────────────────────────────────────
 static id<MTLDevice> gDevice = nil;
 static id<MTLBuffer> poolTake(size_t bytes, BOOL *recycled);
+static void residencyAdd(id<MTLBuffer> buf);
+static void residencyCommit(void);
+static void residencyRemove(id<MTLBuffer> buf);
 static BOOL poolGive(id<MTLBuffer> buf);
 static id<MTLCommandQueue> gQueue = nil;
 static id<MTLLibrary> gLibrary = nil;
@@ -766,11 +770,72 @@ static id<MTLComputeCommandEncoder> gSessionEncoder = nil;
 // metal_session_end().
 static NSString *gLastSessionEndError = nil;
 
+// Weights stay resident on the GPU through an MTLResidencySet (macOS 15+): without
+// one, Metal makes every buffer a command buffer references resident again at
+// each commit, which for mmap-backed weight buffers is paid on every token.
+// The set is reached through the runtime so the shim still builds against older
+// SDKs; on an older macOS these calls do nothing. BYBY_RESIDENCY=0 turns it off.
+static id gResidencySet = nil;
+static BOOL gResidencyDirty = NO;
+static NSHashTable *gResidencyMembers = nil;   // buffers added to the set (not retained)
+
+static id residencySet(void) {
+    static int tried = 0;
+    if (tried) return gResidencySet;
+    tried = 1;
+    const char *e = getenv("BYBY_RESIDENCY");
+    if (e && e[0] == '0') return nil;
+    Class descClass = NSClassFromString(@"MTLResidencySetDescriptor");
+    SEL makeSel = NSSelectorFromString(@"newResidencySetWithDescriptor:error:");
+    SEL attachSel = NSSelectorFromString(@"addResidencySet:");
+    if (!descClass || !gDevice || !gQueue || ![(id)gDevice respondsToSelector:makeSel] ||
+        ![(id)gQueue respondsToSelector:attachSel]) return nil;
+    id desc = [[descClass alloc] init];
+    NSError *error = nil;
+    id set = ((id (*)(id, SEL, id, NSError **))objc_msgSend)((id)gDevice, makeSel, desc, &error);
+    if (!set || ![set respondsToSelector:NSSelectorFromString(@"addAllocation:")] ||
+        ![set respondsToSelector:NSSelectorFromString(@"commit")] ||
+        ![set respondsToSelector:NSSelectorFromString(@"requestResidency")]) return nil;
+    ((void (*)(id, SEL, id))objc_msgSend)((id)gQueue, attachSel, set);
+    gResidencySet = set;
+    return gResidencySet;
+}
+
+static void residencyAdd(id<MTLBuffer> buf) {
+    if (!buf) return;
+    id set = residencySet();
+    if (!set) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(set, NSSelectorFromString(@"addAllocation:"), buf);
+    if (!gResidencyMembers)
+        gResidencyMembers = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory |
+                                                              NSPointerFunctionsOpaquePersonality];
+    [gResidencyMembers addObject:buf];
+    gResidencyDirty = YES;
+}
+
+// Drops a buffer that is about to be released from the residency set.
+static void residencyRemove(id<MTLBuffer> buf) {
+    if (!gResidencySet || !gResidencyMembers || ![gResidencyMembers containsObject:buf]) return;
+    [gResidencyMembers removeObject:buf];
+    SEL removeSel = NSSelectorFromString(@"removeAllocation:");
+    if ([gResidencySet respondsToSelector:removeSel])
+        ((void (*)(id, SEL, id))objc_msgSend)(gResidencySet, removeSel, buf);
+    gResidencyDirty = YES;
+}
+
+static void residencyCommit(void) {
+    if (!gResidencyDirty || !gResidencySet) return;
+    gResidencyDirty = NO;
+    ((void (*)(id, SEL))objc_msgSend)(gResidencySet, NSSelectorFromString(@"commit"));
+    ((void (*)(id, SEL))objc_msgSend)(gResidencySet, NSSelectorFromString(@"requestResidency"));
+}
+
 int metal_session_begin(const char* kernel_src, char** error_out) {
     if (error_out) *error_out = NULL;
     @autoreleasepool {
         if (!ensureMetalInit(kernel_src)) return 0;
         if (gSessionCmdBuf != nil) { NSLog(@"[metal_session_begin] the previous session has not ended, skipping"); return 0; }
+        residencyCommit();
         gSessionCmdBuf = [gQueue commandBuffer];
         if (!gSessionCmdBuf) { NSLog(@"[metal_session_begin] commandBuffer returned nil"); return 0; }
         gSessionEncoder = [gSessionCmdBuf computeCommandEncoder];
@@ -864,6 +929,7 @@ MetalBufferHandle metal_wrap_host_nocopy(const void* data, size_t bytes) {
                                                        length:length
                                                       options:MTLResourceStorageModeShared
                                                   deallocator:nil];
+        residencyAdd(buf);
         return buf ? (__bridge_retained MetalBufferHandle)buf : NULL;
     }
 }
@@ -1362,6 +1428,7 @@ static MetalBufferHandle metalUploadPrivateRaw(const void* data, size_t bytes) {
         // UMA/integrated: the staging buffer IS ALREADY usable (same RAM region,
         // Shared, pageable) - no extra Private copy + blit (it would only waste
         // wired memory on this kind of GPU). Return the staging buffer directly.
+        residencyAdd(staging);
         return (__bridge_retained MetalBufferHandle)staging;
     }
     id<MTLBuffer> priv = [gDevice newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
@@ -1376,6 +1443,7 @@ static MetalBufferHandle metalUploadPrivateRaw(const void* data, size_t bytes) {
         NSLog(@"[metalUploadPrivateRaw] blit FAILED, error=%@ - falling back to Shared to keep the data", cmdBuf.error);
         return (__bridge_retained MetalBufferHandle)staging;   // safe: correct data, only the speedup is lost
     }
+    residencyAdd(priv);
     return (__bridge_retained MetalBufferHandle)priv;
 }
 
@@ -2246,6 +2314,7 @@ void metal_buffer_free(MetalBufferHandle h) {
         // variable that releases it when leaving the scope - the counterpart of
         // the __bridge_retained used by metal_upload/metal_alloc_scratch to create the handle.
         id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)h;
+        residencyRemove(buf);
         (void)poolGive(buf);   // kept by the pool, or released here by ARC
     }
 }
