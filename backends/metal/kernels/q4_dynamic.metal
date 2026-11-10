@@ -125,16 +125,25 @@ kernel void matmul_q4_simd(
 constant uint q4f_mode [[function_constant(120)]];
 constant uint q4f_res [[function_constant(121)]];
 
-static inline float q4f_row(device const uchar* wq, device const float* sc,
-        device const float* zr, uint n, uint rowBytes, uint gpr, uint k, uint g,
-        uint shift, float4 a0, float4 a1, float sumA, float acc) {
-    device const uint* word = (device const uint*)(wq + n * rowBytes + k / 2);
+constant uint q4f_packs [[function_constant(122)]];   // 4-byte packs per thread per step: 1 or 2
+
+// Dot product of 8 activations with the 8 nibbles of one packed word.
+static inline float q4f_dot(device const uint* word, uint shift, float4 a0, float4 a1) {
     const uint p = shift == 0 ? word[0] :
         (word[0] >> (8 * shift)) | (word[1] << (32 - 8 * shift));
-    const float d = fma(a0.x, float(p & 15u), fma(a0.y, float((p >> 4) & 15u),
+    return fma(a0.x, float(p & 15u), fma(a0.y, float((p >> 4) & 15u),
         fma(a0.z, float((p >> 8) & 15u), fma(a0.w, float((p >> 12) & 15u),
         fma(a1.x, float((p >> 16) & 15u), fma(a1.y, float((p >> 20) & 15u),
         fma(a1.z, float((p >> 24) & 15u), a1.w * float(p >> 28))))))));
+}
+
+// One step of row n: the packs at column k, scaled by their group, added to acc.
+static inline float q4f_row(device const uchar* wq, device const float* sc,
+        device const float* zr, uint n, uint rowBytes, uint gpr, uint k, uint g,
+        uint shift, float4 a0, float4 a1, float4 a2, float4 a3, float sumA, float acc) {
+    device const uint* word = (device const uint*)(wq + n * rowBytes + k / 2);
+    float d = q4f_dot(word, shift, a0, a1);
+    if (q4f_packs == 2) d += q4f_dot(word + 1, shift, a2, a3);
     const uint gi = n * gpr + g;
     return fma(sc[gi], d - zr[gi] * sumA, acc);
 }
@@ -176,16 +185,26 @@ kernel void matmul_q4_fused(
     float sumB_[4] = {0, 0, 0, 0};
     const uint rowBytes = uint(K) / 2;
     const uint gpr = uint(groupsPerRow);
-    for (uint k = lane * 8; k < uint(K); k += simdW * 8) {
+    const uint vals = 8 * q4f_packs;   // activations per thread per step
+    const uint gs = uint(max(groupSize, 1));
+    const bool gPow2 = (gs & (gs - 1)) == 0;
+    const uint gShift = 31 - clz(gs);
+    for (uint k = lane * vals; k < uint(K); k += simdW * vals) {
         const float4 a0 = *(device const float4*)(a + k);
         const float4 a1 = *(device const float4*)(a + k + 4);
-        const float sumA = (a0.x + a0.y) + (a0.z + a0.w) + ((a1.x + a1.y) + (a1.z + a1.w));
-        const uint g = groupSize > 0 ? k / uint(groupSize) : 0;
+        float4 a2 = float4(0.0f), a3 = float4(0.0f);
+        float sumA = (a0.x + a0.y) + (a0.z + a0.w) + ((a1.x + a1.y) + (a1.z + a1.w));
+        if (q4f_packs == 2) {
+            a2 = *(device const float4*)(a + k + 8);
+            a3 = *(device const float4*)(a + k + 12);
+            sumA += (a2.x + a2.y) + (a2.z + a2.w) + ((a3.x + a3.y) + (a3.z + a3.w));
+        }
+        const uint g = groupSize > 0 ? (gPow2 ? k >> gShift : k / gs) : 0;
         for (uint r = 0; r < 4; ++r) {
             const uint n = local0 + r;
-            sumA_[r] = q4f_row(wqA, scA, zrA, n, rowBytes, gpr, k, g, shA, a0, a1, sumA, sumA_[r]);
+            sumA_[r] = q4f_row(wqA, scA, zrA, n, rowBytes, gpr, k, g, shA, a0, a1, a2, a3, sumA, sumA_[r]);
             if (q4f_mode == 1)
-                sumB_[r] = q4f_row(wq1, sc1, zr1, n, rowBytes, gpr, k, g, sh.y, a0, a1, sumA, sumB_[r]);
+                sumB_[r] = q4f_row(wq1, sc1, zr1, n, rowBytes, gpr, k, g, sh.y, a0, a1, a2, a3, sumA, sumB_[r]);
         }
     }
     for (uint r = 0; r < 4; ++r) {

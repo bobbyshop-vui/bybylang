@@ -1518,20 +1518,24 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
 // mode 0: up to 3 matrices share `a` (count = number of used slots);
 // mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.
 // res may be NULL. Returns 0 when the shape/kernel is unsupported.
-static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes) {
+static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes, uint32_t packs) {
     static NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *cache;
     if (!cache) cache = [NSMutableDictionary new];
-    NSNumber *key = @(mode * 2 + hasRes);
-    if (cache[key]) return cache[key];
+    NSNumber *key = @((mode * 2 + hasRes) * 4 + packs);
+    if (cache[key]) return cache[key] == (id)[NSNull null] ? nil : cache[key];
+    cache[key] = (id)[NSNull null];   // a pipeline that cannot be used is not built again
     MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
     [constants setConstantValue:&mode type:MTLDataTypeUInt atIndex:120];
     [constants setConstantValue:&hasRes type:MTLDataTypeUInt atIndex:121];
+    [constants setConstantValue:&packs type:MTLDataTypeUInt atIndex:122];
     NSError *error = nil;
     id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_fused"
         constantValues:constants error:&error];
     if (!fn) return nil;
     id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
-    if (!pso || pso.threadExecutionWidth != 32 || pso.maxTotalThreadsPerThreadgroup < 64) return nil;
+    // The kernel takes two simdgroups per threadgroup, so the group is twice the
+    // SIMD width (64 threads on an Apple GPU).
+    if (!pso || pso.maxTotalThreadsPerThreadgroup < 2 * pso.threadExecutionWidth) return nil;
     cache[key] = pso;
     return pso;
 }
@@ -1554,7 +1558,16 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         if (k % 8 != 0 || (groupSize > 0 && groupSize % 8 != 0)) return 0;
         for (int i = 0; i < used; ++i) if (n[i] % 4 != 0) return 0;
         if (mode == 1 && n[0] != n[1]) return 0;
-        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0);
+        // Two 4-byte packs (16 weights) per thread per step, as MLX's qmv does,
+        // when the row and its groups split into 16s; BYBY_FUSE_PACKS=1 keeps one.
+        static int packsEnv = -1;
+        if (packsEnv < 0) {
+            const char *v = getenv("BYBY_FUSE_PACKS");
+            packsEnv = (v && v[0] == '1') ? 1 : 2;
+        }
+        const uint32_t packs = (packsEnv == 2 && k % 16 == 0 &&
+                                (groupSize <= 0 || groupSize % 16 == 0)) ? 2 : 1;
+        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs);
         if (!pso) return 0;
         uint32_t nn[4] = {(uint32_t)n[0], (uint32_t)(used > 1 && mode == 0 ? n[1] : 0),
                           (uint32_t)(used > 2 ? n[2] : 0), 0};
@@ -1578,7 +1591,7 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         [gSessionEncoder setBytes:sh length:16 atIndex:18];
         const uint32_t rows = nn[0] + nn[1] + nn[2];
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(2 * pso.threadExecutionWidth, 1, 1)];
         sessionBarrier();
         return 1;
     }
