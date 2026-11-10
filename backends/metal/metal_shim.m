@@ -1942,8 +1942,15 @@ int metal_session_end(void) {
     @autoreleasepool {
         if (!gSessionEncoder || !gSessionCmdBuf) { return 0; }  // CHANGED: no NSLog spam - the safety logic stays (returns 0 so the caller knows no session is open)
         [gSessionEncoder endEncoding];
+        static int logSession = -1;
+        if (logSession < 0) logSession = getenv("BYBY_SESSION_LOG") != NULL;
+        const double commitAt = logSession ? [NSProcessInfo processInfo].systemUptime : 0;
         [gSessionCmdBuf commit];
         [gSessionCmdBuf waitUntilCompleted];
+        if (logSession && gSessionCmdBuf.GPUEndTime > 0)
+            fprintf(stderr, "[session] gpu %.2f ms, commit->done %.2f ms\n",
+                (gSessionCmdBuf.GPUEndTime - gSessionCmdBuf.GPUStartTime) * 1000.0,
+                ([NSProcessInfo processInfo].systemUptime - commitAt) * 1000.0);
         BOOL ok = (gSessionCmdBuf.status == MTLCommandBufferStatusCompleted);
         if (!ok) {
             NSLog(@"[metal_session_end] command buffer FAILED, status=%ld, error=%@",
