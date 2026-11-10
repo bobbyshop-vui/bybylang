@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <math.h>
+#include <os/lock.h>
 
 // ─────────────────────────────────────────────────────────────
 // matmul_q4 kernel A/B TEST (NEW): change only the 2 lines below to
@@ -33,6 +34,8 @@
 // Global state, initialised once, alive until the process exits.
 // ─────────────────────────────────────────────────────────────
 static id<MTLDevice> gDevice = nil;
+static id<MTLBuffer> poolTake(size_t bytes, BOOL *recycled);
+static BOOL poolGive(id<MTLBuffer> buf);
 static id<MTLCommandQueue> gQueue = nil;
 static id<MTLLibrary> gLibrary = nil;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *gPipelineCache = nil;
@@ -783,8 +786,10 @@ MetalBufferHandle metal_upload(const float* data, int n) {
         // the first metal_matmul (exactly the resident-upload case at model load).
         if (!gDevice) { NSLog(@"[metal_upload] gDevice not initialised - call metal_init() first"); return NULL; }
         size_t bytes = (size_t)n * sizeof(float);
-        id<MTLBuffer> buf = [gDevice newBufferWithBytes:data length:bytes options:MTLResourceStorageModeShared];
+        BOOL recycled = NO;
+        id<MTLBuffer> buf = poolTake(bytes, &recycled);
         if (!buf) { NSLog(@"[metal_upload] tao buffer FAILED (n=%d)", n); return NULL; }
+        memcpy(buf.contents, data, bytes);
         return (__bridge_retained MetalBufferHandle)buf;
     }
 }
@@ -873,11 +878,83 @@ MetalBufferHandle metal_upload_indices(const int* data, int n) {
     }
 }
 
+// Small Shared buffers are recycled instead of going back to the driver: one
+// decode token creates and frees hundreds of activation buffers, and each
+// newBufferWithLength / dealloc is a kernel round trip. A buffer enters the pool
+// in metal_buffer_free (callers free only after the session that used it has
+// completed) and leaves it zero-filled, like a fresh newBufferWithLength.
+// BYBY_SCRATCH_POOL=0 turns the pool off.
+#define BB_POOL_MAX_BYTES ((size_t)4 << 20)    // largest pooled buffer
+#define BB_POOL_CAP_BYTES ((size_t)256 << 20)  // bytes kept idle in the pool
+static NSMutableDictionary<NSNumber *, NSMutableArray<id<MTLBuffer>> *> *gPoolFree = nil;
+static NSHashTable *gPoolOwned = nil;          // buffers the pool may recycle
+static size_t gPoolIdleBytes = 0;
+static os_unfair_lock gPoolLock = OS_UNFAIR_LOCK_INIT;
+
+static BOOL poolEnabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("BYBY_SCRATCH_POOL");
+        enabled = !(e && e[0] == '0');
+        gPoolFree = [NSMutableDictionary dictionary];
+        gPoolOwned = [NSHashTable hashTableWithOptions:NSPointerFunctionsOpaqueMemory |
+                                                       NSPointerFunctionsOpaquePersonality];
+    }
+    return enabled;
+}
+
+// A Shared buffer of `bytes`, from the pool when one of that size is idle.
+// *recycled says whether its contents are stale.
+static id<MTLBuffer> poolTake(size_t bytes, BOOL *recycled) {
+    *recycled = NO;
+    if (bytes == 0) return nil;
+    if (!poolEnabled() || bytes > BB_POOL_MAX_BYTES)
+        return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    os_unfair_lock_lock(&gPoolLock);
+    NSMutableArray<id<MTLBuffer>> *list = gPoolFree[@(bytes)];
+    id<MTLBuffer> buf = nil;
+    if (list.count > 0) {
+        buf = list.lastObject;
+        [list removeLastObject];
+        gPoolIdleBytes -= bytes;
+        *recycled = YES;
+    } else {
+        buf = [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (buf) [gPoolOwned addObject:buf];
+    }
+    os_unfair_lock_unlock(&gPoolLock);
+    return buf;
+}
+
+// Keeps a freed buffer for reuse; returns NO when the caller must release it.
+static BOOL poolGive(id<MTLBuffer> buf) {
+    if (!gPoolOwned) return NO;
+    BOOL kept = NO;
+    os_unfair_lock_lock(&gPoolLock);
+    if ([gPoolOwned containsObject:buf]) {
+        const size_t bytes = buf.length;
+        if (gPoolIdleBytes + bytes > BB_POOL_CAP_BYTES) {
+            [gPoolOwned removeObject:buf];
+        } else {
+            NSNumber *key = @(bytes);
+            NSMutableArray<id<MTLBuffer>> *list = gPoolFree[key];
+            if (!list) { list = [NSMutableArray array]; gPoolFree[key] = list; }
+            [list addObject:buf];
+            gPoolIdleBytes += bytes;
+            kept = YES;
+        }
+    }
+    os_unfair_lock_unlock(&gPoolLock);
+    return kept;
+}
+
 MetalBufferHandle metal_alloc_scratch(int n) {
     @autoreleasepool {
         size_t bytes = (size_t)n * sizeof(float);
-        id<MTLBuffer> buf = [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        BOOL recycled = NO;
+        id<MTLBuffer> buf = poolTake(bytes, &recycled);
         if (!buf) { NSLog(@"[metal_alloc_scratch] tao buffer FAILED (n=%d)", n); return NULL; }
+        if (recycled) memset(buf.contents, 0, bytes);
         return (__bridge_retained MetalBufferHandle)buf;
     }
 }
@@ -2169,7 +2246,7 @@ void metal_buffer_free(MetalBufferHandle h) {
         // variable that releases it when leaving the scope - the counterpart of
         // the __bridge_retained used by metal_upload/metal_alloc_scratch to create the handle.
         id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)h;
-        (void)buf;
+        (void)poolGive(buf);   // kept by the pool, or released here by ARC
     }
 }
 
