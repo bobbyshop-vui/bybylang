@@ -142,6 +142,7 @@ int metal_vecop_enc(int op, MetalBufferHandle a, MetalBufferHandle b, MetalBuffe
 int metal_activation_enc(int op, MetalBufferHandle x, MetalBufferHandle y, int n);
 int metal_scale_enc(MetalBufferHandle x, float scalar, int n);
 int metal_softmax_enc(MetalBufferHandle x, MetalBufferHandle y, int rows, int cols);
+void metal_register_q4_sg_source(const char *source);
 int metal_copy_into_enc(MetalBufferHandle src, MetalBufferHandle dst, int srcOffsetElems, int dstOffsetElems, int n);
 int metal_rmsnorm_enc(MetalBufferHandle x, MetalBufferHandle gamma,
                        MetalBufferHandle y, int rows, int cols, float eps);

@@ -24,6 +24,10 @@ when defined(macosx):
     ## the full explanation in that file (original bug: the M=1 decode kernel re-read
     ## all weights for EVERY row when called with M>1).
 
+  const kQ4SgSrc = staticRead(metalDir / "kernels" / "gemm_q4_sg.metal")
+  proc metal_register_q4_sg_source_c(source: cstring) {.importc: "metal_register_q4_sg_source", header: "metal_shim.h".}
+  metal_register_q4_sg_source_c(kQ4SgSrc.cstring)
+
   proc metal_available_c(): cint {.importc: "metal_available", header: "metal_shim.h".}
   proc metal_is_apple_gpu_c(): cint {.importc: "metal_is_apple_gpu", header: "metal_shim.h".}
   proc metalIsAppleGpu*(): bool = metal_is_apple_gpu_c() != 0

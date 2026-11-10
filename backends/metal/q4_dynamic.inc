@@ -2,7 +2,7 @@
 @interface BBQ4Plan : NSObject
 @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
 @property(nonatomic) NSUInteger threads, rows, batch;
-@property(nonatomic) BOOL legacy, simd;
+@property(nonatomic) BOOL legacy, simd, mm;
 @property(nonatomic, copy) NSString *label;
 @end
 @implementation BBQ4Plan
@@ -47,6 +47,38 @@ static BBQ4Plan *q4MakePlan(NSUInteger tg, NSUInteger rows, NSUInteger batch) {
     return plan;
 }
 
+// simdgroup_matrix Q4 GEMM (kernels/gemm_q4_sg.metal) for M > 1. The source is
+// registered from Nim and compiled once into its own library, only on an Apple
+// GPU (BYBY_Q4_SG_COMPILE_CHECK=1 compiles it anywhere to catch syntax errors).
+static const char *gQ4SgSource = NULL;
+void metal_register_q4_sg_source(const char *source) { gQ4SgSource = source; }
+
+static BBQ4Plan *q4MakeMmPlan(void) {
+    static int state = 0;   // 0 untried, 1 ready, -1 unavailable
+    static BBQ4Plan *plan = nil;
+    if (state != 0) return state > 0 ? plan : nil;
+    state = -1;
+    if (!gQ4SgSource || !gDevice || getenv("BYBY_Q4_NO_SG")) return nil;
+    BOOL apple = NO;
+    if (@available(macOS 10.15, *)) apple = [gDevice supportsFamily:MTLGPUFamilyApple7];
+    const BOOL compileOnly = !apple && getenv("BYBY_Q4_SG_COMPILE_CHECK") != NULL;
+    if (!apple && !compileOnly) return nil;
+    NSError *error = nil;
+    id<MTLLibrary> lib = [gDevice newLibraryWithSource:[NSString stringWithUTF8String:gQ4SgSource]
+        options:nil error:&error];
+    if (!lib) { NSLog(@"[q4-sg] library compile failed: %@", error); return nil; }
+    if (compileOnly) { NSLog(@"[q4-sg] library compiled (compile check only)"); return nil; }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"matmul_q4_mm_sg"];
+    if (!fn) return nil;
+    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    if (!pso || pso.maxTotalThreadsPerThreadgroup < 128) return nil;
+    plan = [BBQ4Plan new];
+    plan.pipeline = pso; plan.threads = 128; plan.rows = 32; plan.batch = 32; plan.mm = YES;
+    plan.label = @"mm-sg32x32";
+    state = 1;
+    return plan;
+}
+
 // One simdgroup per `rows` output rows, `sgs` simdgroups per threadgroup (M=1).
 static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows) {
     if (!gQ4Kernels) gQ4Kernels = [NSMutableDictionary new];
@@ -80,7 +112,7 @@ static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w
     // let it shift the remaining 0-3 bytes in.
     uint32_t wqShift = (uint32_t)(wqOffset & 3);
     [gSessionEncoder setComputePipelineState:plan.pipeline];
-    if (!plan.simd)
+    if (!plan.simd && !plan.mm)
         [gSessionEncoder setThreadgroupMemoryLength:plan.threads * plan.rows * plan.batch * sizeof(float) atIndex:0];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)w offset:(NSUInteger)(wqOffset & ~3) atIndex:1];
@@ -123,7 +155,7 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
             scales.length < (NSUInteger)n * groups * 4 ||
             zeros.length < (NSUInteger)n * groups * 4) return 0;
         if (!gQ4Plans) gQ4Plans = [NSMutableDictionary new];
-        const int m = mode == 1 ? 1 : 8;
+        const int m = mode == 1 ? 1 : 32;
         NSString *key = q4PlanKey(k, n, group, groups, m);
         if (gQ4Plans[key]) return 1;
         BBQ4Plan *baseline = [BBQ4Plan new];
@@ -139,6 +171,10 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
                 BBQ4Plan *p = q4MakeSimdPlan(cfg[c][0], cfg[c][1]);
                 if (p) [plans addObject:p];
             }
+        }
+        if (m > 1 && group > 0 && group % 32 == 0) {
+            BBQ4Plan *p = q4MakeMmPlan();
+            if (p) [plans addObject:p];
         }
         if (m > 1) {
             for (NSUInteger tg = 32; tg <= 64; tg *= 2) {
