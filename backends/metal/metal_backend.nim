@@ -514,6 +514,8 @@ when defined(macosx):
     {.importc: "metal_kv_scatter_enc", header: "metal_shim.h".}
   proc metal_session_end_c(): cint {.importc: "metal_session_end", header: "metal_shim.h".}
   proc metal_get_last_session_error_c(): cstring {.importc: "metal_get_last_session_error", header: "metal_shim.h".}
+  proc metal_session_gpu_seconds_c(): cdouble {.importc: "metal_session_gpu_seconds", header: "metal_shim.h".}
+  proc metalSessionGpuSeconds*(): float = float(metal_session_gpu_seconds_c())
   proc metal_session_commit_continue_c(): cint {.importc: "metal_session_commit_continue", header: "metal_shim.h".}
   proc metal_buffer_read_c(h: MetalBufferHandle, outData: ptr float32, n: cint): cint {.importc: "metal_buffer_read", header: "metal_shim.h".}
   proc metal_buffer_free_c(h: MetalBufferHandle) {.importc: "metal_buffer_free", header: "metal_shim.h".}
@@ -915,6 +917,7 @@ when not defined(macosx):
                                numTensors: int, dst: MetalBufferHandle, totalDim, inner, n: int): bool = false
   proc metalSessionEnd*(): bool = false
   proc metalGetLastSessionError*(): string = ""
+  proc metalSessionGpuSeconds*(): float = 0.0
   proc metalRecoverQueue*(): bool = false
   proc metalSessionCommitContinue*(): bool = false
   proc metalSessionRead*(h: MetalBufferHandle, n: int): seq[float32] = @[]

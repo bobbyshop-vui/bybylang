@@ -128,7 +128,7 @@ static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w
     [gSessionEncoder dispatchThreadgroups:MTLSizeMake((n + plan.rows - 1) / plan.rows,
         (m + plan.batch - 1) / plan.batch, 1)
         threadsPerThreadgroup:MTLSizeMake(plan.threads, 1, 1)];
-    [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    sessionBarrier();
     return 1;
 }
 

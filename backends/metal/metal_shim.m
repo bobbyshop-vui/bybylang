@@ -36,6 +36,7 @@
 // ─────────────────────────────────────────────────────────────
 static id<MTLDevice> gDevice = nil;
 static id<MTLBuffer> poolTake(size_t bytes, BOOL *recycled);
+static void sessionBarrier(void);
 static void residencyAdd(id<MTLBuffer> buf);
 static void residencyCommit(void);
 static void residencyRemove(id<MTLBuffer> buf);
@@ -830,6 +831,38 @@ static void residencyCommit(void) {
     ((void (*)(id, SEL))objc_msgSend)(gResidencySet, NSSelectorFromString(@"requestResidency"));
 }
 
+// The barrier that follows every dispatch of a session. A serial compute encoder
+// already runs its dispatches in order; the explicit barrier is what Intel and
+// AMD drivers need to see the previous dispatch's writes, and on an Apple GPU
+// it only costs time. BYBY_BARRIER=1 / 0 forces it on / off.
+static void sessionBarrier(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("BYBY_BARRIER");
+        enabled = (e && e[0]) ? (e[0] != '0') : !metal_is_apple_gpu();
+    }
+    if (enabled) [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+// GPU execution time of every session command buffer so far.
+static double gSessionGpuSeconds = 0;
+static os_unfair_lock gGpuTimeLock = OS_UNFAIR_LOCK_INIT;
+
+static void addGpuTime(id<MTLCommandBuffer> buf) {
+    const double t = buf.GPUEndTime - buf.GPUStartTime;
+    if (t <= 0) return;
+    os_unfair_lock_lock(&gGpuTimeLock);
+    gSessionGpuSeconds += t;
+    os_unfair_lock_unlock(&gGpuTimeLock);
+}
+
+double metal_session_gpu_seconds(void) {
+    os_unfair_lock_lock(&gGpuTimeLock);
+    const double t = gSessionGpuSeconds;
+    os_unfair_lock_unlock(&gGpuTimeLock);
+    return t;
+}
+
 int metal_session_begin(const char* kernel_src, char** error_out) {
     if (error_out) *error_out = NULL;
     @autoreleasepool {
@@ -1127,7 +1160,7 @@ static int encode_gemm_rb(int transposeB, MetalBufferHandle a, MetalBufferHandle
     [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:5];
     MTLSize groups = MTLSizeMake(((NSUInteger)n + 63) / 64, ((NSUInteger)m + bm - 1) / bm, 1);
     [gSessionEncoder dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    sessionBarrier();
     return 1;
 }
 
@@ -1188,7 +1221,7 @@ int metal_fp4km_gemm_enc(MetalBufferHandle a, MetalBufferHandle w, MetalBufferHa
         [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:6];
         MTLSize groups = MTLSizeMake(((NSUInteger)n + 63) / 64, ((NSUInteger)m + bm - 1) / bm, 1);
         [gSessionEncoder dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1225,7 +1258,7 @@ int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle
         // memoryBarrierWithScope: is inserted right after EVERY dispatch writing a buffer
         // the next dispatch reads, forcing the GPU to finish + flush caches before
         // the next step (matmul->softmax->matmul, or mul->mul->add...) reads it.
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1374,7 +1407,7 @@ int metal_matmul_nt_off_enc(MetalBufferHandle a, MetalBufferHandle b, int bOffse
         [gSessionEncoder dispatchThreadgroups:threadgroupCount threadsPerThreadgroup:groupSize];
         // See the memoryBarrierWithScope explanation in metal_matmul_enc - required
         // on drivers other than Apple Silicon (e.g. Intel Iris).
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1476,7 +1509,7 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
         const NSUInteger tgs = MIN((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup);
         [gSessionEncoder dispatchThreads:MTLSizeMake(total, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1546,7 +1579,7 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         const uint32_t rows = nn[0] + nn[1] + nn[2];
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1594,7 +1627,7 @@ int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHa
         // CHANGED: see the memoryBarrierWithScope explanation in metal_matmul_enc - needed
         // on GPUs other than Apple Silicon (Intel Iris) so the next dispatch
         // (e.g. sessionActivation reading bufC) sees the right data.
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1648,7 +1681,7 @@ static int metal_matmul_q4_gemm_enc(MetalBufferHandle a, MetalBufferHandle wq, M
     MTLSize grid = MTLSizeMake((NSUInteger)((n + tileN[variant] - 1) / tileN[variant]),
                                (NSUInteger)((m + tileM[variant] - 1) / tileM[variant]), 1);
     [gSessionEncoder dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    sessionBarrier();
     return 1;
 }
 
@@ -1692,7 +1725,7 @@ int metal_matmul_q4_batched_enc(MetalBufferHandle a, MetalBufferHandle wq, Metal
         MTLSize groupSzB = MTLSizeMake(simdWidthNS, 1, 1);
         MTLSize gridCountB = MTLSizeMake(rowBlocksB, mBlocks, 1);
         [gSessionEncoder dispatchThreadgroups:gridCountB threadsPerThreadgroup:groupSzB];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1711,7 +1744,7 @@ int metal_softmax_enc(MetalBufferHandle x, MetalBufferHandle y, int rows, int co
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -1740,7 +1773,7 @@ int metal_scale_enc(MetalBufferHandle x, float scalar, int n) {
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1765,7 +1798,7 @@ int metal_activation_enc_p(int op, MetalBufferHandle x, MetalBufferHandle y, int
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -1789,7 +1822,7 @@ int metal_activation_backward_enc(int op, MetalBufferHandle x, MetalBufferHandle
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1815,7 +1848,7 @@ int metal_rope_enc(MetalBufferHandle x, MetalBufferHandle cosT, MetalBufferHandl
         if (tgx == 0) tgx = 1;
         MTLSize groupSize = MTLSizeMake(tgx, 1, 1);
         [gSessionEncoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1836,7 +1869,7 @@ int metal_vecop_enc(int op, MetalBufferHandle a, MetalBufferHandle b, MetalBuffe
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -1878,7 +1911,7 @@ int metal_copy_into_enc(MetalBufferHandle src, MetalBufferHandle dst, int srcOff
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -1901,7 +1934,7 @@ int metal_rmsnorm_enc(MetalBufferHandle x, MetalBufferHandle gamma,
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -1926,7 +1959,7 @@ int metal_layernorm_enc(MetalBufferHandle x, MetalBufferHandle gamma, MetalBuffe
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -1948,7 +1981,7 @@ int metal_embedding_lookup_enc(MetalBufferHandle table, MetalBufferHandle indice
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)dim);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((NSUInteger)num_indices, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -1986,7 +2019,7 @@ int metal_attention_fused_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBuf
         MTLSize gridSize = MTLSizeMake((NSUInteger)(B * H), (NSUInteger)S, 1);
         MTLSize groupSize = MTLSizeMake(1, 1, 1);
         [gSessionEncoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];  // CHANGED: see the explanation in metal_matmul_enc
+        sessionBarrier();  // CHANGED: see the explanation in metal_matmul_enc
         return 1;
     }
 }
@@ -2033,7 +2066,7 @@ int metal_attention_fused_flash_enc(MetalBufferHandle q, MetalBufferHandle k, Me
         MTLSize gridSize = MTLSizeMake((NSUInteger)(B * H), (NSUInteger)S, 1);
         MTLSize groupSize = MTLSizeMake(kAttnFlashTg, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2072,7 +2105,7 @@ int metal_attention_decode_gqa_enc(MetalBufferHandle q, MetalBufferHandle k, Met
         MTLSize gridSize = MTLSizeMake((NSUInteger)H, 1, 1);
         MTLSize groupSize = MTLSizeMake(TG, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2113,7 +2146,7 @@ int metal_attention_decode_all_heads_enc(MetalBufferHandle q, MetalBufferHandle 
         MTLSize gridSize = MTLSizeMake((NSUInteger)H, 1, 1);
         MTLSize groupSize = MTLSizeMake(TG, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2146,7 +2179,7 @@ int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAl
         MTLSize gridSize = MTLSizeMake((NSUInteger)((T + 15) / 16), (NSUInteger)H, 1);
         MTLSize groupSize = MTLSizeMake(128, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2174,7 +2207,7 @@ int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, in
         MTLSize gridSize = MTLSizeMake((total + 255) / 256, 1, 1);
         MTLSize groupSize = MTLSizeMake(256, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2188,6 +2221,7 @@ int metal_session_end(void) {
         const double commitAt = logSession ? [NSProcessInfo processInfo].systemUptime : 0;
         [gSessionCmdBuf commit];
         [gSessionCmdBuf waitUntilCompleted];
+        addGpuTime(gSessionCmdBuf);
         if (logSession && gSessionCmdBuf.GPUEndTime > 0)
             fprintf(stderr, "[session] gpu %.2f ms, commit->done %.2f ms\n",
                 (gSessionCmdBuf.GPUEndTime - gSessionCmdBuf.GPUStartTime) * 1000.0,
@@ -2249,6 +2283,7 @@ int metal_session_commit_continue(void) {
         // NON-BLOCKING (async) log if this buffer eventually fails - only for debugging,
         // no speed impact because nothing waits for the handler.
         [gSessionCmdBuf addCompletedHandler:^(id<MTLCommandBuffer> buf) {
+            addGpuTime(buf);
             if (buf.status != MTLCommandBufferStatusCompleted) {
                 NSLog(@"[metal_session_commit_continue] a buffer in the middle failed (will cascade to later buffers): status=%ld, error=%@",
                       (long)buf.status, buf.error);
@@ -2734,7 +2769,7 @@ int metal_layernorm_backward_enc(MetalBufferHandle dy, MetalBufferHandle x,
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)gridN);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)gridN, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2784,7 +2819,7 @@ int metal_attention_fused_backward_enc(MetalBufferHandle q, MetalBufferHandle k,
         MTLSize gridSize = MTLSizeMake((NSUInteger)(B * H), (NSUInteger)S, 1);
         MTLSize groupSize = MTLSizeMake(1, 1, 1);
         [gSessionEncoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2804,7 +2839,7 @@ int metal_gather_enc(MetalBufferHandle src, MetalBufferHandle idx, MetalBufferHa
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2832,7 +2867,7 @@ int metal_argmax_enc(MetalBufferHandle x, MetalBufferHandle outVal, MetalBufferH
         MTLSize gridSize = MTLSizeMake((NSUInteger)pairs * tgSize, 1, 1);
         MTLSize groupSize = MTLSizeMake(tgSize, 1, 1);
         [gSessionEncoder dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2853,7 +2888,7 @@ int metal_compare_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandl
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2872,7 +2907,7 @@ int metal_dropout_mask_enc(MetalBufferHandle mask, unsigned int seed, float p, f
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2899,7 +2934,7 @@ int metal_permute_enc(MetalBufferHandle src, MetalBufferHandle dst,
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2922,7 +2957,7 @@ int metal_split_slice_enc(MetalBufferHandle src, MetalBufferHandle dst,
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -2951,7 +2986,7 @@ int metal_concat_gather_enc(MetalBufferHandle flatSrc, MetalBufferHandle srcBase
         NSUInteger threadsPerGroup = MIN((NSUInteger)pipeline.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
         if (threadsPerGroup == 0) threadsPerGroup = 1;
         [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }
@@ -3077,7 +3112,7 @@ int metal_enc_dispatch_threads(int threadsX, int threadsY, int threadsZ,
 int metal_enc_barrier(void) {
     @autoreleasepool {
         if (!gSessionEncoder) return 0;
-        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        sessionBarrier();
         return 1;
     }
 }

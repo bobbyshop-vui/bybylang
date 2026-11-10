@@ -322,6 +322,8 @@ int metal_session_commit_continue(void);
 // NEXT metal_session_end() (a static NSString holds a strong ref) - Nim
 // must copy it right away (with $cstring), not keep the pointer.
 const char* metal_get_last_session_error(void);
+// Summed GPU execution time (seconds) of the session command buffers so far.
+double metal_session_gpu_seconds(void);
 // NEW: recreates the MTLCommandQueue (gQueue) when it is "poisoned" after a real GPU error
 // (Timeout/StackOverflow/PageFault...). See the details in
 // metal_shim.m::metal_recover_queue. Returns 1 on success, 0 on failure.

@@ -2440,6 +2440,14 @@ proc sessionRecoverQueue*(backend: GpuBackend): bool {.probed.} =
   else:
     return false
 
+proc sessionGpuSeconds*(backend: GpuBackend): float =
+  ## Summed GPU execution time of the session command buffers so far (Metal only,
+  ## 0 elsewhere).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbMetal: return metalSessionGpuSeconds()
+  0.0
+
 proc sessionGetLastError*(backend: GpuBackend): string {.probed.} =
   ## NEW: the REAL NSError/error description of the last failed sessionEnd()
   ## (see metal_shim.h::metal_get_last_session_error) - call ONLY
