@@ -2,7 +2,7 @@
 @interface BBQ4Plan : NSObject
 @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
 @property(nonatomic) NSUInteger threads, rows, batch;
-@property(nonatomic) BOOL legacy;
+@property(nonatomic) BOOL legacy, simd;
 @property(nonatomic, copy) NSString *label;
 @end
 @implementation BBQ4Plan
@@ -47,6 +47,31 @@ static BBQ4Plan *q4MakePlan(NSUInteger tg, NSUInteger rows, NSUInteger batch) {
     return plan;
 }
 
+// One simdgroup per `rows` output rows, `sgs` simdgroups per threadgroup (M=1).
+static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows) {
+    if (!gQ4Kernels) gQ4Kernels = [NSMutableDictionary new];
+    NSString *key = [NSString stringWithFormat:@"simd_%lu_%lu", (unsigned long)sgs, (unsigned long)rows];
+    if (gQ4Kernels[key]) return gQ4Kernels[key];
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    uint32_t r = (uint32_t)rows, s = (uint32_t)sgs;
+    [constants setConstantValue:&r type:MTLDataTypeUInt atIndex:110];
+    [constants setConstantValue:&s type:MTLDataTypeUInt atIndex:111];
+    NSError *error = nil;
+    id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_simd"
+        constantValues:constants error:&error];
+    if (!fn) return nil;
+    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    if (!pso) return nil;
+    NSUInteger threads = sgs * pso.threadExecutionWidth;
+    if (threads > pso.maxTotalThreadsPerThreadgroup) return nil;
+    BBQ4Plan *plan = [BBQ4Plan new];
+    plan.pipeline = pso; plan.threads = threads; plan.rows = sgs * rows; plan.batch = 1;
+    plan.simd = YES;
+    plan.label = [NSString stringWithFormat:@"simd%lux%lu", (unsigned long)sgs, (unsigned long)rows];
+    gQ4Kernels[key] = plan;
+    return plan;
+}
+
 static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w,
         MetalBufferHandle scale, MetalBufferHandle zero, MetalBufferHandle out,
         int m, int k, int n, int group, int groups, int wqOffset) {
@@ -55,7 +80,8 @@ static int q4EncodePlan(BBQ4Plan *plan, MetalBufferHandle a, MetalBufferHandle w
     // let it shift the remaining 0-3 bytes in.
     uint32_t wqShift = (uint32_t)(wqOffset & 3);
     [gSessionEncoder setComputePipelineState:plan.pipeline];
-    [gSessionEncoder setThreadgroupMemoryLength:plan.threads * plan.rows * plan.batch * sizeof(float) atIndex:0];
+    if (!plan.simd)
+        [gSessionEncoder setThreadgroupMemoryLength:plan.threads * plan.rows * plan.batch * sizeof(float) atIndex:0];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)w offset:(NSUInteger)(wqOffset & ~3) atIndex:1];
     [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)scale offset:0 atIndex:2];
@@ -107,6 +133,13 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
             BBQ4Plan *p = q4MakePlan(tg, m == 1 ? 4 : 1, m);
             if (p) [plans addObject:p];
         }
+        if (m == 1 && !getenv("BYBY_Q4_NO_SIMD")) {
+            static const NSUInteger cfg[][2] = {{1, 4}, {2, 2}, {2, 4}, {4, 2}, {4, 4}, {8, 2}};
+            for (NSUInteger c = 0; c < sizeof(cfg) / sizeof(cfg[0]); ++c) {
+                BBQ4Plan *p = q4MakeSimdPlan(cfg[c][0], cfg[c][1]);
+                if (p) [plans addObject:p];
+            }
+        }
         if (m > 1) {
             for (NSUInteger tg = 32; tg <= 64; tg *= 2) {
                 BBQ4Plan *p = q4MakePlan(tg, 2, 4);
@@ -138,7 +171,10 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
             const float *ref = reference.bytes;
             NSMutableArray<BBQ4Plan *> *valid = [NSMutableArray arrayWithObject:baseline];
             for (NSUInteger p = 1; p < plans.count; ++p) {
-                if (!isfinite(run(plans[p]))) continue;
+                if (!isfinite(run(plans[p]))) {
+                    if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-tune]   %@ failed to run", plans[p].label);
+                    continue;
+                }
                 float err = 0, mag = 0;
                 BOOL finite = YES;
                 const float *v = output.contents;
@@ -147,18 +183,22 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
                     err = fmaxf(err, fabsf(v[i] - ref[i])); mag = fmaxf(mag, fabsf(ref[i]));
                 }
                 if (finite && err <= fmaxf(1e-5f, mag * 1e-4f)) [valid addObject:plans[p]];
+                else if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-tune]   %@ rejected: err %g mag %g", plans[p].label, err, mag);
             }
-            double times[6][3];
+            double times[24][3];
             for (NSUInteger round = 0; round < 3; ++round)
                 for (NSUInteger j = 0; j < valid.count; ++j) {
                     NSUInteger i = round % 2 ? valid.count - 1 - j : j;
                     times[i][round] = run(valid[i]);
                 }
-            double medians[6];
+            double medians[24];
             for (NSUInteger i = 0; i < valid.count; ++i) {
                 double a = times[i][0], b = times[i][1], c = times[i][2];
                 medians[i] = fmax(fmin(a, b), fmin(fmax(a, b), c));
             }
+            if (getenv("BYBY_Q4_TUNE_LOG"))
+                for (NSUInteger i = 0; i < valid.count; ++i)
+                    NSLog(@"[q4-tune]   %@ %.3fms", valid[i].label, medians[i]);
             const char *setting = getenv("BYBY_Q4_TUNED");
             NSUInteger best = setting && strcmp(setting, "wide") == 0 && valid.count > 1 ? 1 : 0;
             for (NSUInteger i = best == 0 ? 1 : 2; i < valid.count; ++i)
