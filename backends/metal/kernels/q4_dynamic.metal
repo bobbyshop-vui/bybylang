@@ -198,3 +198,17 @@ kernel void matmul_q4_fused(
         if (lane == 0) outA[local0 + r] = v;
     }
 }
+
+// Appends one decode token's K and V (HKV heads x D) into the combined KV
+// caches laid out as [head][maxSeq][D].
+kernel void kv_append_kernel(
+    device const float* k [[buffer(0)]], device const float* v [[buffer(1)]],
+    device float* kAll [[buffer(2)]], device float* vAll [[buffer(3)]],
+    constant uint& D [[buffer(4)]], constant uint& maxSeq [[buffer(5)]],
+    constant uint& pos [[buffer(6)]],
+    uint i [[thread_position_in_grid]]) {
+    const uint h = i / D, d = i % D;
+    const uint dst = h * maxSeq * D + pos * D + d;
+    kAll[dst] = k[i];
+    vAll[dst] = v[i];
+}

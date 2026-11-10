@@ -714,6 +714,11 @@ when defined(macosx):
       addr outs[0], res, cint(k), cint(groupSize), cint(groupsPerRow),
       addr nn[0], addr off[0]) != 0
 
+  proc metal_kv_append_enc_c(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: cint): cint
+      {.importc: "metal_kv_append_enc", header: "metal_shim.h".}
+  proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool =
+    metal_kv_append_enc_c(k, v, kAll, vAll, cint(hkv), cint(d), cint(maxSeq), cint(pos)) != 0
+
   proc metal_prepare_q4_tuned_c(w, scales, zeros: MetalBufferHandle;
       k, n, groupSize, groupsPerRow, m, wqOffset: cint): cint
       {.importc: "metal_prepare_q4_tuned", header: "metal_shim.h".}
@@ -879,6 +884,7 @@ when not defined(macosx):
   proc metalSessionMatmulQ4FusedEnc*(mode: int, a: MetalBufferHandle,
       wq, scales, zeros, outs: array[3, MetalBufferHandle], res: MetalBufferHandle,
       k, groupSize, groupsPerRow: int, n, wqOffset: array[3, int]): bool = false
+  proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: int): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool = false
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool = false

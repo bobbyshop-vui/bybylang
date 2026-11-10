@@ -2850,6 +2850,19 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
   else:
     return false
 
+proc sessionKvAppendEnc*(backend: GpuBackend, k, v, kAll, vAll: SessionHandle,
+                          hkv, d, maxSeq, pos: int): bool =
+  ## One dispatch appending the token's K/V for all KV heads into the combined caches
+  ## ([head][maxSeq][D]). Metal only; false means the caller uses per-head copies.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx):
+    return metalSessionKvAppendEnc(k.metalHandle, v.metalHandle, kAll.metalHandle,
+                                   vAll.metalHandle, hkv, d, maxSeq, pos)
+  else:
+    return false
+
 proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
                             ws: openArray[ResidentWeightHandle],
                             outs: openArray[SessionHandle],

@@ -1312,6 +1312,30 @@ MetalBufferHandle metal_upload_bytes_private(const unsigned char* data, int n) {
 
 #include "q4_dynamic.inc"
 
+int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHandle kAll,
+        MetalBufferHandle vAll, int hkv, int d, int maxSeq, int pos) {
+    @autoreleasepool {
+        if (!gSessionEncoder) return 0;
+        id<MTLComputePipelineState> pso = getPipeline(@"kv_append_kernel");
+        if (!pso) return 0;
+        uint32_t D = (uint32_t)d, ms = (uint32_t)maxSeq, p = (uint32_t)pos;
+        [gSessionEncoder setComputePipelineState:pso];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)k offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)v offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)kAll offset:0 atIndex:2];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)vAll offset:0 atIndex:3];
+        [gSessionEncoder setBytes:&D length:4 atIndex:4];
+        [gSessionEncoder setBytes:&ms length:4 atIndex:5];
+        [gSessionEncoder setBytes:&p length:4 atIndex:6];
+        const NSUInteger total = (NSUInteger)hkv * d;
+        const NSUInteger tgs = MIN((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup);
+        [gSessionEncoder dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
 // Fused decode GEMV (see matmul_q4_fused in kernels/q4_dynamic.metal).
 // mode 0: up to 3 matrices share `a` (count = number of used slots);
 // mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.
