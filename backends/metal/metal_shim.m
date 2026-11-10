@@ -1418,8 +1418,10 @@ int metal_matmul_q4_batched_enc(MetalBufferHandle a, MetalBufferHandle wq, Metal
                                  int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_q4_batched_enc] metal_session_begin not called"); return 0; }
-        if (metal_matmul_q4_gemm_enc(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
+        // The autotuned plan (simdgroup_matrix GEMM on Apple GPUs, wide kernels elsewhere) goes
+        // first; the tiled GEMM and the batched kernel are what it is measured against.
         if (q4EncodeSelected(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
+        if (metal_matmul_q4_gemm_enc(a, wq, scales, zeros, c, m, k, n, groupSize, nGroupsPerRow, wqOffset)) return 1;
         id<MTLComputePipelineState> pipeline = getPipeline(@"matmul_q4_batched_m4_kernel");
         if (!pipeline) return 0;
         id<MTLBuffer> bufA = (__bridge id<MTLBuffer>)a;
