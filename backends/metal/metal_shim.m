@@ -1312,6 +1312,76 @@ MetalBufferHandle metal_upload_bytes_private(const unsigned char* data, int n) {
 
 #include "q4_dynamic.inc"
 
+// Fused decode GEMV (see matmul_q4_fused in kernels/q4_dynamic.metal).
+// mode 0: up to 3 matrices share `a` (count = number of used slots);
+// mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.
+// res may be NULL. Returns 0 when the shape/kernel is unsupported.
+static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes) {
+    static NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *cache;
+    if (!cache) cache = [NSMutableDictionary new];
+    NSNumber *key = @(mode * 2 + hasRes);
+    if (cache[key]) return cache[key];
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&mode type:MTLDataTypeUInt atIndex:120];
+    [constants setConstantValue:&hasRes type:MTLDataTypeUInt atIndex:121];
+    NSError *error = nil;
+    id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_fused"
+        constantValues:constants error:&error];
+    if (!fn) return nil;
+    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    if (!pso || pso.threadExecutionWidth != 32 || pso.maxTotalThreadsPerThreadgroup < 64) return nil;
+    cache[key] = pso;
+    return pso;
+}
+
+int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
+        MetalBufferHandle *wq, MetalBufferHandle *scales, MetalBufferHandle *zeros,
+        MetalBufferHandle *out, MetalBufferHandle res, int k, int groupSize,
+        int groupsPerRow, const int *n, const int *wqOffset) {
+    @autoreleasepool {
+        if (!gSessionEncoder || !q4TunedEnabled()) return 0;
+        // Fusion removes CPU-side encode work, which only pays off on Apple GPUs;
+        // discrete/Intel GPUs are bandwidth bound and run the tuned plans faster.
+        static int enabled = -1;
+        if (enabled < 0) {
+            const char *v = getenv("BYBY_FUSE");
+            enabled = v ? (strcmp(v, "0") != 0) : (metal_is_apple_gpu() ? 1 : 0);
+        }
+        if (!enabled) return 0;
+        const int used = mode == 1 ? 2 : (n[2] > 0 ? 3 : (n[1] > 0 ? 2 : 1));
+        if (k % 8 != 0 || (groupSize > 0 && groupSize % 8 != 0)) return 0;
+        for (int i = 0; i < used; ++i) if (n[i] % 4 != 0) return 0;
+        if (mode == 1 && n[0] != n[1]) return 0;
+        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0);
+        if (!pso) return 0;
+        uint32_t nn[4] = {(uint32_t)n[0], (uint32_t)(used > 1 && mode == 0 ? n[1] : 0),
+                          (uint32_t)(used > 2 ? n[2] : 0), 0};
+        uint32_t sh[4] = {0, 0, 0, 0};
+        [gSessionEncoder setComputePipelineState:pso];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
+        for (int i = 0; i < 3; ++i) {
+            const int j = i < used ? i : 0;   // unused slots alias slot 0
+            sh[i] = i < used ? (uint32_t)(wqOffset[j] & 3) : 0;
+            [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)wq[j]
+                offset:(NSUInteger)(wqOffset[j] & ~3) atIndex:1 + i];
+            [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)scales[j] offset:0 atIndex:4 + i];
+            [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)zeros[j] offset:0 atIndex:7 + i];
+            [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)out[j] offset:0 atIndex:10 + i];
+        }
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)(res ? res : out[0]) offset:0 atIndex:13];
+        [gSessionEncoder setBytes:&k length:4 atIndex:14];
+        [gSessionEncoder setBytes:&groupSize length:4 atIndex:15];
+        [gSessionEncoder setBytes:&groupsPerRow length:4 atIndex:16];
+        [gSessionEncoder setBytes:nn length:16 atIndex:17];
+        [gSessionEncoder setBytes:sh length:16 atIndex:18];
+        const uint32_t rows = nn[0] + nn[1] + nn[2];
+        [gSessionEncoder dispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
 int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                          MetalBufferHandle zeros, MetalBufferHandle c,
                          int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset) {

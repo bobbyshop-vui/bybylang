@@ -700,6 +700,20 @@ when defined(macosx):
     metal_matmul_q4_enc_c(a, wq, scales, zeros, c,
       cint(m), cint(k), cint(n), cint(groupSize), cint(nGroupsPerRow), cint(wqOffset)) != 0
 
+  proc metal_matmul_q4_fused_enc_c(mode: cint, a: MetalBufferHandle,
+      wq, scales, zeros, outs: ptr MetalBufferHandle, res: MetalBufferHandle,
+      k, groupSize, groupsPerRow: cint, n, wqOffset: ptr cint): cint
+      {.importc: "metal_matmul_q4_fused_enc", header: "metal_shim.h".}
+  proc metalSessionMatmulQ4FusedEnc*(mode: int, a: MetalBufferHandle,
+      wq, scales, zeros, outs: array[3, MetalBufferHandle], res: MetalBufferHandle,
+      k, groupSize, groupsPerRow: int, n, wqOffset: array[3, int]): bool =
+    var wq = wq; var scales = scales; var zeros = zeros; var outs = outs
+    var nn = [cint(n[0]), cint(n[1]), cint(n[2])]
+    var off = [cint(wqOffset[0]), cint(wqOffset[1]), cint(wqOffset[2])]
+    metal_matmul_q4_fused_enc_c(cint(mode), a, addr wq[0], addr scales[0], addr zeros[0],
+      addr outs[0], res, cint(k), cint(groupSize), cint(groupsPerRow),
+      addr nn[0], addr off[0]) != 0
+
   proc metal_prepare_q4_tuned_c(w, scales, zeros: MetalBufferHandle;
       k, n, groupSize, groupsPerRow, m, wqOffset: cint): cint
       {.importc: "metal_prepare_q4_tuned", header: "metal_shim.h".}
@@ -862,6 +876,9 @@ when not defined(macosx):
                                  m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool = false
   proc metalSessionMatmulQ4BatchedEnc*(a, wq, scales, zeros, c: MetalBufferHandle,
                                         m, k, n, groupSize, nGroupsPerRow: int; wqOffset = 0): bool = false
+  proc metalSessionMatmulQ4FusedEnc*(mode: int, a: MetalBufferHandle,
+      wq, scales, zeros, outs: array[3, MetalBufferHandle], res: MetalBufferHandle,
+      k, groupSize, groupsPerRow: int, n, wqOffset: array[3, int]): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: int): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool = false
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool = false

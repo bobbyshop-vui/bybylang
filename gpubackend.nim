@@ -2850,6 +2850,33 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
   else:
     return false
 
+proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
+                            ws: openArray[ResidentWeightHandle],
+                            outs: openArray[SessionHandle],
+                            res: SessionHandle, hasRes: bool): bool =
+  ## Fused decode GEMV (M=1) on Metal. mode 0: ws.len (1..3) matrices share `a` and each
+  ## writes its own outs[i]; mode 1: ws = [gate, up], outs[0] = silu(gate)*up.
+  ## `res` is added to the result when hasRes. Returns false when unsupported, so
+  ## callers fall back to the unfused sequence. Output handles must already be allocated.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx):
+    if ws.len < 1 or ws.len > 3 or outs.len < ws.len or (mode == 1 and ws.len != 2): return false
+    if hasRes and res.metalHandle == nil: return false
+    var wq, sc, zr, o: array[3, MetalBufferHandle]
+    var n, off: array[3, int]
+    for i in 0 ..< ws.len:
+      if outs[i].metalHandle == nil: return false
+      if ws[i].k != ws[0].k or ws[i].groupSize != ws[0].groupSize or
+         ws[i].nGroupsPerRow != ws[0].nGroupsPerRow: return false
+      wq[i] = ws[i].metalWq; sc[i] = ws[i].metalScales; zr[i] = ws[i].metalZeros
+      o[i] = outs[i].metalHandle; n[i] = ws[i].n; off[i] = ws[i].wqOffset
+    return metalSessionMatmulQ4FusedEnc(mode, a.metalHandle, wq, sc, zr, o,
+      (if hasRes: res.metalHandle else: nil), ws[0].k, ws[0].groupSize, ws[0].nGroupsPerRow, n, off)
+  else:
+    return false
+
 proc residentFreeQ4*(w: var ResidentWeightHandle) {.probed.} =
   ## Frees resident weights - call only when unloading the model/exiting,
   ## NOT between tokens.

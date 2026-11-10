@@ -116,3 +116,85 @@ kernel void matmul_q4_simd(
         if (lane == 0 && row0 + r < uint(N)) out[row0 + r] = s;
     }
 }
+
+// Fused decode GEMV (M=1), MLX-style. One simdgroup computes 4 output rows.
+//   mode 0: up to 3 independent matrices (Q/K/V) share the input vector; the
+//           grid covers N0+N1+N2 rows, each N must be a multiple of 4.
+//   mode 1: gate/up pair; out0[n] = silu(gate[n]) * up[n].
+// HAS_RES adds res[n] to the result (residual epilogue for o_proj / down_proj).
+constant uint q4f_mode [[function_constant(120)]];
+constant uint q4f_res [[function_constant(121)]];
+
+static inline float q4f_row(device const uchar* wq, device const float* sc,
+        device const float* zr, uint n, uint rowBytes, uint gpr, uint k, uint g,
+        uint shift, float4 a0, float4 a1, float sumA, float acc) {
+    device const uint* word = (device const uint*)(wq + n * rowBytes + k / 2);
+    const uint p = shift == 0 ? word[0] :
+        (word[0] >> (8 * shift)) | (word[1] << (32 - 8 * shift));
+    const float d = fma(a0.x, float(p & 15u), fma(a0.y, float((p >> 4) & 15u),
+        fma(a0.z, float((p >> 8) & 15u), fma(a0.w, float((p >> 12) & 15u),
+        fma(a1.x, float((p >> 16) & 15u), fma(a1.y, float((p >> 20) & 15u),
+        fma(a1.z, float((p >> 24) & 15u), a1.w * float(p >> 28))))))));
+    const uint gi = n * gpr + g;
+    return fma(sc[gi], d - zr[gi] * sumA, acc);
+}
+
+kernel void matmul_q4_fused(
+    device const float* a [[buffer(0)]],
+    device const uchar* wq0 [[buffer(1)]], device const uchar* wq1 [[buffer(2)]],
+    device const uchar* wq2 [[buffer(3)]],
+    device const float* sc0 [[buffer(4)]], device const float* sc1 [[buffer(5)]],
+    device const float* sc2 [[buffer(6)]],
+    device const float* zr0 [[buffer(7)]], device const float* zr1 [[buffer(8)]],
+    device const float* zr2 [[buffer(9)]],
+    device float* out0 [[buffer(10)]], device float* out1 [[buffer(11)]],
+    device float* out2 [[buffer(12)]],
+    device const float* res [[buffer(13)]],
+    constant int& K [[buffer(14)]], constant int& groupSize [[buffer(15)]],
+    constant int& groupsPerRow [[buffer(16)]],
+    constant uint4& nn [[buffer(17)]],      // N0, N1, N2, unused
+    constant uint4& sh [[buffer(18)]],      // wqShift of the three matrices
+    uint tg [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simdW [[threads_per_simdgroup]]) {
+    const uint row0 = (tg * 2 + sgid) * 4;
+    device const uchar* wqA = wq0; device const float* scA = sc0; device const float* zrA = zr0;
+    device float* outA = out0; uint shA = sh.x; uint base = 0;
+    if (q4f_mode == 0) {
+        if (row0 >= nn.x + nn.y + nn.z) return;
+        if (row0 >= nn.x + nn.y) {
+            wqA = wq2; scA = sc2; zrA = zr2; outA = out2; shA = sh.z; base = nn.x + nn.y;
+        } else if (row0 >= nn.x) {
+            wqA = wq1; scA = sc1; zrA = zr1; outA = out1; shA = sh.y; base = nn.x;
+        }
+    } else if (row0 >= nn.x) {
+        return;
+    }
+    const uint local0 = row0 - base;
+    float sumA_[4] = {0, 0, 0, 0};
+    float sumB_[4] = {0, 0, 0, 0};
+    const uint rowBytes = uint(K) / 2;
+    const uint gpr = uint(groupsPerRow);
+    for (uint k = lane * 8; k < uint(K); k += simdW * 8) {
+        const float4 a0 = *(device const float4*)(a + k);
+        const float4 a1 = *(device const float4*)(a + k + 4);
+        const float sumA = (a0.x + a0.y) + (a0.z + a0.w) + ((a1.x + a1.y) + (a1.z + a1.w));
+        const uint g = groupSize > 0 ? k / uint(groupSize) : 0;
+        for (uint r = 0; r < 4; ++r) {
+            const uint n = local0 + r;
+            sumA_[r] = q4f_row(wqA, scA, zrA, n, rowBytes, gpr, k, g, shA, a0, a1, sumA, sumA_[r]);
+            if (q4f_mode == 1)
+                sumB_[r] = q4f_row(wq1, sc1, zr1, n, rowBytes, gpr, k, g, sh.y, a0, a1, sumA, sumB_[r]);
+        }
+    }
+    for (uint r = 0; r < 4; ++r) {
+        float v = simd_sum(sumA_[r]);
+        if (q4f_mode == 1) {
+            const float u = simd_sum(sumB_[r]);
+            v = v / (1.0f + exp(-v)) * u;
+        }
+        if (q4f_res != 0) v += res[local0 + r];
+        if (lane == 0) outA[local0 + r] = v;
+    }
+}
