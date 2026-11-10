@@ -1518,16 +1518,19 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
 // mode 0: up to 3 matrices share `a` (count = number of used slots);
 // mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.
 // res may be NULL. Returns 0 when the shape/kernel is unsupported.
-static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes, uint32_t packs) {
+static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes, uint32_t packs,
+        uint32_t load, uint32_t pre) {
     static NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *cache;
     if (!cache) cache = [NSMutableDictionary new];
-    NSNumber *key = @((mode * 2 + hasRes) * 4 + packs);
+    NSNumber *key = @((((mode * 2 + hasRes) * 8 + packs) * 4 + load) * 2 + pre);
     if (cache[key]) return cache[key] == (id)[NSNull null] ? nil : cache[key];
     cache[key] = (id)[NSNull null];   // a pipeline that cannot be used is not built again
     MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
     [constants setConstantValue:&mode type:MTLDataTypeUInt atIndex:120];
     [constants setConstantValue:&hasRes type:MTLDataTypeUInt atIndex:121];
-    [constants setConstantValue:&packs type:MTLDataTypeUInt atIndex:122];
+    [constants setConstantValue:&packs type:MTLDataTypeUInt atIndex:112];
+    [constants setConstantValue:&load type:MTLDataTypeUInt atIndex:113];
+    [constants setConstantValue:&pre type:MTLDataTypeUInt atIndex:114];
     NSError *error = nil;
     id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_fused"
         constantValues:constants error:&error];
@@ -1558,16 +1561,11 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         if (k % 8 != 0 || (groupSize > 0 && groupSize % 8 != 0)) return 0;
         for (int i = 0; i < used; ++i) if (n[i] % 4 != 0) return 0;
         if (mode == 1 && n[0] != n[1]) return 0;
-        // Two 4-byte packs (16 weights) per thread per step, as MLX's qmv does,
-        // when the row and its groups split into 16s; BYBY_FUSE_PACKS=1 keeps one.
-        static int packsEnv = -1;
-        if (packsEnv < 0) {
-            const char *v = getenv("BYBY_FUSE_PACKS");
-            packsEnv = (v && v[0] == '1') ? 1 : 2;
-        }
-        const uint32_t packs = (packsEnv == 2 && k % 16 == 0 &&
-                                (groupSize <= 0 || groupSize % 16 == 0)) ? 2 : 1;
-        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs);
+        // Reads its weights the way the tuner found fastest for this shape.
+        uint32_t packs = 1, load = 0, pre = 0;
+        BBQ4Plan *tuned = gQ4Plans[q4PlanKey(k, n[0], groupSize, groupsPerRow, 1)];
+        if (tuned && tuned.simd) { packs = tuned.packs; load = tuned.load; pre = tuned.pre; }
+        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs, load, pre);
         if (!pso) return 0;
         uint32_t nn[4] = {(uint32_t)n[0], (uint32_t)(used > 1 && mode == 0 ? n[1] : 0),
                           (uint32_t)(used > 2 ? n[2] : 0), 0};

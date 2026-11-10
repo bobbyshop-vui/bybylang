@@ -3,6 +3,8 @@
 @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
 @property(nonatomic) NSUInteger threads, rows, batch;
 @property(nonatomic) BOOL legacy, simd, mm;
+@property(nonatomic) NSUInteger sgs, simdRows;      // simd plans: simdgroups per threadgroup, rows per simdgroup
+@property(nonatomic) uint32_t packs, load, pre;     // simd plans: weight read variant (q4v_* in the kernel)
 @property(nonatomic, copy) NSString *label;
 @end
 @implementation BBQ4Plan
@@ -79,15 +81,21 @@ static BBQ4Plan *q4MakeMmPlan(void) {
     return plan;
 }
 
-// One simdgroup per `rows` output rows, `sgs` simdgroups per threadgroup (M=1).
-static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows) {
+// One simdgroup per `rows` output rows, `sgs` simdgroups per threadgroup (M=1);
+// packs/load/pre pick how a thread reads its weights (see q4v_* in the kernel).
+static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows, uint32_t packs,
+        uint32_t load, uint32_t pre) {
     if (!gQ4Kernels) gQ4Kernels = [NSMutableDictionary new];
-    NSString *key = [NSString stringWithFormat:@"simd_%lu_%lu", (unsigned long)sgs, (unsigned long)rows];
+    NSString *key = [NSString stringWithFormat:@"simd_%lu_%lu_%u_%u_%u", (unsigned long)sgs,
+        (unsigned long)rows, packs, load, pre];
     if (gQ4Kernels[key]) return gQ4Kernels[key];
     MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
     uint32_t r = (uint32_t)rows, s = (uint32_t)sgs;
     [constants setConstantValue:&r type:MTLDataTypeUInt atIndex:110];
     [constants setConstantValue:&s type:MTLDataTypeUInt atIndex:111];
+    [constants setConstantValue:&packs type:MTLDataTypeUInt atIndex:112];
+    [constants setConstantValue:&load type:MTLDataTypeUInt atIndex:113];
+    [constants setConstantValue:&pre type:MTLDataTypeUInt atIndex:114];
     NSError *error = nil;
     id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_simd"
         constantValues:constants error:&error];
@@ -98,8 +106,12 @@ static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows) {
     if (threads > pso.maxTotalThreadsPerThreadgroup) return nil;
     BBQ4Plan *plan = [BBQ4Plan new];
     plan.pipeline = pso; plan.threads = threads; plan.rows = sgs * rows; plan.batch = 1;
-    plan.simd = YES;
-    plan.label = [NSString stringWithFormat:@"simd%lux%lu", (unsigned long)sgs, (unsigned long)rows];
+    plan.simd = YES; plan.sgs = sgs; plan.simdRows = rows;
+    plan.packs = packs; plan.load = load; plan.pre = pre;
+    plan.label = (packs == 1 && load == 0 && pre == 0) ?
+        [NSString stringWithFormat:@"simd%lux%lu", (unsigned long)sgs, (unsigned long)rows] :
+        [NSString stringWithFormat:@"simd%lux%lu-p%u-l%u-s%u", (unsigned long)sgs,
+            (unsigned long)rows, packs, load, pre];
     gQ4Kernels[key] = plan;
     return plan;
 }
@@ -168,7 +180,7 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
         if (m == 1 && !getenv("BYBY_Q4_NO_SIMD")) {
             static const NSUInteger cfg[][2] = {{1, 4}, {2, 2}, {2, 4}, {4, 2}, {4, 4}, {8, 2}};
             for (NSUInteger c = 0; c < sizeof(cfg) / sizeof(cfg[0]); ++c) {
-                BBQ4Plan *p = q4MakeSimdPlan(cfg[c][0], cfg[c][1]);
+                BBQ4Plan *p = q4MakeSimdPlan(cfg[c][0], cfg[c][1], 1, 0, 0);
                 if (p) [plans addObject:p];
             }
         }
@@ -199,8 +211,13 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
                     metal_matmul_q4_enc(hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset) :
                     metal_matmul_q4_batched_enc(hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset)) :
                     q4EncodePlan(p, hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset);
+                const double gpu0 = metal_session_gpu_seconds();
                 int ended = metal_session_end();
-                return encoded && ended ? ([NSProcessInfo processInfo].systemUptime - start) * 1000 : INFINITY;
+                if (!encoded || !ended) return INFINITY;
+                // GPU execution time when the driver reports it: the wall time of a
+                // sub-millisecond kernel is mostly command buffer round trip.
+                const double gpu = (metal_session_gpu_seconds() - gpu0) * 1000;
+                return gpu > 0 ? gpu : ([NSProcessInfo processInfo].systemUptime - start) * 1000;
             };
             if (!isfinite(run(baseline))) return 0;
             NSData *reference = [NSData dataWithBytes:output.contents length:(NSUInteger)m * n * 4];
@@ -230,7 +247,7 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
             double medians[24];
             for (NSUInteger i = 0; i < valid.count; ++i) {
                 double a = times[i][0], b = times[i][1], c = times[i][2];
-                medians[i] = fmax(fmin(a, b), fmin(fmax(a, b), c));
+                medians[i] = fmin(a, fmin(b, c));   // fastest run: a stall only ever adds time
             }
             if (getenv("BYBY_Q4_TUNE_LOG"))
                 for (NSUInteger i = 0; i < valid.count; ++i)
@@ -239,9 +256,52 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
             NSUInteger best = setting && strcmp(setting, "wide") == 0 && valid.count > 1 ? 1 : 0;
             for (NSUInteger i = best == 0 ? 1 : 2; i < valid.count; ++i)
                 if (medians[i] < medians[best] * 0.97) best = i;
-            gQ4Plans[key] = valid[best];
-            NSLog(@"[q4-tune] %dx%d M=%d: %@ %.3fms (legacy %.3fms; GPU parity checked)",
-                k, n, m, valid[best].label, medians[best], medians[0]);
+            BBQ4Plan *chosen = valid[best];
+            double chosenMs = medians[best];
+            // Second stage for a simdgroup plan: the weight read variants of its
+            // shape, each parity checked, timed by the fastest of five runs.
+            // BYBY_Q4_VARIANT=packs,load,pre forces one; BYBY_Q4_VARIANT=0 skips the stage.
+            const char *forced = getenv("BYBY_Q4_VARIANT");
+            if (chosen.simd && !(forced && strcmp(forced, "0") == 0)) {
+                NSMutableArray<BBQ4Plan *> *variants = [NSMutableArray array];
+                unsigned fp = 0, fl = 0, fs = 0;
+                const BOOL haveForced = forced && sscanf(forced, "%u,%u,%u", &fp, &fl, &fs) == 3;
+                for (uint32_t packs = 1; packs <= 4; packs *= 2) {
+                    if (k % (8 * packs) || (group > 0 && group % (8 * packs))) continue;
+                    for (uint32_t load = 0; load < 3; ++load)
+                        for (uint32_t pre = 0; pre < 2; ++pre) {
+                            if (packs == 1 && load == 0 && pre == 0) continue;
+                            if (haveForced && (packs != fp || load != fl || pre != fs)) continue;
+                            BBQ4Plan *p = q4MakeSimdPlan(chosen.sgs, chosen.simdRows, packs, load, pre);
+                            if (p) [variants addObject:p];
+                        }
+                }
+                double bestMs = INFINITY;
+                for (int rep = 0; rep < 5; ++rep) bestMs = fmin(bestMs, run(chosen));
+                if (haveForced) bestMs = INFINITY;
+                chosenMs = isfinite(bestMs) ? bestMs : chosenMs;
+                for (BBQ4Plan *p in variants) {
+                    if (!isfinite(run(p))) continue;
+                    float err = 0, mag = 0;
+                    BOOL finite = YES;
+                    const float *v = output.contents;
+                    for (NSUInteger i = 0; i < (NSUInteger)m * n; ++i) {
+                        if (!isfinite(v[i])) { finite = NO; break; }
+                        err = fmaxf(err, fabsf(v[i] - ref[i])); mag = fmaxf(mag, fabsf(ref[i]));
+                    }
+                    if (!finite || err > fmaxf(1e-5f, mag * 1e-4f)) {
+                        if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-tune]   %@ rejected: err %g mag %g", p.label, err, mag);
+                        continue;
+                    }
+                    double ms = INFINITY;
+                    for (int rep = 0; rep < 5; ++rep) ms = fmin(ms, run(p));
+                    if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-tune]   %@ %.3fms", p.label, ms);
+                    if (ms < bestMs * 0.97) { bestMs = ms; chosen = p; chosenMs = ms; }
+                }
+            }
+            gQ4Plans[key] = chosen;
+            NSLog(@"[q4-tune] %dx%d M=%d shift %d: %@ %.3fms (legacy %.3fms; GPU parity checked)",
+                k, n, m, wqOffset & 3, chosen.label, chosenMs, medians[0]);
             return 1;
         } @finally { gQ4Tuning = NO; }
     }
