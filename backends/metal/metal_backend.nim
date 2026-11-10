@@ -11,6 +11,8 @@ when defined(macosx):
   {.compile: "metal_shim.m".}
 
   const kMetalKernelSrc = staticRead(metalDir / "kernels" / "vecop_matmul.metal") &
+    "\n" & staticRead(metalDir / "kernels" / "gemm_blocked.metal") &
+    "\n" & staticRead(metalDir / "kernels" / "gemm_fp4km.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_decode_all_heads.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash_fp16.metal") &
@@ -601,6 +603,32 @@ when defined(macosx):
     # Single-token decode is strictly native GEMV/compute, never MPS.
     if m <= 1: return false
     metal_matmul_mps_nt_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(stride), cint(offset)) != 0
+
+  const kFp4kmSgSrc = staticRead(metalDir / "kernels" / "gemm_fp4km_sg.metal")
+  proc metal_fp4km_gemm_enc_c(a, w, lut, c: MetalBufferHandle; m, k, n, mode: cint;
+      sgSource: cstring): cint {.importc: "metal_fp4km_gemm_enc", header: "metal_shim.h".}
+  proc metalSessionFp4GemmEnc*(a, w, lut, c: MetalBufferHandle; m, k, n: int; simdgroup: bool): bool =
+    ## C(m,n) = A(m,k) @ W^T for packed FP4-KM weights (prefill, any m >= 1). simdgroup = the
+    ## simdgroup_matrix kernel (Apple GPU only); false = the register-blocked kernel (any GPU).
+    ## False means the kernel is unavailable and the caller keeps its packed micro-VM tiles.
+    metal_fp4km_gemm_enc_c(a, w, lut, c, cint(m), cint(k), cint(n), cint(if simdgroup: 1 else: 0),
+      kFp4kmSgSrc.cstring) != 0
+
+  proc metal_matmul_mps_enc_c(a, b, c: MetalBufferHandle;
+      m, k, n, stride, offset: cint): cint {.importc: "metal_matmul_mps_enc", header: "metal_shim.h".}
+  proc metalSessionMatmulMpsEnc*(a, b, c: MetalBufferHandle;
+      m, k, n, stride, offset: int): bool =
+    ## C(m,n) = A(m,k) @ B(k,n) with MPSMatrixMultiplication; decode (m <= 1) stays native.
+    if m <= 1: return false
+    metal_matmul_mps_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(stride), cint(offset)) != 0
+
+  proc metal_matmul_mps_any_enc_c(a, b, c: MetalBufferHandle;
+      m, k, n, aOff, cOff, transposeRight: cint): cint {.importc: "metal_matmul_mps_any_enc", header: "metal_shim.h".}
+  proc metalSessionMatmulMpsAnyEnc*(a, b, c: MetalBufferHandle;
+      m, k, n, aOffsetElems, cOffsetElems: int; transposeB: bool): bool =
+    ## MPS GEMM for any m >= 1 with element offsets into A and C (no copies needed for arena ports).
+    metal_matmul_mps_any_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(aOffsetElems), cint(cOffsetElems),
+                               cint(if transposeB: 1 else: 0)) != 0
 
   proc metalSessionMatmulNTEnc*(a, b, c: MetalBufferHandle, m, k, n: int): bool =
     ## C(m,n) = A(m,k) @ B(n,k)^T - B KEEPS its original [n,k] layout (no

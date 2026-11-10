@@ -1316,6 +1316,27 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
   else:
     return false
 
+proc sessionMatmulMps*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int;
+                       transposeB = false; aOffsetElems = 0; cOffsetElems = 0): bool =
+  ## Metal only: C(M x N) = A(M x K) @ B with MPSMatrixMultiplication in the open session. A and C
+  ## start aOffsetElems / cOffsetElems floats into their buffers (so ports of one arena need no copies).
+  ## B is [K,N] (transposeB = false) or [N,K] (transposeB = true). One row (M = 1) goes to MPS only on
+  ## machines that are not Apple Silicon (e.g. Intel Iris), where the native GEMV is slower than MPS;
+  ## Apple Silicon keeps its GEMV. Returns false when MPS does not apply (other backend, no MPS,
+  ## Apple Silicon decode); the caller then falls back to sessionMatmul / sessionMatmulNT.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx):
+    if M < 1 or not metalMpsSupported(): return false
+    if M == 1 and (metalIsAppleSilicon() or getEnv("BYBY_METAL_MPS_GEMV", "1") == "0"): return false
+    if c.metalHandle == nil:
+      c.metalHandle = metalSessionAllocScratch(M * N)
+    return metalSessionMatmulMpsAnyEnc(a.metalHandle, b.metalHandle, c.metalHandle, M, K, N,
+                                       aOffsetElems, cOffsetElems, transposeB)
+  else:
+    return false
+
 proc sessionMatmulNT*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int;
                       bOffsetElems = 0): bool {.probed.} =
   ## Encodes matmul-NT into the session: C(M x N) = A(M x K) @ B(N x K)^T.
@@ -1389,6 +1410,19 @@ proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
   if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
   vulkanSessionFp4GemmEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
     c.vulkanHandle, M, K, N)
+
+proc sessionFp4GemmMetal*(backend: GpuBackend, a, w, lut: SessionHandle,
+    c: var SessionHandle; M, K, N: int; simdgroup: bool): bool {.probed.} =
+  ## Packed FP4-KM prefill GEMM on Metal: the register-blocked kernel on every GPU, or the
+  ## simdgroup_matrix kernel on an Apple GPU. False means unavailable; use the packed micro-VM tiles.
+  when defined(macosx):
+    if normalizeBackend(backend) != gbMetal: return false
+    if a.metalHandle == nil or w.metalHandle == nil or lut.metalHandle == nil or c.metalHandle == nil:
+      return false
+    metalSessionFp4GemmEnc(a.metalHandle, w.metalHandle, lut.metalHandle,
+      c.metalHandle, M, K, N, simdgroup)
+  else:
+    false
 
 proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
     c: var SessionHandle; M, K, N: int): bool {.probed.} =

@@ -158,8 +158,15 @@ int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHan
 int metal_matmul_nt_off_enc(MetalBufferHandle a, MetalBufferHandle b, int bOffsetBytes,
                             MetalBufferHandle c, int m, int k, int n);
 // Resident prefix GEMM. C may be a column tile of a wider row-major matrix.
+int metal_fp4km_gemm_enc(MetalBufferHandle a, MetalBufferHandle w, MetalBufferHandle lut,
+                         MetalBufferHandle c, int m, int k, int n, int mode, const char* sgSource);
+
 int metal_matmul_mps_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
                             int m, int k, int n, int cRowStride, int cColumnOffset);
+int metal_matmul_mps_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
+                         int m, int k, int n, int cRowStride, int cColumnOffset);
+int metal_matmul_mps_any_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
+                             int m, int k, int n, int aOffsetElems, int cOffsetElems, int transposeRight);
 int metal_mps_supported(void);
 // Runtime machine check. Returns 1 on Apple Silicon (including Rosetta), 0 otherwise.
 int metal_is_apple_silicon(void);

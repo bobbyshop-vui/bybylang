@@ -962,9 +962,98 @@ void metal_free_heap(void* heapPtr) {
     }
 }
 
+// Register-blocked FP32 GEMM (kernels/gemm_blocked.metal). Picks the tile height from m so a short
+// matrix does not pad to 64 rows. Returns 0 when the pipeline is unavailable or the GPU cannot run
+// 256 threads per group, and the caller keeps the older tiled kernel.
+static int encode_gemm_rb(int transposeB, MetalBufferHandle a, MetalBufferHandle b, int bOffsetBytes,
+                          MetalBufferHandle c, int m, int k, int n) {
+    if (!gSessionEncoder || m <= 0 || k <= 0 || n <= 0) return 0;
+    if (getenv("BYBY_METAL_GEMM_RB") && getenv("BYBY_METAL_GEMM_RB")[0] == '0') return 0;
+    // The old NN kernel is still ahead for a handful of rows; the NT one is ahead at every size.
+    if (!transposeB && m < 16) return 0;
+    int bm = m <= 16 ? 16 : (m <= 32 ? 32 : 64);
+    NSString *name = [NSString stringWithFormat:@"gemm_rb_%s_%d", transposeB ? "nt" : "nn", bm];
+    id<MTLComputePipelineState> pipeline = getPipeline(name);
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+    [gSessionEncoder setComputePipelineState:pipeline];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)b offset:(NSUInteger)bOffsetBytes atIndex:1];
+    [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)c offset:0 atIndex:2];
+    [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:3];
+    [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:4];
+    [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:5];
+    MTLSize groups = MTLSizeMake(((NSUInteger)n + 63) / 64, ((NSUInteger)m + bm - 1) / bm, 1);
+    [gSessionEncoder dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    return 1;
+}
+
+// ---- FP4-KM GEMM for prefill (kernels/gemm_fp4km.metal, gemm_fp4km_sg.metal) -------------------
+// The simdgroup_matrix kernel lives in its own library that is compiled only on an Apple GPU, so a
+// source an Intel/AMD driver cannot build never touches the main library.
+static id<MTLLibrary> gSgLibrary = nil;
+static int gSgState = 0;   // 0 untried, 1 ready, -1 unavailable
+static id<MTLComputePipelineState> gSgPipeline = nil;
+
+static id<MTLComputePipelineState> fp4kmSgPipeline(const char* source) {
+    if (gSgState < 0) return nil;
+    if (gSgState > 0) return gSgPipeline;
+    gSgState = -1;
+    if (!source || !gDevice) return nil;
+    BOOL apple = NO;
+    if (@available(macOS 10.15, *)) apple = [gDevice supportsFamily:MTLGPUFamilyApple7];
+    // BYBY_FP4_SG_COMPILE_CHECK=1 compiles the source on any GPU to catch syntax errors, but a
+    // non-Apple GPU never gets a pipeline from it.
+    BOOL compileOnly = !apple && getenv("BYBY_FP4_SG_COMPILE_CHECK") != NULL;
+    if (!apple && !compileOnly) return nil;
+    NSError *error = nil;
+    gSgLibrary = [gDevice newLibraryWithSource:[NSString stringWithUTF8String:source] options:nil error:&error];
+    if (!gSgLibrary) { NSLog(@"[fp4km-sg] library compile failed: %@", error); return nil; }
+    if (compileOnly) { NSLog(@"[fp4km-sg] library compiled (compile check only, no pipeline on this GPU)"); return nil; }
+    id<MTLFunction> fn = [gSgLibrary newFunctionWithName:@"gemm_fp4km_sg"];
+    if (!fn) return nil;
+    gSgPipeline = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    if (!gSgPipeline || gSgPipeline.maxTotalThreadsPerThreadgroup < 128) { gSgPipeline = nil; return nil; }
+    gSgState = 1;
+    return gSgPipeline;
+}
+
+// mode: 0 = register-blocked (any GPU), 1 = simdgroup_matrix (Apple GPU only). Returns 0 when the
+// requested kernel is not available so the caller can fall back to the packed micro-VM tiles.
+int metal_fp4km_gemm_enc(MetalBufferHandle a, MetalBufferHandle w, MetalBufferHandle lut,
+                         MetalBufferHandle c, int m, int k, int n, int mode, const char* sgSource) {
+    @autoreleasepool {
+        if (!gSessionEncoder || m <= 0 || k <= 0 || n <= 0 || k % 32 != 0) return 0;
+        id<MTLComputePipelineState> pipeline = nil;
+        NSUInteger bm = 64, threads = 256;
+        if (mode == 1) {
+            pipeline = fp4kmSgPipeline(sgSource);
+            threads = 128;
+        } else {
+            bm = m <= 16 ? 16 : (m <= 32 ? 32 : 64);
+            pipeline = getPipeline([NSString stringWithFormat:@"gemm_fp4km_rb_%d", (int)bm]);
+            if (pipeline && pipeline.maxTotalThreadsPerThreadgroup < 256) pipeline = nil;
+        }
+        if (!pipeline) return 0;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)w offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)lut offset:0 atIndex:2];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)c offset:0 atIndex:3];
+        [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:4];
+        [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:5];
+        [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:6];
+        MTLSize groups = MTLSizeMake(((NSUInteger)n + 63) / 64, ((NSUInteger)m + bm - 1) / bm, 1);
+        [gSessionEncoder dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [gSessionEncoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 1;
+    }
+}
+
 int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_enc] metal_session_begin not called"); return 0; }
+        if (encode_gemm_rb(0, a, b, 0, c, m, k, n)) return 1;
         int tile = 8;
         id<MTLComputePipelineState> pipeline = pickMatmulPipeline(&tile);
         if (!pipeline) return 0;
@@ -1055,6 +1144,63 @@ int metal_matmul_mps_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBuffe
     }
 }
 
+// MPS GEMM with offsets and an optional transposed B. A is [m,k] at aOffsetElems; B is [k,n]
+// (transposeRight = 0) or [n,k] (transposeRight = 1); C is [m,n] at cOffsetElems with row stride
+// cRowStride. Returns 0 (nothing encoded) when MPS cannot take the shapes.
+static int mps_gemm_impl(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
+                         int m, int k, int n, int cRowStride, int aOffsetElems, int cOffsetElems,
+                         int transposeRight) {
+    @autoreleasepool {
+        if (!gSessionEncoder || !gSessionCmdBuf || !MPSSupportsMTLDevice(gDevice) ||
+            !a || !b || !c || m <= 0 || k <= 0 || n <= 0 || aOffsetElems < 0 || cOffsetElems < 0 ||
+            cRowStride < n) return 0;
+        id<MTLBuffer> ba = (__bridge id<MTLBuffer>)a;
+        id<MTLBuffer> bb = (__bridge id<MTLBuffer>)b;
+        id<MTLBuffer> bc = (__bridge id<MTLBuffer>)c;
+        if (ba.length < ((NSUInteger)aOffsetElems + (NSUInteger)m * k) * sizeof(float) ||
+            bb.length < (NSUInteger)n * k * sizeof(float) ||
+            bc.length < ((NSUInteger)cOffsetElems + (NSUInteger)(m - 1) * cRowStride + n) * sizeof(float)) return 0;
+        MPSMatrixDescriptor *da = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:k
+            rowBytes:(NSUInteger)k * sizeof(float) dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *db = transposeRight
+            ? [MPSMatrixDescriptor matrixDescriptorWithRows:n columns:k rowBytes:(NSUInteger)k * sizeof(float) dataType:MPSDataTypeFloat32]
+            : [MPSMatrixDescriptor matrixDescriptorWithRows:k columns:n rowBytes:(NSUInteger)n * sizeof(float) dataType:MPSDataTypeFloat32];
+        MPSMatrixDescriptor *dc = [MPSMatrixDescriptor matrixDescriptorWithRows:m columns:n
+            rowBytes:(NSUInteger)cRowStride * sizeof(float) dataType:MPSDataTypeFloat32];
+        MPSMatrix *ma = [[MPSMatrix alloc] initWithBuffer:ba offset:(NSUInteger)aOffsetElems * sizeof(float) descriptor:da];
+        MPSMatrix *mb = [[MPSMatrix alloc] initWithBuffer:bb descriptor:db];
+        MPSMatrix *mc = [[MPSMatrix alloc] initWithBuffer:bc offset:(NSUInteger)cOffsetElems * sizeof(float) descriptor:dc];
+        static NSMutableDictionary<NSString *, MPSMatrixMultiplication *> *cache;
+        if (!cache) cache = [NSMutableDictionary new];
+        NSString *key = [NSString stringWithFormat:@"%d/%d/%d/%d", transposeRight, m, k, n];
+        MPSMatrixMultiplication *mm = cache[key];
+        if (!mm) {
+            mm = [[MPSMatrixMultiplication alloc] initWithDevice:gDevice
+                transposeLeft:NO transposeRight:transposeRight ? YES : NO resultRows:m resultColumns:n
+                interiorColumns:k alpha:1.0 beta:0.0];
+            cache[key] = mm;
+        }
+        [gSessionEncoder endEncoding];
+        [mm encodeToCommandBuffer:gSessionCmdBuf leftMatrix:ma rightMatrix:mb resultMatrix:mc];
+        gSessionEncoder = [gSessionCmdBuf computeCommandEncoder];
+        return gSessionEncoder != nil;
+    }
+}
+
+// NN variant of metal_matmul_mps_nt_enc: B keeps its [k,n] layout (FIR fir.linear weights); m >= 2.
+int metal_matmul_mps_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
+                         int m, int k, int n, int cRowStride, int cColumnOffset) {
+    if (m <= 1 || cColumnOffset < 0) return 0;
+    return mps_gemm_impl(a, b, c, m, k, n, cRowStride, 0, cColumnOffset, 0);
+}
+
+// Any m (including 1), offsets into A and C, B transposed or not. The caller decides when a single
+// row should go to MPS (the framework's decode keeps its native GEMV on Apple Silicon).
+int metal_matmul_mps_any_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c,
+                             int m, int k, int n, int aOffsetElems, int cOffsetElems, int transposeRight) {
+    return mps_gemm_impl(a, b, c, m, k, n, n, aOffsetElems, cOffsetElems, transposeRight);
+}
+
 int metal_matmul_nt_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n) {
     return metal_matmul_nt_off_enc(a, b, 0, c, m, k, n);
 }
@@ -1063,6 +1209,7 @@ int metal_matmul_nt_off_enc(MetalBufferHandle a, MetalBufferHandle b, int bOffse
                             MetalBufferHandle c, int m, int k, int n) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_nt_enc] metal_session_begin not called"); return 0; }
+        if (encode_gemm_rb(1, a, b, bOffsetBytes, c, m, k, n)) return 1;
         // Fixed tile=8 (matmul_nt_kernel), the same stable choice
         // as pickMatmulPipeline() for the normal version - no need to measure
         // maxTotalThreadsPerThreadgroup again for this kernel.
