@@ -252,7 +252,8 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
 int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         MetalBufferHandle *wq, MetalBufferHandle *scales, MetalBufferHandle *zeros,
         MetalBufferHandle *out, MetalBufferHandle res, int k, int groupSize,
-        int groupsPerRow, const int *n, const int *wqOffset);
+        int groupsPerRow, const int *n, const int *wqOffset,
+        MetalBufferHandle gamma, float eps);   // gamma != NULL: `a` is the raw vector, RMSNorm folded in
 int metal_matmul_q4_enc(MetalBufferHandle a, MetalBufferHandle wq, MetalBufferHandle scales,
                          MetalBufferHandle zeros, MetalBufferHandle c,
                          int m, int k, int n, int groupSize, int nGroupsPerRow, int wqOffset);

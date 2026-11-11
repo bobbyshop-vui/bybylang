@@ -1519,15 +1519,16 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
 // mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.
 // res may be NULL. Returns 0 when the shape/kernel is unsupported.
 static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes, uint32_t packs,
-        uint32_t load, uint32_t pre) {
+        uint32_t load, uint32_t pre, uint32_t norm) {
     static NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *cache;
     if (!cache) cache = [NSMutableDictionary new];
-    NSNumber *key = @((((mode * 2 + hasRes) * 8 + packs) * 4 + load) * 2 + pre);
+    NSNumber *key = @(((((mode * 2 + hasRes) * 8 + packs) * 4 + load) * 2 + pre) * 2 + norm);
     if (cache[key]) return cache[key] == (id)[NSNull null] ? nil : cache[key];
     cache[key] = (id)[NSNull null];   // a pipeline that cannot be used is not built again
     MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
     [constants setConstantValue:&mode type:MTLDataTypeUInt atIndex:120];
     [constants setConstantValue:&hasRes type:MTLDataTypeUInt atIndex:121];
+    [constants setConstantValue:&norm type:MTLDataTypeUInt atIndex:123];
     [constants setConstantValue:&packs type:MTLDataTypeUInt atIndex:112];
     [constants setConstantValue:&load type:MTLDataTypeUInt atIndex:113];
     [constants setConstantValue:&pre type:MTLDataTypeUInt atIndex:114];
@@ -1546,7 +1547,8 @@ static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRe
 int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         MetalBufferHandle *wq, MetalBufferHandle *scales, MetalBufferHandle *zeros,
         MetalBufferHandle *out, MetalBufferHandle res, int k, int groupSize,
-        int groupsPerRow, const int *n, const int *wqOffset) {
+        int groupsPerRow, const int *n, const int *wqOffset,
+        MetalBufferHandle gamma, float eps) {
     @autoreleasepool {
         if (!gSessionEncoder || !q4TunedEnabled()) return 0;
         // Fusion removes CPU-side encode work, which only pays off on Apple GPUs;
@@ -1565,7 +1567,15 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         uint32_t packs = 1, load = 0, pre = 0;
         BBQ4Plan *tuned = gQ4Plans[q4PlanKey(k, n[0], groupSize, groupsPerRow, 1)];
         if (tuned && tuned.simd) { packs = tuned.packs; load = tuned.load; pre = tuned.pre; }
-        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs, load, pre);
+        // RMSNorm folded into the kernel (gamma given): the input is the raw vector.
+        static int normEnv = -1;
+        if (normEnv < 0) {
+            const char *v = getenv("BYBY_FUSE_NORM");
+            normEnv = !(v && v[0] == '0');
+        }
+        if (gamma && !normEnv) return 0;
+        id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs, load, pre,
+                                                          gamma ? 1 : 0);
         if (!pso) return 0;
         uint32_t nn[4] = {(uint32_t)n[0], (uint32_t)(used > 1 && mode == 0 ? n[1] : 0),
                           (uint32_t)(used > 2 ? n[2] : 0), 0};
@@ -1587,6 +1597,8 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
         [gSessionEncoder setBytes:&groupsPerRow length:4 atIndex:16];
         [gSessionEncoder setBytes:nn length:16 atIndex:17];
         [gSessionEncoder setBytes:sh length:16 atIndex:18];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)(gamma ? gamma : a) offset:0 atIndex:19];
+        [gSessionEncoder setBytes:&eps length:4 atIndex:20];
         const uint32_t rows = nn[0] + nn[1] + nn[2];
         [gSessionEncoder dispatchThreadgroups:MTLSizeMake((rows + 7) / 8, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(2 * pso.threadExecutionWidth, 1, 1)];

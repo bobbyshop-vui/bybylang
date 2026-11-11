@@ -2915,10 +2915,12 @@ proc sessionArgmaxTokenEnc*(backend: GpuBackend, logits, ring: SessionHandle,
 proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
                             ws: openArray[ResidentWeightHandle],
                             outs: openArray[SessionHandle],
-                            res: SessionHandle, hasRes: bool): bool =
+                            res: SessionHandle, hasRes: bool,
+                            gamma = SessionHandle(), eps = 0'f32, hasNorm = false): bool =
   ## Fused decode GEMV (M=1) on Metal. mode 0: ws.len (1..3) matrices share `a` and each
   ## writes its own outs[i]; mode 1: ws = [gate, up], outs[0] = silu(gate)*up.
-  ## `res` is added to the result when hasRes. Returns false when unsupported, so
+  ## `res` is added to the result when hasRes. With hasNorm, `a` is the raw vector and
+  ## RMSNorm (weight `gamma`, `eps`) is applied inside the kernel. Returns false when unsupported, so
   ## callers fall back to the unfused sequence. Output handles must already be allocated.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -2926,6 +2928,7 @@ proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
   when defined(macosx):
     if ws.len < 1 or ws.len > 3 or outs.len < ws.len or (mode == 1 and ws.len != 2): return false
     if hasRes and res.metalHandle == nil: return false
+    if hasNorm and gamma.metalHandle == nil: return false
     var wq, sc, zr, o: array[3, MetalBufferHandle]
     var n, off: array[3, int]
     for i in 0 ..< ws.len:
@@ -2935,7 +2938,8 @@ proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
       wq[i] = ws[i].metalWq; sc[i] = ws[i].metalScales; zr[i] = ws[i].metalZeros
       o[i] = outs[i].metalHandle; n[i] = ws[i].n; off[i] = ws[i].wqOffset
     return metalSessionMatmulQ4FusedEnc(mode, a.metalHandle, wq, sc, zr, o,
-      (if hasRes: res.metalHandle else: nil), ws[0].k, ws[0].groupSize, ws[0].nGroupsPerRow, n, off)
+      (if hasRes: res.metalHandle else: nil), ws[0].k, ws[0].groupSize, ws[0].nGroupsPerRow, n, off,
+      (if hasNorm: gamma.metalHandle else: nil), eps)
   else:
     return false
 

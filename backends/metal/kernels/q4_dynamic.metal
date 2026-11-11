@@ -85,21 +85,39 @@ struct Q4Act {
     float sum;     // their plain sum, for the zero-point correction
 };
 
+// Adds the 8 activations of pack `pk` to act (pre-scaled when q4v_pre is set).
+static inline void q4v_put(thread Q4Act& act, uint pk, float4 x0, float4 x1) {
+    act.sum += (x0.x + x0.y) + (x0.z + x0.w) + ((x1.x + x1.y) + (x1.z + x1.w));
+    if (q4v_pre != 0) {
+        act.v[2 * pk] = x0 * float4(1.0f, 0.0625f, 0.00390625f, 0.000244140625f);
+        act.v[2 * pk + 1] = x1 * float4(1.52587890625e-05f, 9.5367431640625e-07f,
+            5.9604644775390625e-08f, 3.725290298461914e-09f);
+    } else {
+        act.v[2 * pk] = x0;
+        act.v[2 * pk + 1] = x1;
+    }
+}
+
 static inline Q4Act q4v_act(device const float* a) {
+    Q4Act act;
+    act.sum = 0.0f;
+    for (uint pk = 0; pk < q4v_packs; ++pk)
+        q4v_put(act, pk, *(device const float4*)(a + 8 * pk), *(device const float4*)(a + 8 * pk + 4));
+    return act;
+}
+
+// Same for a vector that still has to go through RMSNorm: the activations are
+// multiplied by gamma here and the sum of squares of the raw values goes to ssq,
+// so the norm becomes one scale of the finished dot products (x*g*inv . w = inv * (x*g . w)).
+static inline Q4Act q4v_act_norm(device const float* a, device const float* g, thread float& ssq) {
     Q4Act act;
     act.sum = 0.0f;
     for (uint pk = 0; pk < q4v_packs; ++pk) {
         const float4 x0 = *(device const float4*)(a + 8 * pk);
         const float4 x1 = *(device const float4*)(a + 8 * pk + 4);
-        act.sum += (x0.x + x0.y) + (x0.z + x0.w) + ((x1.x + x1.y) + (x1.z + x1.w));
-        if (q4v_pre != 0) {
-            act.v[2 * pk] = x0 * float4(1.0f, 0.0625f, 0.00390625f, 0.000244140625f);
-            act.v[2 * pk + 1] = x1 * float4(1.52587890625e-05f, 9.5367431640625e-07f,
-                5.9604644775390625e-08f, 3.725290298461914e-09f);
-        } else {
-            act.v[2 * pk] = x0;
-            act.v[2 * pk + 1] = x1;
-        }
+        ssq += dot(x0, x0) + dot(x1, x1);
+        q4v_put(act, pk, x0 * *(device const float4*)(g + 8 * pk),
+                x1 * *(device const float4*)(g + 8 * pk + 4));
     }
     return act;
 }
@@ -191,6 +209,7 @@ kernel void matmul_q4_simd(
 // HAS_RES adds res[n] to the result (residual epilogue for o_proj / down_proj).
 constant uint q4f_mode [[function_constant(120)]];
 constant uint q4f_res [[function_constant(121)]];
+constant uint q4f_norm [[function_constant(123)]];   // 1: `a` is the raw vector, RMSNorm folded in
 
 // One step of row n: its packs at column k, scaled by their group, added to acc.
 static inline float q4f_row(device const uchar* wq, device const float* sc,
@@ -216,6 +235,8 @@ kernel void matmul_q4_fused(
     constant int& groupsPerRow [[buffer(16)]],
     constant uint4& nn [[buffer(17)]],      // N0, N1, N2, unused
     constant uint4& sh [[buffer(18)]],      // wqShift of the three matrices
+    device const float* gamma [[buffer(19)]],   // RMSNorm weight (q4f_norm)
+    constant float& eps [[buffer(20)]],
     uint tg [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -242,8 +263,9 @@ kernel void matmul_q4_fused(
     const uint gs = uint(max(groupSize, 1));
     const bool gPow2 = (gs & (gs - 1)) == 0;
     const uint gShift = 31 - clz(gs);
+    float ssq = 0.0f;
     for (uint k = lane * vals; k < uint(K); k += simdW * vals) {
-        const Q4Act act = q4v_act(a + k);
+        const Q4Act act = q4f_norm != 0 ? q4v_act_norm(a + k, gamma + k, ssq) : q4v_act(a + k);
         const uint g = groupSize > 0 ? (gPow2 ? k >> gShift : k / gs) : 0;
         for (uint r = 0; r < 4; ++r) {
             const uint n = local0 + r;
@@ -252,10 +274,11 @@ kernel void matmul_q4_fused(
                 sumB_[r] = q4f_row(wq1, sc1, zr1, n, rowBytes, gpr, k, g, sh.y, act, sumB_[r]);
         }
     }
+    const float inv = q4f_norm != 0 ? rsqrt(simd_sum(ssq) / float(K) + eps) : 1.0f;
     for (uint r = 0; r < 4; ++r) {
-        float v = simd_sum(sumA_[r]);
+        float v = simd_sum(sumA_[r]) * inv;
         if (q4f_mode == 1) {
-            const float u = simd_sum(sumB_[r]);
+            const float u = simd_sum(sumB_[r]) * inv;
             v = v / (1.0f + exp(-v)) * u;
         }
         if (q4f_res != 0) v += res[local0 + r];
