@@ -352,8 +352,10 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
                 }
             }
             gQ4Plans[key] = chosen;
-            NSLog(@"[q4-tune] %dx%d M=%d shift %d: %@ %.3fms (legacy %.3fms; GPU parity checked)",
-                k, n, m, wqOffset & 3, chosen.label, chosenMs, medians[0]);
+            // Effective read rate: packed weights plus fp32 scale and zero per group.
+            const double bytes = (double)n * (k / 2.0 + 8.0 * (group > 0 ? (double)k / group : 1.0));
+            NSLog(@"[q4-tune] %dx%d M=%d shift %d: %@ %.3fms = %.1f GB/s (legacy %.3fms; GPU parity checked)",
+                k, n, m, wqOffset & 3, chosen.label, chosenMs, bytes / (chosenMs * 1e-3) / 1e9, medians[0]);
             return 1;
         } @finally { gQ4Tuning = NO; }
     }
