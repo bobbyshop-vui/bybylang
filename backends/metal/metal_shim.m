@@ -1622,7 +1622,7 @@ int metal_graph_begin(int maxSeqLen) {
         r.psos = [NSMutableArray array];
         r.dyn = [NSMutableArray array];
         const NSUInteger devTg = gDevice.maxThreadgroupMemoryLength;
-        r.tgCap = MIN((NSUInteger)maxSeqLen * 4, devTg > 4096 ? devTg - 2048 : devTg);
+        r.tgCap = MIN((NSUInteger)maxSeqLen * 4, devTg > 16384 ? devTg - 10240 : 0);
         gGraphRec = r;
         gGraphRecordFailed = NO;
         gGraphRecording = YES;
@@ -2438,7 +2438,9 @@ int metal_attention_decode_all_heads_enc(MetalBufferHandle q, MetalBufferHandle 
         // inside the kernel, NO separate host allocation needed.)
         NSUInteger scoresBytes = (NSUInteger)S * sizeof(float);
         [gSessionEncoder setThreadgroupMemoryLength:scoresBytes atIndex:0];
-        const NSUInteger TG = 128;
+        // A multiple of 128 threads, up to 512: more threads hide the latency of the K/V reads.
+        NSUInteger TG = MIN((NSUInteger)512, pipeline.maxTotalThreadsPerThreadgroup) / 128 * 128;
+        if (TG < 128 || D > 128 || scoresBytes + 10240 > gDevice.maxThreadgroupMemoryLength) return 0;
         MTLSize gridSize = MTLSizeMake((NSUInteger)H, 1, 1);
         MTLSize groupSize = MTLSizeMake(TG, 1, 1);
         [gSessionEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:groupSize];
