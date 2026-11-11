@@ -84,6 +84,12 @@ const
   OP_LOAD_VACT*    = 0x9B'u32   # R[a] = (this virtual threadgroup has real work) ? 1 : 0
   OP_U_LOAD_U32*   = 0x9D'u32   # U[a] = *(uint*)(memU8 + U[b] + word)  (4 bytes/lane, ADDRESS MUST be a multiple of 4; buffer 2)
   OP_U_LOAD_IN4*   = 0x9E'u32   # R[a..a+3] = inF32[U[b]+word .. +3]  (one 16-byte load; buffer 4)
+  # ── simdgroup ops (Metal JIT and Vulkan subgroups; the test interpreter uses width 32) ──
+  OP_SIMD_SUM*     = 0xA0'u32   # R[a] = sum of R[b] over the simdgroup (every lane must execute it)
+  OP_SIMD_LANE*    = 0xA1'u32   # U[a] = thread_index_in_simdgroup
+  OP_SIMD_ID*      = 0xA2'u32   # U[a] = simdgroup_index_in_threadgroup
+  OP_SIMD_W*       = 0xA3'u32   # U[a] = threads_per_simdgroup
+  OP_SIMD_GID*     = 0xA4'u32   # U[a] = global thread id / threads_per_simdgroup (grid-wide simdgroup index)
   OP_GRID_EPILOGUE* = 0x9C'u32  # next word = ctrl index; the last TG resets the counter, copies err -> lastErr
 
 type
@@ -233,6 +239,11 @@ proc opHasWord*(op: uint32): bool {.inline.} =
      OP_U_LOAD_F32, OP_U_ATOMIC_ADD: true
   else: false
 
+proc emitSimdSum*(p: var VmProgram; rd, rs: uint32) = p.emit pack2(OP_SIMD_SUM, rd, rs)
+proc emitSimdLane*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_LANE, ud)
+proc emitSimdId*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_ID, ud)
+proc emitSimdW*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_W, ud)
+proc emitSimdGid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_GID, ud)
 proc emitUTgid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_TGID, ud)
 proc emitULid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_LID, ud)
 proc emitUConst*(p: var VmProgram; ud: uint32; v: uint32) =

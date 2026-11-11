@@ -73,7 +73,7 @@ proc initJitCache*(cfg = defaultJitConfig()): JitCache =
 type LowerState = object
   body: seq[string]
   pc, loopDepth, indent: int
-  usesU, usesIn: bool
+  usesU, usesIn, usesSimd: bool
   glsl: bool
   ctrlBuf: bool         ## grid control words live in their own buffer (slot 5), selected by the 0xFFFFFFFF sentinel
   od: bool              ## uses one-dispatch ops (persistent kernel) -> the kernel has its own prologue
@@ -96,6 +96,9 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   let c = (w shr 18) and 0x1F
   if op >= OP_U_TGID and op <= OP_U_ATOMIC_ADD: st.usesU = true
   if op == OP_U_LOAD_IN or op == OP_U_LOAD_IN4: st.usesIn = true
+  if op == OP_SIMD_SUM or op == OP_SIMD_LANE or op == OP_SIMD_ID: st.usesSimd = true
+  if op in [OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID]: st.usesU = true
+  if op == OP_SIMD_W or op == OP_SIMD_GID: st.usesSimd = true
   case op
   of OP_NOP:
     discard
@@ -224,6 +227,16 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & &"tgF32[uint(R[{b}]) + {off}u] = R[{a}];"
     else:
       st.body.add st.ind() & &"tgF32[(uint)R[{b}] + {off}u] = R[{a}];"
+  of OP_SIMD_SUM:
+    st.body.add st.ind() & (if st.glsl: &"R[{a}] = subgroupAdd(R[{b}]);" else: &"R[{a}] = simd_sum(R[{b}]);")
+  of OP_SIMD_LANE:
+    st.body.add st.ind() & (if st.glsl: &"U[{a}] = gl_SubgroupInvocationID;" else: &"U[{a}] = simdLane;")
+  of OP_SIMD_ID:
+    st.body.add st.ind() & (if st.glsl: &"U[{a}] = gl_SubgroupID;" else: &"U[{a}] = simdId;")
+  of OP_SIMD_W:
+    st.body.add st.ind() & (if st.glsl: &"U[{a}] = gl_SubgroupSize;" else: &"U[{a}] = simdW;")
+  of OP_SIMD_GID:
+    st.body.add st.ind() & (if st.glsl: &"U[{a}] = tid / gl_SubgroupSize;" else: &"U[{a}] = tid / simdW;")
   of OP_U_TGID:
     st.body.add st.ind() & &"U[{a}] = tgid;"
   of OP_U_LID:
@@ -514,7 +527,8 @@ kernel void """ & kernelName & """(
 """ & (if st.usesIn: "    device const float* inF32  [[buffer(4)]],\n" else: "") & """    threadgroup float*  tgF32  [[threadgroup(0)]],
     uint tid  [[thread_position_in_grid]],
     uint lid  [[thread_position_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]])
+    uint tgid [[threadgroup_position_in_grid]]""" &
+    (if st.usesSimd: ",\n    uint simdLane [[thread_index_in_simdgroup]],\n    uint simdId [[simdgroup_index_in_threadgroup]],\n    uint simdW [[threads_per_simdgroup]]" else: "") & """)
 {
 """ & lines.join("\n") & """
 }
@@ -538,8 +552,10 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
     "  for (int i=0; i<32; ++i) R[i]=0.0;",
     "  R[0] = float(tid);"
   ] & uDecl & st.body
-  result = "// Vulkan micro-VM JIT: " & kernelName & "\n" & """
-#version 450
+  let simdExt = if st.usesSimd:
+      "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_arithmetic : require\n"
+    else: ""
+  result = "// Vulkan micro-VM JIT: " & kernelName & "\n" & "#version 450\n" & simdExt & """
 layout(local_size_x_id = 0) in;
 layout(set=0, binding=0, std430) buffer MemF32Buf { float memF32[]; };
 layout(set=0, binding=1, std430) readonly buffer MemU8Buf { uint memU8[]; };

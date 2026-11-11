@@ -38,7 +38,9 @@ enum {
     OP_GRID_BARRIER = 0x93, OP_BASE_F32 = 0x94, OP_BASE_U8 = 0x95,
     OP_BASE_LUT = 0x96, OP_BASE_IN = 0x97, OP_U_LOAD_META = 0x98,
     OP_VTG_BEGIN = 0x99, OP_VTG_END = 0x9A, OP_LOAD_VACT = 0x9B,
-    OP_GRID_EPILOGUE = 0x9C, OP_U_LOAD_U32 = 0x9D, OP_U_LOAD_IN4 = 0x9E
+    OP_GRID_EPILOGUE = 0x9C, OP_U_LOAD_U32 = 0x9D, OP_U_LOAD_IN4 = 0x9E,
+    OP_SIMD_SUM = 0xA0, OP_SIMD_LANE = 0xA1, OP_SIMD_ID = 0xA2,
+    OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4
 };
 
 typedef struct {
@@ -55,6 +57,8 @@ typedef struct {
     size_t base_f32, base_u8, base_lut, base_in;
     int halted;
     int wait_tg, wait_grid;
+    int wait_simd;     /* destination register + 1 while waiting in OP_SIMD_SUM, else 0 */
+    float simd_val;
 } VmThread;
 
 static inline uint32_t op_of(uint32_t w) { return w & 0xFFu; }
@@ -165,7 +169,7 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
         int progressed = 0;
         for (int tid = 0; tid < n_threads; ++tid) {
             VmThread* t = &threads[tid];
-            if (t->halted || t->wait_tg || t->wait_grid) continue;
+            if (t->halted || t->wait_tg || t->wait_grid || t->wait_simd) continue;
             int lid = tid % tg_size;
             int tgid = tid / tg_size;
             float* tgp = tg ? tg + (size_t)tgid * (size_t)tg_floats : NULL;
@@ -316,6 +320,11 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
             case OP_CMP_LT:
                 t->r[a] = t->r[b] < t->r[c] ? 1.0f : 0.0f;
                 break;
+            case OP_SIMD_LANE: t->u[a] = (uint32_t)lid % 32u; break;
+            case OP_SIMD_W: t->u[a] = 32u; break;
+            case OP_SIMD_GID: t->u[a] = (uint32_t)tid / 32u; break;
+            case OP_SIMD_ID: t->u[a] = (uint32_t)lid / 32u; break;
+            case OP_SIMD_SUM: t->wait_simd = (int)a + 1; t->simd_val = t->r[b]; break;
             case OP_U_TGID: t->u[a] = (uint32_t)tgid; break;
             case OP_U_LID: t->u[a] = (uint32_t)lid; break;
             case OP_U_CONST:
@@ -444,6 +453,22 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 if (threads[i].wait_tg) any = 1;
             }
             if (all && any) for (int i = lo; i < hi; ++i) threads[i].wait_tg = 0;
+        }
+        /* A simdgroup reduction completes when every live lane of the group arrived. */
+        for (int lo = 0; lo < n_threads; lo += 32) {
+            int hi = lo + 32; if (hi > n_threads) hi = n_threads;
+            int simd_all = 1, simd_any = 0;
+            for (int i = lo; i < hi; ++i) {
+                if (!threads[i].halted && !threads[i].wait_simd) { simd_all = 0; break; }
+                if (threads[i].wait_simd) simd_any = 1;
+            }
+            if (simd_all && simd_any) {
+                float total = 0.0f;
+                for (int i = lo; i < hi; ++i) if (threads[i].wait_simd) total += threads[i].simd_val;
+                for (int i = lo; i < hi; ++i)
+                    if (threads[i].wait_simd) { threads[i].r[threads[i].wait_simd - 1] = total; threads[i].wait_simd = 0; }
+                progressed = 1;
+            }
         }
         /* Release a grid barrier when every live thread arrived. */
         int grid_all = 1, grid_any = 0;

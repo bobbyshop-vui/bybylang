@@ -45,7 +45,8 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
        OP_DIV, OP_SOFTPLUS, OP_RSQRT, OP_LUT_U8, OP_FOR_BEGIN, OP_FOR_END,
        OP_BARRIER_TG, OP_CMP_LT, OP_IF_BEGIN, OP_IF_END, OP_U_TGID, OP_U_LID,
        OP_U_ADD, OP_U_MUL, OP_U_SHR, OP_U_TO_R, OP_R_TO_U, OP_BASE_F32,
-       OP_BASE_U8, OP_BASE_LUT, OP_BASE_IN, OP_VTG_END, OP_LOAD_VACT: discard
+       OP_BASE_U8, OP_BASE_LUT, OP_BASE_IN, OP_VTG_END, OP_LOAD_VACT,
+       OP_SIMD_SUM, OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID: discard
     else: raise newException(ValueError, "unknown VM opcode 0x" & toHex(op, 2))
     if pc+extra > words.len: raise newException(ValueError, "truncated recorded VM instruction")
     case op
