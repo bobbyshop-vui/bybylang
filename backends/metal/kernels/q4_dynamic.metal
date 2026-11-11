@@ -276,3 +276,47 @@ kernel void kv_append_kernel(
     kAll[dst] = k[i];
     vAll[dst] = v[i];
 }
+
+// ---- Pipelined decode: the next token is chosen on the GPU ----
+// ring[] holds token ids. A step reads its input token from one slot and
+// writes the next token to the following slot, so the CPU can encode the next
+// step while this one still runs.
+
+// Copies the embedding row of the token in ring[slot] into out[0..<dim].
+kernel void embed_token_kernel(
+    device const float* table [[buffer(0)]], device const int* ring [[buffer(1)]],
+    device float* out [[buffer(2)]], constant uint& dim [[buffer(3)]],
+    constant uint& slot [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    out[i] = table[uint(ring[slot]) * dim + i];
+}
+
+// Greedy choice: the largest finite logit, the lowest index among equals, and
+// 0 when no logit is finite. One threadgroup of 256 threads.
+kernel void argmax_token_kernel(
+    device const float* logits [[buffer(0)]], device int* ring [[buffer(1)]],
+    constant uint& n [[buffer(2)]], constant uint& slot [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float bestV[256];
+    threadgroup uint bestI[256];
+    float bv = -INFINITY;
+    uint bi = 0xFFFFFFFFu;
+    for (uint i = tid; i < n; i += 256) {
+        const float v = logits[i];
+        if (isfinite(v) && v > bv) { bv = v; bi = i; }
+    }
+    bestV[tid] = bv;
+    bestI[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float ov = bestV[tid + s];
+            const uint oi = bestI[tid + s];
+            if (ov > bestV[tid] || (ov == bestV[tid] && oi < bestI[tid])) {
+                bestV[tid] = ov;
+                bestI[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) ring[slot] = bestI[0] == 0xFFFFFFFFu ? 0 : int(bestI[0]);
+}

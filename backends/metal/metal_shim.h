@@ -312,6 +312,18 @@ int metal_session_end(void);
 // in the middle - SLOW because that is a REAL wait). Returns 1 on
 // success, 0 on failure (e.g. no open session).
 int metal_session_commit_continue(void);
+
+// Pipelined decode: commit the open session without waiting (it joins an in-flight
+// queue), then wait for the oldest in-flight session. Both return 1 on success.
+int metal_session_end_async(void);
+int metal_session_wait_oldest(void);
+// Token id ring (a Shared scratch buffer read as ints) and the encoders that
+// read/write it: embedding row of ring[slot], greedy argmax of logits into ring[slot].
+int metal_token_ring_get(MetalBufferHandle h, int slot);
+void metal_token_ring_set(MetalBufferHandle h, int slot, int value);
+int metal_embed_token_enc(MetalBufferHandle table, MetalBufferHandle ring,
+                          MetalBufferHandle out, int dim, int slot);
+int metal_argmax_token_enc(MetalBufferHandle logits, MetalBufferHandle ring, int n, int slot);
 // NEW: the REAL NSError description of the last failed metal_session_end()
 // (commit/waitUntilCompleted not Completed) - this error used to go ONLY
 // to NSLog (Console/syslog) and could not reach Nim, so the caller

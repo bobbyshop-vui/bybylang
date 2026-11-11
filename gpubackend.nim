@@ -2871,6 +2871,47 @@ proc sessionKvAppendEnc*(backend: GpuBackend, k, v, kAll, vAll: SessionHandle,
   else:
     return false
 
+proc sessionEndAsync*(backend: GpuBackend): bool =
+  ## Commits the open session without waiting (Metal only). Pair with sessionWaitOldest.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx): return metalSessionEndAsync()
+  else: return false
+
+proc sessionWaitOldest*(backend: GpuBackend): bool =
+  ## Waits for the oldest session committed by sessionEndAsync; false if it failed.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx): return metalSessionWaitOldest()
+  else: return false
+
+proc sessionTokenRingGet*(backend: GpuBackend, ring: SessionHandle, slot: int): int =
+  when defined(macosx): metalTokenRingGet(ring.metalHandle, slot)
+  else: 0
+
+proc sessionTokenRingSet*(backend: GpuBackend, ring: SessionHandle, slot, value: int) =
+  when defined(macosx): metalTokenRingSet(ring.metalHandle, slot, value)
+
+proc sessionEmbedTokenEnc*(backend: GpuBackend, table, ring: SessionHandle,
+                            o: SessionHandle, dim, slot: int): bool =
+  ## Encodes o[0..<dim] = table row of the token id in ring[slot] (Metal only).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx): return metalSessionEmbedTokenEnc(table.metalHandle, ring.metalHandle, o.metalHandle, dim, slot)
+  else: return false
+
+proc sessionArgmaxTokenEnc*(backend: GpuBackend, logits, ring: SessionHandle,
+                             n, slot: int): bool =
+  ## Encodes ring[slot] = greedy token of logits[0..<n] (Metal only).
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx): return metalSessionArgmaxTokenEnc(logits.metalHandle, ring.metalHandle, n, slot)
+  else: return false
+
 proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
                             ws: openArray[ResidentWeightHandle],
                             outs: openArray[SessionHandle],

@@ -2311,6 +2311,91 @@ int metal_session_commit_continue(void) {
 
 
 
+// ---- Pipelined decode ----
+// A session ended with metal_session_end_async() is committed without waiting
+// and queued here; metal_session_wait_oldest() waits for the oldest one. The
+// queue runs command buffers in commit order, so the next one may be encoded
+// and committed while the previous still executes.
+static NSMutableArray<id<MTLCommandBuffer>> *gInflight = nil;
+
+int metal_session_end_async(void) {
+    @autoreleasepool {
+        if (!gSessionEncoder || !gSessionCmdBuf) return 0;
+        [gSessionEncoder endEncoding];
+        if (!gInflight) gInflight = [NSMutableArray new];
+        [gSessionCmdBuf commit];
+        [gInflight addObject:gSessionCmdBuf];
+        gSessionEncoder = nil;
+        gSessionCmdBuf = nil;
+        return 1;
+    }
+}
+
+int metal_session_wait_oldest(void) {
+    @autoreleasepool {
+        if (gInflight.count == 0) return 0;
+        id<MTLCommandBuffer> buf = gInflight.firstObject;
+        [gInflight removeObjectAtIndex:0];
+        [buf waitUntilCompleted];
+        addGpuTime(buf);
+        const BOOL ok = buf.status == MTLCommandBufferStatusCompleted;
+        if (!ok) {
+            NSLog(@"[metal_session_wait_oldest] command buffer FAILED, status=%ld, error=%@",
+                  (long)buf.status, buf.error);
+            gLastSessionEndError = [NSString stringWithFormat:@"status=%ld %@", (long)buf.status,
+                buf.error ? [buf.error description] : @"(no error)"];
+        }
+        return ok ? 1 : 0;
+    }
+}
+
+int metal_token_ring_get(MetalBufferHandle h, int slot) {
+    return h ? ((const int *)((__bridge id<MTLBuffer>)h).contents)[slot] : 0;
+}
+
+void metal_token_ring_set(MetalBufferHandle h, int slot, int value) {
+    if (h) ((int *)((__bridge id<MTLBuffer>)h).contents)[slot] = value;
+}
+
+int metal_embed_token_enc(MetalBufferHandle table, MetalBufferHandle ring,
+                          MetalBufferHandle out, int dim, int slot) {
+    @autoreleasepool {
+        if (!gSessionEncoder || dim <= 0) return 0;
+        id<MTLComputePipelineState> pipeline = getPipeline(@"embed_token_kernel");
+        if (!pipeline) return 0;
+        const uint32_t d = (uint32_t)dim, sl = (uint32_t)slot;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)table offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)ring offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)out offset:0 atIndex:2];
+        [gSessionEncoder setBytes:&d length:4 atIndex:3];
+        [gSessionEncoder setBytes:&sl length:4 atIndex:4];
+        const NSUInteger tg = MIN((NSUInteger)256, MIN((NSUInteger)dim, pipeline.maxTotalThreadsPerThreadgroup));
+        [gSessionEncoder dispatchThreads:MTLSizeMake((NSUInteger)dim, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        sessionBarrier();
+        return 1;
+    }
+}
+
+int metal_argmax_token_enc(MetalBufferHandle logits, MetalBufferHandle ring, int n, int slot) {
+    @autoreleasepool {
+        if (!gSessionEncoder || n <= 0) return 0;
+        id<MTLComputePipelineState> pipeline = getPipeline(@"argmax_token_kernel");
+        if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+        const uint32_t cnt = (uint32_t)n, sl = (uint32_t)slot;
+        [gSessionEncoder setComputePipelineState:pipeline];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)logits offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)ring offset:0 atIndex:1];
+        [gSessionEncoder setBytes:&cnt length:4 atIndex:2];
+        [gSessionEncoder setBytes:&sl length:4 atIndex:3];
+        [gSessionEncoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        sessionBarrier();
+        return 1;
+    }
+}
+
 const char* metal_get_last_session_error(void) {
     return gLastSessionEndError ? gLastSessionEndError.UTF8String : "";
 }

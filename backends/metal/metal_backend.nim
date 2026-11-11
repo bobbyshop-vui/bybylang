@@ -721,6 +721,26 @@ when defined(macosx):
   proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool =
     metal_kv_append_enc_c(k, v, kAll, vAll, cint(hkv), cint(d), cint(maxSeq), cint(pos)) != 0
 
+  proc metal_session_end_async_c(): cint {.importc: "metal_session_end_async", header: "metal_shim.h".}
+  proc metal_session_wait_oldest_c(): cint {.importc: "metal_session_wait_oldest", header: "metal_shim.h".}
+  proc metal_token_ring_get_c(h: MetalBufferHandle, slot: cint): cint
+      {.importc: "metal_token_ring_get", header: "metal_shim.h".}
+  proc metal_token_ring_set_c(h: MetalBufferHandle, slot, value: cint)
+      {.importc: "metal_token_ring_set", header: "metal_shim.h".}
+  proc metal_embed_token_enc_c(table, ring, o: MetalBufferHandle, dim, slot: cint): cint
+      {.importc: "metal_embed_token_enc", header: "metal_shim.h".}
+  proc metal_argmax_token_enc_c(logits, ring: MetalBufferHandle, n, slot: cint): cint
+      {.importc: "metal_argmax_token_enc", header: "metal_shim.h".}
+  proc metalSessionEndAsync*(): bool = metal_session_end_async_c() != 0
+  proc metalSessionWaitOldest*(): bool = metal_session_wait_oldest_c() != 0
+  proc metalTokenRingGet*(h: MetalBufferHandle, slot: int): int = int(metal_token_ring_get_c(h, cint(slot)))
+  proc metalTokenRingSet*(h: MetalBufferHandle, slot, value: int) =
+    metal_token_ring_set_c(h, cint(slot), cint(value))
+  proc metalSessionEmbedTokenEnc*(table, ring, o: MetalBufferHandle, dim, slot: int): bool =
+    metal_embed_token_enc_c(table, ring, o, cint(dim), cint(slot)) != 0
+  proc metalSessionArgmaxTokenEnc*(logits, ring: MetalBufferHandle, n, slot: int): bool =
+    metal_argmax_token_enc_c(logits, ring, cint(n), cint(slot)) != 0
+
   proc metal_prepare_q4_tuned_c(w, scales, zeros: MetalBufferHandle;
       k, n, groupSize, groupsPerRow, m, wqOffset: cint): cint
       {.importc: "metal_prepare_q4_tuned", header: "metal_shim.h".}
@@ -887,6 +907,12 @@ when not defined(macosx):
       wq, scales, zeros, outs: array[3, MetalBufferHandle], res: MetalBufferHandle,
       k, groupSize, groupsPerRow: int, n, wqOffset: array[3, int]): bool = false
   proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool = false
+  proc metalSessionEndAsync*(): bool = false
+  proc metalSessionWaitOldest*(): bool = false
+  proc metalTokenRingGet*(h: MetalBufferHandle, slot: int): int = 0
+  proc metalTokenRingSet*(h: MetalBufferHandle, slot, value: int) = discard
+  proc metalSessionEmbedTokenEnc*(table, ring, o: MetalBufferHandle, dim, slot: int): bool = false
+  proc metalSessionArgmaxTokenEnc*(logits, ring: MetalBufferHandle, n, slot: int): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, srcOffsetElems, dstOffsetElems, n: int): bool = false
   proc metalSessionCopyIntoEnc*(src, dst: MetalBufferHandle, dstOffsetElems, n: int): bool = false
   proc metalSessionSoftmaxEnc*(x, y: MetalBufferHandle, rows, cols: int): bool = false
