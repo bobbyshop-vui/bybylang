@@ -189,3 +189,94 @@ kernel void matmul_q4_mm_sg2(
         }
     }
 }
+
+// 64 x 64 output tile per threadgroup for long prompts: four simdgroups (2 x 2) each own a
+// 32 x 32 block (4 x 4 simdgroup matrices), so every k step of 8 does 16 multiplies for 8
+// fragment loads, twice the ratio of the 16 x 16 blocks above. Same math, fp32 tiles.
+kernel void matmul_q4_mm_sg3(
+    device const float* a [[buffer(0)]],
+    device const uchar* wq [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    device const float* zeros [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant int& M [[buffer(5)]], constant int& K [[buffer(6)]],
+    constant int& N [[buffer(7)]], constant int& groupSize [[buffer(8)]],
+    constant int& groupsPerRow [[buffer(9)]],
+    constant uint& wqShift [[buffer(10)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]]) {
+    constexpr int BM = 64, BN = 64, BK = 32, LD = BK + 4;
+    threadgroup float Ts[2 * 64 * LD];
+    threadgroup float* Xs = Ts;
+    threadgroup float* Ws = Ts + 64 * LD;
+    const int m0 = int(tg.y) * BM, n0 = int(tg.x) * BN;
+    const int sm = int(sgid) / 2, sn = int(sgid) % 2;
+    const uint rowBytes = uint(K) / 2;
+
+    simdgroup_float8x8 acc[4][4];
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        for (int t = 0; t < 2; ++t) {
+            const int idx = int(lid) + t * 128;
+            const int r = idx / 4, c = (idx % 4) * 8;
+            const int gk = k0 + c;
+            {
+                const int gm = m0 + r;
+                float4 v0 = float4(0), v1 = float4(0);
+                if (gk < K && gm < M) {
+                    device const float4* src = (device const float4*)(a + gm * K + gk);
+                    v0 = src[0]; v1 = src[1];
+                }
+                threadgroup float4* dst = (threadgroup float4*)(Xs + r * LD + c);
+                dst[0] = v0; dst[1] = v1;
+            }
+            {
+                const int n = n0 + r;
+                float w[8];
+                for (int u = 0; u < 8; ++u) w[u] = 0;
+                if (gk < K && n < N) {
+                    device const uint* word = (device const uint*)(wq + uint(n) * rowBytes + uint(gk) / 2);
+                    const uint p = wqShift == 0 ? word[0] :
+                        (word[0] >> (8 * wqShift)) | (word[1] << (32 - 8 * wqShift));
+                    const int gi = n * groupsPerRow + (groupSize > 0 ? gk / groupSize : 0);
+                    const float sc = scales[gi], zp = zeros[gi];
+                    for (int u = 0; u < 8; ++u)
+                        w[u] = (float((p >> (4 * u)) & 15u) - zp) * sc;
+                }
+                for (int u = 0; u < 8; ++u) Ws[r * LD + c + u] = w[u];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < BK / 8; ++kk) {
+            simdgroup_float8x8 af[4], bf[4];
+            for (int i = 0; i < 4; ++i)
+                simdgroup_load(af[i], Xs + (sm * 32 + i * 8) * LD + kk * 8, LD);
+            for (int j = 0; j < 4; ++j)
+                simdgroup_load(bf[j], Ws + (sn * 32 + j * 8) * LD + kk * 8, LD, ulong2(0, 0), true);
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (m0 + BM <= M && n0 + BN <= N) {
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                simdgroup_store(acc[i][j],
+                    out + (m0 + sm * 32 + i * 8) * N + n0 + sn * 32 + j * 8, ulong(N));
+    } else {
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j)
+                simdgroup_store(acc[i][j], Ts + (sm * 32 + i * 8) * BN + sn * 32 + j * 8, ulong(BN));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int idx = int(lid); idx < BM * BN; idx += 128) {
+            const int r = idx / BN, c = idx % BN;
+            if (m0 + r < M && n0 + c < N) out[(m0 + r) * N + n0 + c] = Ts[r * BN + c];
+        }
+    }
+}

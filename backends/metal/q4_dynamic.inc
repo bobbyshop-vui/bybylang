@@ -15,7 +15,7 @@ static NSMutableDictionary<NSString *, BBQ4Plan *> *gQ4Kernels;
 static BOOL gQ4Tuning = NO;
 
 static NSString *q4PlanKey(int k, int n, int group, int groups, int m) {
-    return [NSString stringWithFormat:@"%d_%d_g%d_%d_m%d", k, n, group, groups, m == 1 ? 1 : 8];
+    return [NSString stringWithFormat:@"%d_%d_g%d_%d_m%d", k, n, group, groups, m == 1 ? 1 : (m >= 128 ? 128 : 8)];
 }
 
 static BOOL q4TunedEnabled(void) {
@@ -127,6 +127,32 @@ static BBQ4Plan *q4MakeMm2Plan(uint32_t bn, uint32_t bk) {
     return plan;
 }
 
+// 64 x 64 tile GEMM (matmul_q4_mm_sg3) for long prompts.
+static BBQ4Plan *q4MakeMm3Plan(void) {
+    static id<MTLLibrary> lib = nil;
+    static BOOL tried = NO;
+    static BBQ4Plan *plan = nil;
+    if (tried) return plan;
+    tried = YES;
+    BOOL apple = NO;
+    if (@available(macOS 10.15, *)) apple = gDevice && [gDevice supportsFamily:MTLGPUFamilyApple7];
+    if (!gQ4SgSource || !apple || getenv("BYBY_Q4_NO_SG") || getenv("BYBY_Q4_NO_MM3")) return nil;
+    NSError *error = nil;
+    lib = [gDevice newLibraryWithSource:[NSString stringWithUTF8String:gQ4SgSource] options:nil error:&error];
+    if (!lib) { NSLog(@"[q4-sg] mm3 library compile failed: %@", error); return nil; }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"matmul_q4_mm_sg3"];
+    if (!fn) return nil;
+    id<MTLComputePipelineState> pso = bbNewPSO(fn, &error);
+    if (!pso || pso.maxTotalThreadsPerThreadgroup < 128) {
+        NSLog(@"[q4-sg] mm3 pipeline failed: %@", error);
+        return nil;
+    }
+    plan = [BBQ4Plan new];
+    plan.pipeline = pso; plan.threads = 128; plan.rows = 64; plan.batch = 64; plan.mm = YES;
+    plan.label = @"mm-sg64x64";
+    return plan;
+}
+
 // One simdgroup per `rows` output rows, `sgs` simdgroups per threadgroup (M=1);
 // packs/load/pre pick how a thread reads its weights (see q4v_* in the kernel).
 static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows, uint32_t packs,
@@ -195,7 +221,73 @@ static int q4EncodeSelected(MetalBufferHandle a, MetalBufferHandle w,
         int m, int k, int n, int group, int groups, int wqOffset) {
     if (gQ4Tuning || !q4TunedEnabled()) return 0;
     BBQ4Plan *plan = gQ4Plans[q4PlanKey(k, n, group, groups, m)];
+    if (!plan && m >= 128) plan = gQ4Plans[q4PlanKey(k, n, group, groups, 32)];   // no long-prompt tuning
     return q4EncodePlan(plan, a, w, scale, zero, out, m, k, n, group, groups, wqOffset);
+}
+
+// Long prompts (M >= 128): picks the fastest simdgroup GEMM tile for this shape, checked
+// against the 32 x 32 kernel, which was itself checked against the legacy kernel.
+static int q4TuneLarge(MetalBufferHandle w, MetalBufferHandle scale, MetalBufferHandle zero,
+        int k, int n, int group, int groups, int wqOffset, int m, NSString *key) {
+    BBQ4Plan *ref = q4MakeMmPlan();
+    if (!ref || group <= 0 || group % 32 != 0 || n > 16384) return 0;
+    NSMutableArray<BBQ4Plan *> *plans = [NSMutableArray arrayWithObject:ref];
+    BBQ4Plan *p3 = q4MakeMm3Plan();
+    if (p3) [plans addObject:p3];
+    for (uint32_t bn = 32; bn <= 64; bn *= 2)
+        for (uint32_t bk = 32; bk <= 64; bk *= 2) {
+            if (group % bk) continue;
+            BBQ4Plan *q = q4MakeMm2Plan(bn, bk);
+            if (q) [plans addObject:q];
+        }
+    if (plans.count == 1) { gQ4Plans[key] = ref; return 1; }
+    id<MTLBuffer> input = [gDevice newBufferWithLength:(NSUInteger)m * k * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> output = [gDevice newBufferWithLength:(NSUInteger)m * n * 4 options:MTLResourceStorageModeShared];
+    if (!input || !output) return 0;
+    for (NSUInteger i = 0; i < (NSUInteger)m * k; ++i)
+        ((float*)input.contents)[i] = ((int)((i * 17) % 101) - 50) / 64.0f;
+    MetalBufferHandle hIn = (__bridge MetalBufferHandle)input;
+    MetalBufferHandle hOut = (__bridge MetalBufferHandle)output;
+    gQ4Tuning = YES;
+    @try {
+        double (^run)(BBQ4Plan *) = ^double(BBQ4Plan *p) {
+            if (!metal_session_begin(NULL, NULL)) return INFINITY;
+            int encoded = q4EncodePlan(p, hIn, w, scale, zero, hOut, m, k, n, group, groups, wqOffset);
+            const double gpu0 = metal_session_gpu_seconds();
+            int ended = metal_session_end();
+            if (!encoded || !ended) return INFINITY;
+            return (metal_session_gpu_seconds() - gpu0) * 1000;
+        };
+        if (!isfinite(run(ref))) return 0;
+        NSData *reference = [NSData dataWithBytes:output.contents length:(NSUInteger)m * n * 4];
+        const float *rf = reference.bytes;
+        NSMutableArray<BBQ4Plan *> *valid = [NSMutableArray arrayWithObject:ref];
+        for (NSUInteger i = 1; i < plans.count; ++i) {
+            if (!isfinite(run(plans[i]))) continue;
+            float err = 0, mag = 0;
+            const float *v = output.contents;
+            BOOL finite = YES;
+            for (NSUInteger j = 0; j < (NSUInteger)m * n; ++j) {
+                if (!isfinite(v[j])) { finite = NO; break; }
+                err = fmaxf(err, fabsf(v[j] - rf[j])); mag = fmaxf(mag, fabsf(rf[j]));
+            }
+            if (finite && err <= fmaxf(1e-5f, mag * 1e-4f)) [valid addObject:plans[i]];
+            else if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-tune]   %@ rejected: err %g mag %g", plans[i].label, err, mag);
+        }
+        BBQ4Plan *best = ref;
+        double bestMs = INFINITY;
+        for (BBQ4Plan *p in valid) {
+            double ms = INFINITY;
+            for (int rep = 0; rep < 4; ++rep) ms = fmin(ms, run(p));
+            if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-tune]   M=%d %@ %.3fms", m, p.label, ms);
+            if (ms < bestMs * 0.97) { bestMs = ms; best = p; }
+        }
+        gQ4Plans[key] = best;
+        const double flops = 2.0 * m * (double)k * n;
+        NSLog(@"[q4-tune] %dx%d M=%d: %@ %.3fms = %.2f TFLOPs", k, n, m, best.label, bestMs,
+              flops / (bestMs * 1e-3) / 1e12);
+        return 1;
+    } @finally { gQ4Tuning = NO; }
 }
 
 int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
@@ -213,9 +305,10 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
             scales.length < (NSUInteger)n * groups * 4 ||
             zeros.length < (NSUInteger)n * groups * 4) return 0;
         if (!gQ4Plans) gQ4Plans = [NSMutableDictionary new];
-        const int m = mode == 1 ? 1 : 32;
+        const int m = mode == 1 ? 1 : (mode >= 128 ? 256 : 32);
         NSString *key = q4PlanKey(k, n, group, groups, m);
         if (gQ4Plans[key]) return 1;
+        if (m >= 128) return q4TuneLarge(w, scale, zero, k, n, group, groups, wqOffset, m, key);
         BBQ4Plan *baseline = [BBQ4Plan new];
         baseline.legacy = YES; baseline.label = @"legacy";
         NSMutableArray<BBQ4Plan *> *plans = [NSMutableArray arrayWithObject:baseline];
