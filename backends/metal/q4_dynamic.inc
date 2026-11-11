@@ -98,6 +98,9 @@ static BBQ4Plan *q4MakeMm2Plan(uint32_t bn, uint32_t bk) {
             if (!lib) NSLog(@"[q4-sg] library compile failed: %@", error);
         }
         cache = [NSMutableDictionary new];
+        if (getenv("BYBY_Q4_TUNE_LOG"))
+            NSLog(@"[q4-sg] mm2 library %s (source %s, apple %d)", lib ? "ready" : "missing",
+                  gQ4SgSource ? "set" : "NULL", (int)apple);
     }
     if (!lib) return nil;
     NSString *key = [NSString stringWithFormat:@"mm2_%u_%u", bn, bk];
@@ -108,9 +111,15 @@ static BBQ4Plan *q4MakeMm2Plan(uint32_t bn, uint32_t bk) {
     [constants setConstantValue:&bk type:MTLDataTypeUInt atIndex:131];
     NSError *error = nil;
     id<MTLFunction> fn = [lib newFunctionWithName:@"matmul_q4_mm_sg2" constantValues:constants error:&error];
-    if (!fn) return nil;
+    if (!fn) {
+        if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-sg] mm2 %ux%u function failed: %@", bn, bk, error);
+        return nil;
+    }
     id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
-    if (!pso || pso.maxTotalThreadsPerThreadgroup < bn * 4) return nil;
+    if (!pso || pso.maxTotalThreadsPerThreadgroup < bn * 4) {
+        if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-sg] mm2 %ux%u pipeline failed: %@", bn, bk, error);
+        return nil;
+    }
     BBQ4Plan *plan = [BBQ4Plan new];
     plan.pipeline = pso; plan.threads = bn * 4; plan.rows = bn; plan.batch = 32; plan.mm = YES;
     plan.label = [NSString stringWithFormat:@"mm-sg32x%u-k%u", bn, bk];
