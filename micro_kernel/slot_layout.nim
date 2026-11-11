@@ -21,7 +21,7 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
     case op
     of OP_LOAD_F32, OP_U_LOAD_F32, OP_LOAD_F32_IDX:
       result.reads.incl "mem"
-    of OP_STORE_F32, OP_U_STORE_F32, OP_STORE_F32_IDX:
+    of OP_STORE_F32, OP_U_STORE_F32, OP_STORE_F32_IDX, OP_MM_STORE_MEM:
       result.writes.incl "mem"
     of OP_U_ATOMIC_ADD:
       result.reads.incl "mem"; result.writes.incl "mem"
@@ -38,7 +38,8 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
        OP_U_CONST, OP_U_ADDK, OP_U_MULK, OP_U_ANDK, OP_U_SHRK, OP_U_SHLK,
        OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_CONSTF, OP_U_LOAD_IN,
        OP_U_LOAD_IN4, OP_U_STORE_F32, OP_U_LOAD_F32, OP_U_ATOMIC_ADD,
-       OP_U_LOAD_META, OP_GRID_BARRIER, OP_GRID_EPILOGUE: extra = 1
+       OP_U_LOAD_META, OP_GRID_BARRIER, OP_GRID_EPILOGUE,
+       OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM: extra = 1
     of OP_VTG_BEGIN: extra = 2
     of OP_NOP, OP_HALT, OP_LOAD_F32_IDX, OP_STORE_F32_IDX, OP_LOAD_LID,
        OP_LOAD_TGID, OP_ADD, OP_MUL, OP_SUB, OP_EXP, OP_NEG, OP_SIGMOID,
@@ -46,7 +47,8 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
        OP_BARRIER_TG, OP_CMP_LT, OP_IF_BEGIN, OP_IF_END, OP_U_TGID, OP_U_LID,
        OP_U_ADD, OP_U_MUL, OP_U_SHR, OP_U_TO_R, OP_R_TO_U, OP_BASE_F32,
        OP_BASE_U8, OP_BASE_LUT, OP_BASE_IN, OP_VTG_END, OP_LOAD_VACT,
-       OP_SIMD_SUM, OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID: discard
+       OP_SIMD_SUM, OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID,
+       OP_MM_ZERO, OP_MM_MAC: discard
     else: raise newException(ValueError, "unknown VM opcode 0x" & toHex(op, 2))
     if pc+extra > words.len: raise newException(ValueError, "truncated recorded VM instruction")
     case op

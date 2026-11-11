@@ -89,6 +89,11 @@ const
   OP_SIMD_LANE*    = 0xA1'u32   # U[a] = thread_index_in_simdgroup
   OP_SIMD_ID*      = 0xA2'u32   # U[a] = simdgroup_index_in_threadgroup
   OP_SIMD_W*       = 0xA3'u32   # U[a] = threads_per_simdgroup
+  OP_MM_ZERO*      = 0xA5'u32   # MM[a] = 8x8 float simdgroup matrix of zeros
+  OP_MM_LOAD*      = 0xA6'u32   # MM[a] = simdgroup_load(tgF32 + U[b], ld = next word, transpose = c)
+  OP_MM_MAC*       = 0xA7'u32   # MM[a] = MM[b] * MM[c] + MM[a]
+  OP_MM_STORE_TG*  = 0xA8'u32   # simdgroup_store(MM[a], tgF32 + U[b], ld = next word)
+  OP_MM_STORE_MEM* = 0xA9'u32   # simdgroup_store(MM[a], memF32 + U[b], ld = next word)
   OP_SIMD_GID*     = 0xA4'u32   # U[a] = global thread id / threads_per_simdgroup (grid-wide simdgroup index)
   OP_GRID_EPILOGUE* = 0x9C'u32  # next word = ctrl index; the last TG resets the counter, copies err -> lastErr
 
@@ -236,12 +241,20 @@ proc opHasWord*(op: uint32): bool {.inline.} =
      OP_ADD_CONST, OP_MUL_CONST, OP_TG_LOAD_F32, OP_TG_STORE_F32,
      OP_U_CONST, OP_U_ADDK, OP_U_MULK, OP_U_ANDK, OP_U_SHRK, OP_U_SHLK,
      OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_CONSTF, OP_U_LOAD_IN, OP_U_LOAD_IN4, OP_U_STORE_F32,
-     OP_U_LOAD_F32, OP_U_ATOMIC_ADD: true
+     OP_U_LOAD_F32, OP_U_ATOMIC_ADD, OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM: true
   else: false
 
 proc emitSimdSum*(p: var VmProgram; rd, rs: uint32) = p.emit pack2(OP_SIMD_SUM, rd, rs)
 proc emitSimdLane*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_LANE, ud)
 proc emitSimdId*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_ID, ud)
+proc emitMmZero*(p: var VmProgram; ma: uint32) = p.emit pack1(OP_MM_ZERO, ma)
+proc emitMmLoad*(p: var VmProgram; ma, ub, transpose, ld: uint32) =
+  p.emit pack3(OP_MM_LOAD, ma, ub, transpose); p.emit ld
+proc emitMmMac*(p: var VmProgram; ma, mb, mc: uint32) = p.emit pack3(OP_MM_MAC, ma, mb, mc)
+proc emitMmStoreTg*(p: var VmProgram; ma, ub, ld: uint32) =
+  p.emit pack2(OP_MM_STORE_TG, ma, ub); p.emit ld
+proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) =
+  p.emit pack2(OP_MM_STORE_MEM, ma, ub); p.emit ld
 proc emitSimdW*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_W, ud)
 proc emitSimdGid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_GID, ud)
 proc emitUTgid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_TGID, ud)

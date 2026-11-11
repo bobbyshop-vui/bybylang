@@ -40,7 +40,8 @@ enum {
     OP_VTG_BEGIN = 0x99, OP_VTG_END = 0x9A, OP_LOAD_VACT = 0x9B,
     OP_GRID_EPILOGUE = 0x9C, OP_U_LOAD_U32 = 0x9D, OP_U_LOAD_IN4 = 0x9E,
     OP_SIMD_SUM = 0xA0, OP_SIMD_LANE = 0xA1, OP_SIMD_ID = 0xA2,
-    OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4
+    OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4,
+    OP_MM_ZERO = 0xA5, OP_MM_LOAD = 0xA6, OP_MM_MAC = 0xA7, OP_MM_STORE_TG = 0xA8, OP_MM_STORE_MEM = 0xA9
 };
 
 typedef struct {
@@ -59,6 +60,7 @@ typedef struct {
     int wait_tg, wait_grid;
     int wait_simd;     /* destination register + 1 while waiting in OP_SIMD_SUM, else 0 */
     float simd_val;
+    float (*mm)[64];   /* simdgroup matrices, allocated on first use; every lane keeps its own replica */
 } VmThread;
 
 static inline uint32_t op_of(uint32_t w) { return w & 0xFFu; }
@@ -77,6 +79,7 @@ static int extra_words(uint32_t op) {
     case OP_U_SHRK: case OP_U_SHLK: case OP_U_LOAD_U8: case OP_U_LOAD_U32:
     case OP_U_LOAD_CONSTF: case OP_U_LOAD_IN: case OP_U_LOAD_IN4: case OP_U_STORE_F32:
     case OP_U_LOAD_F32: case OP_U_ATOMIC_ADD: case OP_U_LOAD_META:
+    case OP_MM_LOAD: case OP_MM_STORE_TG: case OP_MM_STORE_MEM:
     case OP_GRID_BARRIER: case OP_GRID_EPILOGUE:
         return 1;
     case OP_VTG_BEGIN:
@@ -321,6 +324,46 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 t->r[a] = t->r[b] < t->r[c] ? 1.0f : 0.0f;
                 break;
             case OP_SIMD_LANE: t->u[a] = (uint32_t)lid % 32u; break;
+            case OP_MM_ZERO:
+            case OP_MM_LOAD:
+            case OP_MM_MAC:
+            case OP_MM_STORE_TG:
+            case OP_MM_STORE_MEM: {
+                if (!t->mm) t->mm = (float (*)[64])calloc(32, 64 * sizeof(float));
+                if (!t->mm) { snprintf(err, (size_t)err_len, "CPU VM out of memory"); result = -1; goto done; }
+                if (op == OP_MM_ZERO) { memset(t->mm[a], 0, 64 * sizeof(float)); break; }
+                if (op == OP_MM_MAC) {
+                    float acc[64];
+                    for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) {
+                        float sum = t->mm[a][i * 8 + j];
+                        for (int k2 = 0; k2 < 8; ++k2) sum += t->mm[b][i * 8 + k2] * t->mm[c][k2 * 8 + j];
+                        acc[i * 8 + j] = sum;
+                    }
+                    memcpy(t->mm[a], acc, sizeof(acc));
+                    break;
+                }
+                if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
+                uint32_t ld = code[npc++];
+                int64_t base = (int64_t)t->u[b];
+                if (op == OP_MM_LOAD) {
+                    for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) {
+                        int64_t idx = c ? base + (int64_t)j * ld + i : base + (int64_t)i * ld + j;
+                        t->mm[a][i * 8 + j] = (tgp && idx >= 0 && idx < tg_floats) ? tgp[idx] : 0.0f;
+                    }
+                } else if (op == OP_MM_STORE_TG) {
+                    for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) {
+                        int64_t idx = base + (int64_t)i * ld + j;
+                        if (tgp && idx >= 0 && idx < tg_floats) tgp[idx] = t->mm[a][i * 8 + j];
+                    }
+                } else {
+                    for (int i = 0; i < 8; ++i) for (int j = 0; j < 8; ++j) {
+                        int64_t idx = base + (int64_t)i * ld + j + (int64_t)t->base_f32;
+                        if (!check_idx(idx, mem_len, "mm_store", err, err_len)) { result = -1; goto done; }
+                        mem[idx] = t->mm[a][i * 8 + j];
+                    }
+                }
+                break;
+            }
             case OP_SIMD_W: t->u[a] = 32u; break;
             case OP_SIMD_GID: t->u[a] = (uint32_t)tid / 32u; break;
             case OP_SIMD_ID: t->u[a] = (uint32_t)lid / 32u; break;
@@ -490,6 +533,7 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
     }
     goto done;
 done:
+    for (int i = 0; i < n_threads; ++i) free(threads[i].mm);
     free(threads);
     free(tg);
     return result;

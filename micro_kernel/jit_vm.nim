@@ -73,7 +73,7 @@ proc initJitCache*(cfg = defaultJitConfig()): JitCache =
 type LowerState = object
   body: seq[string]
   pc, loopDepth, indent: int
-  usesU, usesIn, usesSimd: bool
+  usesU, usesIn, usesSimd, usesMm: bool
   glsl: bool
   ctrlBuf: bool         ## grid control words live in their own buffer (slot 5), selected by the 0xFFFFFFFF sentinel
   od: bool              ## uses one-dispatch ops (persistent kernel) -> the kernel has its own prologue
@@ -99,6 +99,7 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   if op == OP_SIMD_SUM or op == OP_SIMD_LANE or op == OP_SIMD_ID: st.usesSimd = true
   if op in [OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID]: st.usesU = true
   if op == OP_SIMD_W or op == OP_SIMD_GID: st.usesSimd = true
+  if op >= OP_MM_ZERO and op <= OP_MM_STORE_MEM: st.usesMm = true; st.usesU = true
   case op
   of OP_NOP:
     discard
@@ -237,6 +238,19 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     st.body.add st.ind() & (if st.glsl: &"U[{a}] = gl_SubgroupSize;" else: &"U[{a}] = simdW;")
   of OP_SIMD_GID:
     st.body.add st.ind() & (if st.glsl: &"U[{a}] = tid / gl_SubgroupSize;" else: &"U[{a}] = tid / simdW;")
+  of OP_MM_ZERO:
+    st.body.add st.ind() & (if st.glsl: "// simdgroup matrix ops are Metal only" else: &"MM[{a}] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);")
+  of OP_MM_LOAD:
+    let ld = st.imm(p)
+    st.body.add st.ind() & (if st.glsl: "// simdgroup matrix ops are Metal only" else: &"simdgroup_load(MM[{a}], tgF32 + U[{b}], {ld}, ulong2(0, 0), {(if c != 0: \"true\" else: \"false\")});")
+  of OP_MM_MAC:
+    st.body.add st.ind() & (if st.glsl: "// simdgroup matrix ops are Metal only" else: &"simdgroup_multiply_accumulate(MM[{a}], MM[{b}], MM[{c}], MM[{a}]);")
+  of OP_MM_STORE_TG:
+    let ld = st.imm(p)
+    st.body.add st.ind() & (if st.glsl: "// simdgroup matrix ops are Metal only" else: &"simdgroup_store(MM[{a}], tgF32 + U[{b}], {ld});")
+  of OP_MM_STORE_MEM:
+    let ld = st.imm(p)
+    st.body.add st.ind() & (if st.glsl: "// simdgroup matrix ops are Metal only" else: &"simdgroup_store(MM[{a}], memF32 + U[{b}], ulong({ld}));")
   of OP_U_TGID:
     st.body.add st.ind() & &"U[{a}] = tgid;"
   of OP_U_LID:
@@ -512,12 +526,13 @@ kernel void """ & kernelName & """(
   let uDecl = if st.usesU:
       @["  uint U[32];", "  for (int i=0;i<32;++i) U[i]=0u;"]
     else: newSeq[string]()
+  let mmDecl = if st.usesMm: @["  simdgroup_float8x8 MM[16];"] else: newSeq[string]()
   let lines = @["  float R[32];",
                 "  for (int i=0;i<32;++i) R[i]=0.f;",
-                "  R[0] = (float)tid;"] & uDecl & st.body
+                "  R[0] = (float)tid;"] & uDecl & mmDecl & st.body
   result = """
 #include <metal_stdlib>
-using namespace metal;
+""" & (if st.usesMm: "#include <metal_simdgroup_matrix>\n" else: "") & """using namespace metal;
 
 // Auto-JIT from bytecode — do not edit
 kernel void """ & kernelName & """(
