@@ -209,25 +209,28 @@ kernel void matmul_q4_simd(
 // HAS_RES adds res[n] to the result (residual epilogue for o_proj / down_proj).
 constant uint q4f_mode [[function_constant(120)]];
 constant uint q4f_res [[function_constant(121)]];
+constant uint q4f_half [[function_constant(124)]];   // 1: scales/zeros are fp16
 constant uint q4f_norm [[function_constant(123)]];   // 1: `a` is the raw vector, RMSNorm folded in
 
 // One step of row n: its packs at column k, scaled by their group, added to acc.
-static inline float q4f_row(device const uchar* wq, device const float* sc,
-        device const float* zr, uint n, uint rowBytes, uint gpr, uint k, uint g,
+static inline float q4f_row(device const uchar* wq, device const uchar* sc,
+        device const uchar* zr, uint n, uint rowBytes, uint gpr, uint k, uint g,
         uint shift, Q4Act act, float acc) {
     const float d = q4v_rowdot(wq + n * rowBytes + k / 2, shift, act);
     const uint gi = n * gpr + g;
-    return fma(sc[gi], d - zr[gi] * act.sum, acc);
+    const float s = q4f_half != 0 ? float(((device const half*)sc)[gi]) : ((device const float*)sc)[gi];
+    const float z = q4f_half != 0 ? float(((device const half*)zr)[gi]) : ((device const float*)zr)[gi];
+    return fma(s, d - z * act.sum, acc);
 }
 
 kernel void matmul_q4_fused(
     device const float* a [[buffer(0)]],
     device const uchar* wq0 [[buffer(1)]], device const uchar* wq1 [[buffer(2)]],
     device const uchar* wq2 [[buffer(3)]],
-    device const float* sc0 [[buffer(4)]], device const float* sc1 [[buffer(5)]],
-    device const float* sc2 [[buffer(6)]],
-    device const float* zr0 [[buffer(7)]], device const float* zr1 [[buffer(8)]],
-    device const float* zr2 [[buffer(9)]],
+    device const uchar* sc0 [[buffer(4)]], device const uchar* sc1 [[buffer(5)]],
+    device const uchar* sc2 [[buffer(6)]],
+    device const uchar* zr0 [[buffer(7)]], device const uchar* zr1 [[buffer(8)]],
+    device const uchar* zr2 [[buffer(9)]],
     device float* out0 [[buffer(10)]], device float* out1 [[buffer(11)]],
     device float* out2 [[buffer(12)]],
     device const float* res [[buffer(13)]],
@@ -242,7 +245,7 @@ kernel void matmul_q4_fused(
     uint lane [[thread_index_in_simdgroup]],
     uint simdW [[threads_per_simdgroup]]) {
     const uint row0 = (tg * 2 + sgid) * 4;
-    device const uchar* wqA = wq0; device const float* scA = sc0; device const float* zrA = zr0;
+    device const uchar* wqA = wq0; device const uchar* scA = sc0; device const uchar* zrA = zr0;
     device float* outA = out0; uint shA = sh.x; uint base = 0;
     if (q4f_mode == 0) {
         if (row0 >= nn.x + nn.y + nn.z) return;
@@ -298,6 +301,11 @@ kernel void kv_append_kernel(
     const uint dst = h * maxSeq * D + pos * D + d;
     kAll[dst] = k[i];
     vAll[dst] = v[i];
+}
+
+kernel void f32_to_f16_kernel(device const float* in [[buffer(0)]], device half* out [[buffer(1)]],
+                              uint i [[thread_position_in_grid]]) {
+    out[i] = half(in[i]);
 }
 
 // RoPE(Q) + Q scale + RoPE(K) + KV append in one dispatch (decode, one token).

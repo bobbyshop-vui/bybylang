@@ -1551,16 +1551,17 @@ int metal_rope_kv_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBufferHandl
 // mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.
 // res may be NULL. Returns 0 when the shape/kernel is unsupported.
 static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRes, uint32_t packs,
-        uint32_t load, uint32_t pre, uint32_t norm) {
+        uint32_t load, uint32_t pre, uint32_t norm, uint32_t half16) {
     static NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *cache;
     if (!cache) cache = [NSMutableDictionary new];
-    NSNumber *key = @(((((mode * 2 + hasRes) * 8 + packs) * 4 + load) * 2 + pre) * 2 + norm);
+    NSNumber *key = @((((((mode * 2 + hasRes) * 8 + packs) * 4 + load) * 2 + pre) * 2 + norm) * 2 + half16);
     if (cache[key]) return cache[key] == (id)[NSNull null] ? nil : cache[key];
     cache[key] = (id)[NSNull null];   // a pipeline that cannot be used is not built again
     MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
     [constants setConstantValue:&mode type:MTLDataTypeUInt atIndex:120];
     [constants setConstantValue:&hasRes type:MTLDataTypeUInt atIndex:121];
     [constants setConstantValue:&norm type:MTLDataTypeUInt atIndex:123];
+    [constants setConstantValue:&half16 type:MTLDataTypeUInt atIndex:124];
     [constants setConstantValue:&packs type:MTLDataTypeUInt atIndex:112];
     [constants setConstantValue:&load type:MTLDataTypeUInt atIndex:113];
     [constants setConstantValue:&pre type:MTLDataTypeUInt atIndex:114];
@@ -1574,6 +1575,28 @@ static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRe
     if (!pso || pso.maxTotalThreadsPerThreadgroup < 2 * pso.threadExecutionWidth) return nil;
     cache[key] = pso;
     return pso;
+}
+
+// fp16 copy of an fp32 buffer (Q4 scales/zeros for the decode kernels: half the bytes).
+// Made on first use inside the open session, kept for the life of the source buffer.
+static id<MTLBuffer> q4HalfCopy(id<MTLBuffer> src) {
+    static NSMutableDictionary<NSNumber *, NSArray *> *cache;
+    if (!cache) cache = [NSMutableDictionary new];
+    NSNumber *key = @((uintptr_t)(__bridge void *)src);
+    NSArray *hit = cache[key];
+    if (hit) return hit[1];
+    id<MTLComputePipelineState> pso = getPipeline(@"f32_to_f16_kernel");
+    if (!pso) return nil;
+    const NSUInteger count = src.length / 4;
+    id<MTLBuffer> dst = [gDevice newBufferWithLength:count * 2 options:MTLResourceStorageModeShared];
+    if (!dst) return nil;
+    [gSessionEncoder setComputePipelineState:pso];
+    [gSessionEncoder setBuffer:src offset:0 atIndex:0];
+    [gSessionEncoder setBuffer:dst offset:0 atIndex:1];
+    [gSessionEncoder dispatchThreads:MTLSizeMake(count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup), 1, 1)];
+    cache[key] = @[src, dst];   // holding src keeps its address from being reused
+    return dst;
 }
 
 int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
@@ -1606,8 +1629,20 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
             normEnv = !(v && v[0] == '0');
         }
         if (gamma && !normEnv) return 0;
+        static int halfEnv = -1;
+        if (halfEnv < 0) {
+            const char *v = getenv("BYBY_Q4_FP16");
+            halfEnv = !(v && v[0] == '0');
+        }
+        id<MTLBuffer> hs[3] = {nil, nil, nil}, hz[3] = {nil, nil, nil};
+        uint32_t useHalf = halfEnv ? 1 : 0;
+        for (int i = 0; i < used && useHalf; ++i) {
+            hs[i] = q4HalfCopy((__bridge id<MTLBuffer>)scales[i]);
+            hz[i] = q4HalfCopy((__bridge id<MTLBuffer>)zeros[i]);
+            if (!hs[i] || !hz[i]) useHalf = 0;
+        }
         id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs, load, pre,
-                                                          gamma ? 1 : 0);
+                                                          gamma ? 1 : 0, useHalf);
         if (!pso) return 0;
         uint32_t nn[4] = {(uint32_t)n[0], (uint32_t)(used > 1 && mode == 0 ? n[1] : 0),
                           (uint32_t)(used > 2 ? n[2] : 0), 0};
@@ -1619,8 +1654,8 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
             sh[i] = i < used ? (uint32_t)(wqOffset[j] & 3) : 0;
             [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)wq[j]
                 offset:(NSUInteger)(wqOffset[j] & ~3) atIndex:1 + i];
-            [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)scales[j] offset:0 atIndex:4 + i];
-            [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)zeros[j] offset:0 atIndex:7 + i];
+            [gSessionEncoder setBuffer:useHalf ? hs[j] : (__bridge id<MTLBuffer>)scales[j] offset:0 atIndex:4 + i];
+            [gSessionEncoder setBuffer:useHalf ? hz[j] : (__bridge id<MTLBuffer>)zeros[j] offset:0 atIndex:7 + i];
             [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)out[j] offset:0 atIndex:10 + i];
         }
         [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)(res ? res : out[0]) offset:0 atIndex:13];
