@@ -1881,7 +1881,10 @@ proc generateNimCode(tokens: seq[Token], outFile: string) =
     if t.sym == "other" and (t.text == "traceback" or t.text.startsWith("traceback ")):
       usesTraceback = true
   let stackFlags = if usesTraceback: " --stackTrace:on --lineTrace:on" else: ""
-  let cmd = "nim c -d:release --hints:off --colors:off" & stackFlags & " --path:" & quoteShell(getAppDir()) &
+  # BYBYLANG_NIM_FLAGS adds Nim options (for example a cross-compile: --cpu:arm64 --passC:"-arch arm64").
+  let extraFlags = getEnv("BYBYLANG_NIM_FLAGS").strip()
+  let cmd = "nim c -d:release --hints:off --colors:off" & stackFlags &
+    (if extraFlags.len > 0: " " & extraFlags else: "") & " --path:" & quoteShell(getAppDir()) &
     nimcacheArg & " -o:" & quoteShell(outFile) & " " & quoteShell(nimFile)
   traceInfo("Compiling with: " & cmd)
   let res = execCmdEx(cmd)
