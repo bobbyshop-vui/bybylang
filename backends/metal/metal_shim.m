@@ -1577,25 +1577,26 @@ static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRe
     return pso;
 }
 
-// fp16 copy of an fp32 buffer (Q4 scales/zeros for the decode kernels: half the bytes).
-// Made on first use inside the open session, kept for the life of the source buffer.
-static id<MTLBuffer> q4HalfCopy(id<MTLBuffer> src) {
+// (scale, zero) of every group as one fp16 pair (4 bytes instead of 8) for the decode kernels.
+// Made on first use inside the open session, kept for the life of the source buffers.
+static id<MTLBuffer> q4HalfPair(id<MTLBuffer> scales, id<MTLBuffer> zeros) {
     static NSMutableDictionary<NSNumber *, NSArray *> *cache;
     if (!cache) cache = [NSMutableDictionary new];
-    NSNumber *key = @((uintptr_t)(__bridge void *)src);
+    NSNumber *key = @((uintptr_t)(__bridge void *)scales);
     NSArray *hit = cache[key];
-    if (hit) return hit[1];
-    id<MTLComputePipelineState> pso = getPipeline(@"f32_to_f16_kernel");
+    if (hit && hit[1] == zeros) return hit[2];
+    id<MTLComputePipelineState> pso = getPipeline(@"pack_scale_zero_f16_kernel");
     if (!pso) return nil;
-    const NSUInteger count = src.length / 4;
-    id<MTLBuffer> dst = [gDevice newBufferWithLength:count * 2 options:MTLResourceStorageModeShared];
+    const NSUInteger count = MIN(scales.length, zeros.length) / 4;
+    id<MTLBuffer> dst = [gDevice newBufferWithLength:count * 4 options:MTLResourceStorageModeShared];
     if (!dst) return nil;
     [gSessionEncoder setComputePipelineState:pso];
-    [gSessionEncoder setBuffer:src offset:0 atIndex:0];
-    [gSessionEncoder setBuffer:dst offset:0 atIndex:1];
+    [gSessionEncoder setBuffer:scales offset:0 atIndex:0];
+    [gSessionEncoder setBuffer:zeros offset:0 atIndex:1];
+    [gSessionEncoder setBuffer:dst offset:0 atIndex:2];
     [gSessionEncoder dispatchThreads:MTLSizeMake(count, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup), 1, 1)];
-    cache[key] = @[src, dst];   // holding src keeps its address from being reused
+    cache[key] = @[scales, zeros, dst];   // holding the sources keeps their addresses from being reused
     return dst;
 }
 
@@ -1634,12 +1635,11 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
             const char *v = getenv("BYBY_Q4_FP16");
             halfEnv = !(v && v[0] == '0');
         }
-        id<MTLBuffer> hs[3] = {nil, nil, nil}, hz[3] = {nil, nil, nil};
+        id<MTLBuffer> hs[3] = {nil, nil, nil};
         uint32_t useHalf = halfEnv ? 1 : 0;
         for (int i = 0; i < used && useHalf; ++i) {
-            hs[i] = q4HalfCopy((__bridge id<MTLBuffer>)scales[i]);
-            hz[i] = q4HalfCopy((__bridge id<MTLBuffer>)zeros[i]);
-            if (!hs[i] || !hz[i]) useHalf = 0;
+            hs[i] = q4HalfPair((__bridge id<MTLBuffer>)scales[i], (__bridge id<MTLBuffer>)zeros[i]);
+            if (!hs[i]) useHalf = 0;
         }
         id<MTLComputePipelineState> pso = q4FusedPipeline((uint32_t)mode, res ? 1 : 0, packs, load, pre,
                                                           gamma ? 1 : 0, useHalf);
@@ -1655,7 +1655,7 @@ int metal_matmul_q4_fused_enc(int mode, MetalBufferHandle a,
             [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)wq[j]
                 offset:(NSUInteger)(wqOffset[j] & ~3) atIndex:1 + i];
             [gSessionEncoder setBuffer:useHalf ? hs[j] : (__bridge id<MTLBuffer>)scales[j] offset:0 atIndex:4 + i];
-            [gSessionEncoder setBuffer:useHalf ? hz[j] : (__bridge id<MTLBuffer>)zeros[j] offset:0 atIndex:7 + i];
+            [gSessionEncoder setBuffer:useHalf ? hs[j] : (__bridge id<MTLBuffer>)zeros[j] offset:0 atIndex:7 + i];
             [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)out[j] offset:0 atIndex:10 + i];
         }
         [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)(res ? res : out[0]) offset:0 atIndex:13];

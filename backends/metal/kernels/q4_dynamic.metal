@@ -218,8 +218,13 @@ static inline float q4f_row(device const uchar* wq, device const uchar* sc,
         uint shift, Q4Act act, float acc) {
     const float d = q4v_rowdot(wq + n * rowBytes + k / 2, shift, act);
     const uint gi = n * gpr + g;
-    const float s = q4f_half != 0 ? float(((device const half*)sc)[gi]) : ((device const float*)sc)[gi];
-    const float z = q4f_half != 0 ? float(((device const half*)zr)[gi]) : ((device const float*)zr)[gi];
+    float s, z;
+    if (q4f_half != 0) {   // `sc` holds the (scale, zero) fp16 pair of the group: one 4-byte load
+        const half2 sz = ((device const half2*)sc)[gi];
+        s = float(sz.x); z = float(sz.y);
+    } else {
+        s = ((device const float*)sc)[gi]; z = ((device const float*)zr)[gi];
+    }
     return fma(s, d - z * act.sum, acc);
 }
 
@@ -303,9 +308,12 @@ kernel void kv_append_kernel(
     vAll[dst] = v[i];
 }
 
-kernel void f32_to_f16_kernel(device const float* in [[buffer(0)]], device half* out [[buffer(1)]],
-                              uint i [[thread_position_in_grid]]) {
-    out[i] = half(in[i]);
+// Interleaves the fp32 scale and zero of every group into one half2 (scale, zero).
+kernel void pack_scale_zero_f16_kernel(device const float* scales [[buffer(0)]],
+                                       device const float* zeros [[buffer(1)]],
+                                       device half2* out [[buffer(2)]],
+                                       uint i [[thread_position_in_grid]]) {
+    out[i] = half2(half(scales[i]), half(zeros[i]));
 }
 
 // RoPE(Q) + Q scale + RoPE(K) + KV append in one dispatch (decode, one token).
