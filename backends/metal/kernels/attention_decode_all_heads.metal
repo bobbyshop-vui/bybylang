@@ -34,10 +34,11 @@
 
 #define ATTN_ALL_TG 128
 
-kernel void attention_decode_all_heads_kernel(
+template <typename KV>
+kernel void attention_decode_all_heads_t(
     device const float* Qbuf        [[buffer(0)]],   // [H*D]
-    device const float* Kbuf        [[buffer(1)]],   // [HKV*maxSeqLen*D]
-    device const float* Vbuf        [[buffer(2)]],   // [HKV*maxSeqLen*D]
+    device const KV*    Kbuf        [[buffer(1)]],   // [HKV*maxSeqLen*D]
+    device const KV*    Vbuf        [[buffer(2)]],   // [HKV*maxSeqLen*D]
     device float*       Obuf        [[buffer(3)]],   // [H*D]
     constant int&       H           [[buffer(4)]],
     constant int&       HKV         [[buffer(5)]],
@@ -55,16 +56,16 @@ kernel void attention_decode_all_heads_kernel(
     if (hkv >= HKV) hkv = HKV - 1;   // guard against an uneven split (should not happen when H%HKV==0)
 
     device const float* q    = Qbuf + uint(headIdx) * uint(D);
-    device const float* kBase = Kbuf + uint(hkv) * uint(maxSeqLen) * uint(D);
-    device const float* vBase = Vbuf + uint(hkv) * uint(maxSeqLen) * uint(D);
+    device const KV*    kBase = Kbuf + uint(hkv) * uint(maxSeqLen) * uint(D);
+    device const KV*    vBase = Vbuf + uint(hkv) * uint(maxSeqLen) * uint(D);
     device float*       out  = Obuf + uint(headIdx) * uint(D);
 
     // ---- Pha 1: scores[s] = dot(Q, K[s]) cho s = tid, tid+TG, tid+2*TG, ... ----
     for (uint s = tid; s < uint(S); s += ATTN_ALL_TG) {
-        device const float* k = kBase + s * uint(D);
+        device const KV* k = kBase + s * uint(D);
         float dot = 0.0f;
         for (int d = 0; d < D; d++) {
-            dot += q[d] * k[d];
+            dot += q[d] * float(k[d]);
         }
         scores[s] = dot;
     }
@@ -109,8 +110,10 @@ kernel void attention_decode_all_heads_kernel(
     for (int d = int(tid); d < D; d += ATTN_ALL_TG) {
         float acc = 0.0f;
         for (uint s = 0; s < uint(S); s++) {
-            acc += scores[s] * vBase[s * uint(D) + uint(d)];
+            acc += scores[s] * float(vBase[s * uint(D) + uint(d)]);
         }
         out[d] = acc * invSum;
     }
 }
+template [[host_name("attention_decode_all_heads_kernel")]] kernel decltype(attention_decode_all_heads_t<float>) attention_decode_all_heads_t<float>;
+template [[host_name("attention_decode_all_heads_kernel_h")]] kernel decltype(attention_decode_all_heads_t<half>) attention_decode_all_heads_t<half>;

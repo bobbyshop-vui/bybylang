@@ -436,6 +436,7 @@ int metal_graph_begin(int maxSeqLen);
 int metal_graph_end(void);
 int metal_graph_ready(void);
 void metal_graph_reset(void);
+void metal_set_kv_fp16(int on);
 int metal_graph_run(int pos, int seq, int slotIn, int slotOut);
 
 int metal_device_max_tg_threads(void);

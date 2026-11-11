@@ -1552,8 +1552,8 @@ enum { BBDynPos = 1, BBDynSeq = 2, BBDynSlotIn = 3, BBDynSlotOut = 4 };
     NSString *name = _pso.label;
     int kind = 0;
     if (len == 4 && name) {
-        if ([name isEqualToString:@"attention_decode_all_heads_kernel"] && i == 7) kind = BBDynSeq;
-        else if ([name isEqualToString:@"rope_kv_kernel"] && i == 8) kind = BBDynPos;
+        if ([name hasPrefix:@"attention_decode_all_heads_kernel"] && i == 7) kind = BBDynSeq;
+        else if ([name hasPrefix:@"rope_kv_kernel"] && i == 8) kind = BBDynPos;
         else if ([name isEqualToString:@"embed_token_kernel"] && i == 4) kind = BBDynSlotIn;
         else if ([name isEqualToString:@"argmax_token_kernel"] && i == 3) kind = BBDynSlotOut;
     }
@@ -1563,7 +1563,7 @@ enum { BBDynPos = 1, BBDynSeq = 2, BBDynSlotIn = 3, BBDynSlotOut = 4 };
     if (i >= 4) { gGraphRecordFailed = YES; return; }
     // The attention kernel keeps its scores in threadgroup memory sized by the sequence
     // length; a replayed command has one fixed size, so it gets the capacity.
-    if ([_pso.label isEqualToString:@"attention_decode_all_heads_kernel"] && i == 0) len = _tgCap;
+    if ([_pso.label hasPrefix:@"attention_decode_all_heads_kernel"] && i == 0) len = _tgCap;
     _tgLen[i] = len;
 }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope { }
@@ -1589,6 +1589,11 @@ static BBRecEncoder *gGraphRec = nil;           // being recorded
 static id<MTLComputeCommandEncoder> gGraphRealEncoder = nil;
 
 void metal_graph_reset(void) { gGraph = nil; }
+
+// fp16 KV cache: the K/V buffers hold half values; the *_h kernels read/write them.
+static int gKvFp16 = 0;
+void metal_set_kv_fp16(int on) { gKvFp16 = on != 0; }
+static NSString *kvKernel(NSString *base) { return gKvFp16 ? [base stringByAppendingString:@"_h"] : base; }
 
 // Starts recording into the open session; the encode functions that follow go to the graph.
 int metal_graph_begin(int maxSeqLen) {
@@ -1695,7 +1700,7 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
         MetalBufferHandle vAll, int hkv, int d, int maxSeq, int pos) {
     @autoreleasepool {
         if (!gSessionEncoder) return 0;
-        id<MTLComputePipelineState> pso = getPipeline(@"kv_append_kernel");
+        id<MTLComputePipelineState> pso = getPipeline(kvKernel(@"kv_append_kernel"));
         if (!pso) return 0;
         uint32_t D = (uint32_t)d, ms = (uint32_t)maxSeq, p = (uint32_t)pos;
         [gSessionEncoder setComputePipelineState:pso];
@@ -1723,7 +1728,7 @@ int metal_rope_kv_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBufferHandl
         static int on = -1;
         if (on < 0) { const char *e = getenv("BYBY_FUSE_ROPE"); on = !(e && e[0] == '0'); }
         if (!on) return 0;
-        id<MTLComputePipelineState> pso = getPipeline(@"rope_kv_kernel");
+        id<MTLComputePipelineState> pso = getPipeline(kvKernel(@"rope_kv_kernel"));
         if (!pso) return 0;
         uint32_t dims[4] = {(uint32_t)h, (uint32_t)hkv, (uint32_t)d, (uint32_t)maxSeq};
         uint32_t p = (uint32_t)pos;
@@ -2410,7 +2415,7 @@ int metal_attention_decode_all_heads_enc(MetalBufferHandle q, MetalBufferHandle 
                                           int H, int HKV, int D, int S, int maxSeqLen) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_attention_decode_all_heads_enc] metal_session_begin not called"); return 0; }
-        id<MTLComputePipelineState> pipeline = getPipeline(@"attention_decode_all_heads_kernel");
+        id<MTLComputePipelineState> pipeline = getPipeline(kvKernel(@"attention_decode_all_heads_kernel"));
         if (!pipeline) return 0;
         id<MTLBuffer> bufQ = (__bridge id<MTLBuffer>)q;
         id<MTLBuffer> bufK = (__bridge id<MTLBuffer>)kAll;
@@ -2456,8 +2461,8 @@ int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAl
         const char *flashMode = getenv("BYBY_FLASH_ATTENTION");
         id<MTLComputePipelineState> pipeline =
             (flashMode && strcmp(flashMode, "scalar") == 0) ? nil :
-            getPipeline(@"attention_prefill_flash_fp16_kernel");
-        if (!pipeline) pipeline = getPipeline(@"attention_prefill_flash_kernel");
+            getPipeline(kvKernel(@"attention_prefill_flash_fp16_kernel"));
+        if (!pipeline && !gKvFp16) pipeline = getPipeline(@"attention_prefill_flash_kernel");   // fp32 cache only
         if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) return 0;
         MetalFlashParams params = { (uint32_t)T, (uint32_t)H, (uint32_t)HKV, (uint32_t)D,
                                     (uint32_t)pos, (uint32_t)maxSeqLen, scale * 1.4426950408889634f };
@@ -2478,7 +2483,7 @@ int metal_attention_prefill_flash_enc(MetalBufferHandle q, MetalBufferHandle kAl
 int metal_attention_prefill_flash_fp16_supported(void) {
     const char *flashMode = getenv("BYBY_FLASH_ATTENTION");
     return !(flashMode && strcmp(flashMode, "scalar") == 0) &&
-        getPipeline(@"attention_prefill_flash_fp16_kernel") != nil;
+        getPipeline(kvKernel(@"attention_prefill_flash_fp16_kernel")) != nil;
 }
 
 int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, int HKV, int D,
@@ -2486,7 +2491,7 @@ int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, in
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_kv_scatter_enc] metal_session_begin not called"); return 0; }
         if (T <= 0 || pos < 0 || pos + T > maxSeqLen) return 0;
-        id<MTLComputePipelineState> pipeline = getPipeline(@"kv_cache_scatter_kernel");
+        id<MTLComputePipelineState> pipeline = getPipeline(kvKernel(@"kv_cache_scatter_kernel"));
         if (!pipeline) return 0;
         MetalKvScatterParams params = { (uint32_t)T, (uint32_t)HKV, (uint32_t)D, (uint32_t)pos,
                                         (uint32_t)maxSeqLen };

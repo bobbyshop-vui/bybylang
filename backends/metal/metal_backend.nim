@@ -722,6 +722,8 @@ when defined(macosx):
   proc metal_graph_end_c(): cint {.importc: "metal_graph_end", header: "metal_shim.h".}
   proc metal_graph_ready_c(): cint {.importc: "metal_graph_ready", header: "metal_shim.h".}
   proc metal_graph_reset_c() {.importc: "metal_graph_reset", header: "metal_shim.h".}
+  proc metal_set_kv_fp16_c(on: cint) {.importc: "metal_set_kv_fp16", header: "metal_shim.h".}
+  proc metalSetKvFp16*(on: bool) = metal_set_kv_fp16_c(cint(on))
   proc metal_graph_run_c(pos, seq, slotIn, slotOut: cint): cint {.importc: "metal_graph_run", header: "metal_shim.h".}
   proc metalGraphBegin*(maxSeqLen: int): bool = metal_graph_begin_c(cint(maxSeqLen)) != 0
   proc metalGraphEnd*(): bool = metal_graph_end_c() != 0
@@ -931,6 +933,7 @@ when not defined(macosx):
   proc metalGraphEnd*(): bool = false
   proc metalGraphReady*(): bool = false
   proc metalGraphReset*() = discard
+  proc metalSetKvFp16*(on: bool) = discard
   proc metalGraphRun*(pos, seq, slotIn, slotOut: int): bool = false
   proc metalSessionRopeKvEnc*(q, k, v, cs, sn, kAll, vAll: MetalBufferHandle,
       h, hkv, d, maxSeq, pos: int, scale: float32): bool = false

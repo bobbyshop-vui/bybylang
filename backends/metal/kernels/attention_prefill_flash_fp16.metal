@@ -24,10 +24,11 @@ struct FlashFp16Params {
     float scaleLog2;
 };
 
-kernel void attention_prefill_flash_fp16_kernel(
+template <typename KV>
+kernel void attention_prefill_flash_fp16_t(
     device const float* q        [[buffer(0)]],
-    device const float* kc       [[buffer(1)]],
-    device const float* vc       [[buffer(2)]],
+    device const KV* kc          [[buffer(1)]],
+    device const KV* vc          [[buffer(2)]],
     device float* o              [[buffer(3)]],
     constant FlashFp16Params& p      [[buffer(4)]],
     uint3 tg                     [[threadgroup_position_in_grid]],
@@ -69,8 +70,8 @@ kernel void attention_prefill_flash_fp16_kernel(
             uint d = i - j * D;
             uint key = kb + j;
             bool ok = key < kvLen;
-            ks[j * (FA16_MAXD + 1u) + d] = half(ok ? kc[kvBase + key * D + d] : 0.0f);
-            vs[j * FA16_MAXD + d] = half(ok ? vc[kvBase + key * D + d] : 0.0f);
+            ks[j * (FA16_MAXD + 1u) + d] = half(ok ? float(kc[kvBase + key * D + d]) : 0.0f);
+            vs[j * FA16_MAXD + d] = half(ok ? float(vc[kvBase + key * D + d]) : 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -127,3 +128,5 @@ kernel void attention_prefill_flash_fp16_kernel(
     }
 }
 
+template [[host_name("attention_prefill_flash_fp16_kernel")]] kernel decltype(attention_prefill_flash_fp16_t<float>) attention_prefill_flash_fp16_t<float>;
+template [[host_name("attention_prefill_flash_fp16_kernel_h")]] kernel decltype(attention_prefill_flash_fp16_t<half>) attention_prefill_flash_fp16_t<half>;

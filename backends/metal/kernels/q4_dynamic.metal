@@ -296,17 +296,20 @@ kernel void matmul_q4_fused(
 
 // Appends one decode token's K and V (HKV heads x D) into the combined KV
 // caches laid out as [head][maxSeq][D].
-kernel void kv_append_kernel(
+template <typename KV>
+kernel void kv_append_t(
     device const float* k [[buffer(0)]], device const float* v [[buffer(1)]],
-    device float* kAll [[buffer(2)]], device float* vAll [[buffer(3)]],
+    device KV* kAll [[buffer(2)]], device KV* vAll [[buffer(3)]],
     constant uint& D [[buffer(4)]], constant uint& maxSeq [[buffer(5)]],
     constant uint& pos [[buffer(6)]],
     uint i [[thread_position_in_grid]]) {
     const uint h = i / D, d = i % D;
     const uint dst = h * maxSeq * D + pos * D + d;
-    kAll[dst] = k[i];
-    vAll[dst] = v[i];
+    kAll[dst] = KV(k[i]);
+    vAll[dst] = KV(v[i]);
 }
+template [[host_name("kv_append_kernel")]] kernel decltype(kv_append_t<float>) kv_append_t<float>;
+template [[host_name("kv_append_kernel_h")]] kernel decltype(kv_append_t<half>) kv_append_t<half>;
 
 // Interleaves the fp32 scale and zero of every group into one half2 (scale, zero).
 kernel void pack_scale_zero_f16_kernel(device const float* scales [[buffer(0)]],
@@ -319,10 +322,11 @@ kernel void pack_scale_zero_f16_kernel(device const float* scales [[buffer(0)]],
 // RoPE(Q) + Q scale + RoPE(K) + KV append in one dispatch (decode, one token).
 // Threads [0, H*half) rotate Q in place and scale it, the next HKV*half rotate K straight into
 // the cache row, the last HKV*D copy V into the cache row.
-kernel void rope_kv_kernel(
+template <typename KV>
+kernel void rope_kv_t(
     device float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
     device const float* csTab [[buffer(3)]], device const float* snTab [[buffer(4)]],   // [maxSeq][D/2]
-    device float* kAll [[buffer(5)]], device float* vAll [[buffer(6)]],
+    device KV* kAll [[buffer(5)]], device KV* vAll [[buffer(6)]],
     constant uint4& dims [[buffer(7)]],     // H, HKV, D, maxSeq
     constant uint& pos [[buffer(8)]], constant float& scale [[buffer(9)]],
     uint t [[thread_position_in_grid]]) {
@@ -341,17 +345,19 @@ kernel void rope_kv_kernel(
     if (t < HKV * half_) {
         const uint h = t / half_, i = t % half_;
         const float x1 = k[h * D + i], x2 = k[h * D + i + half_], c = cs[i], s = sn[i];
-        device float* dst = kAll + h * maxSeq * D + pos * D;
-        dst[i] = x1 * c - x2 * s;
-        dst[i + half_] = x2 * c + x1 * s;
+        device KV* dst = kAll + h * maxSeq * D + pos * D;
+        dst[i] = KV(x1 * c - x2 * s);
+        dst[i + half_] = KV(x2 * c + x1 * s);
         return;
     }
     t -= HKV * half_;
     if (t < HKV * D) {
         const uint h = t / D, d = t % D;
-        vAll[h * maxSeq * D + pos * D + d] = v[t];
+        vAll[h * maxSeq * D + pos * D + d] = KV(v[t]);
     }
 }
+template [[host_name("rope_kv_kernel")]] kernel decltype(rope_kv_t<float>) rope_kv_t<float>;
+template [[host_name("rope_kv_kernel_h")]] kernel decltype(rope_kv_t<half>) rope_kv_t<half>;
 
 // ---- Pipelined decode: the next token is chosen on the GPU ----
 // ring[] holds token ids. A step reads its input token from one slot and

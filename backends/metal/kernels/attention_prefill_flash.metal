@@ -130,9 +130,10 @@ struct KvScatterParams {
 };
 
 // src [T, HKV, D] (the K or V projection) -> dst [HKV, maxSeqLen, D] at pos.
-kernel void kv_cache_scatter_kernel(
+template <typename KV>
+kernel void kv_cache_scatter_t(
     device const float* src      [[buffer(0)]],
-    device float* dst            [[buffer(1)]],
+    device KV* dst               [[buffer(1)]],
     constant KvScatterParams& p  [[buffer(2)]],
     uint i                       [[thread_position_in_grid]])
 {
@@ -142,5 +143,8 @@ kernel void kv_cache_scatter_kernel(
     uint th = i / p.D;
     uint h = th % p.HKV;
     uint t = th / p.HKV;
-    dst[(h * p.maxSeqLen + p.pos + t) * p.D + d] = src[i];
+    dst[(h * p.maxSeqLen + p.pos + t) * p.D + d] = KV(src[i]);
 }
+template [[host_name("kv_cache_scatter_kernel")]] kernel decltype(kv_cache_scatter_t<float>) kv_cache_scatter_t<float>;
+template [[host_name("kv_cache_scatter_kernel_h")]] kernel decltype(kv_cache_scatter_t<half>) kv_cache_scatter_t<half>;
+

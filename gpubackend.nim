@@ -2906,6 +2906,12 @@ proc sessionGraphReady*(backend: GpuBackend): bool =
       return metalGraphReady()
   false
 
+proc sessionSetKvFp16*(backend: GpuBackend, on: bool) =
+  ## Metal: the KV caches handed to the KV/attention kernels hold fp16 (set before the first use).
+  when defined(macosx):
+    if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
+      metalSetKvFp16(on)
+
 proc sessionGraphReset*(backend: GpuBackend) =
   when defined(macosx):
     if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
