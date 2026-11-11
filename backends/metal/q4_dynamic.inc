@@ -81,6 +81,43 @@ static BBQ4Plan *q4MakeMmPlan(void) {
     return plan;
 }
 
+// Configurable-tile variant of the prefill GEMM (matmul_q4_mm_sg2): bn output columns and
+// bk k-values per step.
+static BBQ4Plan *q4MakeMm2Plan(uint32_t bn, uint32_t bk) {
+    static id<MTLLibrary> lib = nil;
+    static BOOL tried = NO;
+    static NSMutableDictionary<NSString *, BBQ4Plan *> *cache = nil;
+    if (!tried) {
+        tried = YES;
+        BOOL apple = NO;
+        if (@available(macOS 10.15, *)) apple = gDevice && [gDevice supportsFamily:MTLGPUFamilyApple7];
+        if (gQ4SgSource && apple && !getenv("BYBY_Q4_NO_SG") && !getenv("BYBY_Q4_NO_MM2")) {
+            NSError *error = nil;
+            lib = [gDevice newLibraryWithSource:[NSString stringWithUTF8String:gQ4SgSource]
+                options:nil error:&error];
+            if (!lib) NSLog(@"[q4-sg] library compile failed: %@", error);
+        }
+        cache = [NSMutableDictionary new];
+    }
+    if (!lib) return nil;
+    NSString *key = [NSString stringWithFormat:@"mm2_%u_%u", bn, bk];
+    if (cache[key]) return cache[key] == (id)[NSNull null] ? nil : cache[key];
+    cache[key] = (BBQ4Plan *)[NSNull null];
+    MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+    [constants setConstantValue:&bn type:MTLDataTypeUInt atIndex:130];
+    [constants setConstantValue:&bk type:MTLDataTypeUInt atIndex:131];
+    NSError *error = nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:@"matmul_q4_mm_sg2" constantValues:constants error:&error];
+    if (!fn) return nil;
+    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    if (!pso || pso.maxTotalThreadsPerThreadgroup < bn * 4) return nil;
+    BBQ4Plan *plan = [BBQ4Plan new];
+    plan.pipeline = pso; plan.threads = bn * 4; plan.rows = bn; plan.batch = 32; plan.mm = YES;
+    plan.label = [NSString stringWithFormat:@"mm-sg32x%u-k%u", bn, bk];
+    cache[key] = plan;
+    return plan;
+}
+
 // One simdgroup per `rows` output rows, `sgs` simdgroups per threadgroup (M=1);
 // packs/load/pre pick how a thread reads its weights (see q4v_* in the kernel).
 static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows, uint32_t packs,
@@ -187,6 +224,12 @@ int metal_prepare_q4_tuned(MetalBufferHandle w, MetalBufferHandle scale,
         if (m > 1 && group > 0 && group % 32 == 0) {
             BBQ4Plan *p = q4MakeMmPlan();
             if (p) [plans addObject:p];
+            for (uint32_t bn = 32; bn <= 64; bn *= 2)
+                for (uint32_t bk = 32; bk <= 64; bk *= 2) {
+                    if (group % bk) continue;
+                    BBQ4Plan *q = q4MakeMm2Plan(bn, bk);
+                    if (q) [plans addObject:q];
+                }
         }
         if (m > 1) {
             for (NSUInteger tg = 32; tg <= 64; tg *= 2) {
