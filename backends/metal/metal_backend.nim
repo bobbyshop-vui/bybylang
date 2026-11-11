@@ -718,6 +718,17 @@ when defined(macosx):
       addr outs[0], res, cint(k), cint(groupSize), cint(groupsPerRow),
       addr nn[0], addr off[0], gamma, cfloat(eps)) != 0
 
+  proc metal_graph_begin_c(maxSeqLen: cint): cint {.importc: "metal_graph_begin", header: "metal_shim.h".}
+  proc metal_graph_end_c(): cint {.importc: "metal_graph_end", header: "metal_shim.h".}
+  proc metal_graph_ready_c(): cint {.importc: "metal_graph_ready", header: "metal_shim.h".}
+  proc metal_graph_reset_c() {.importc: "metal_graph_reset", header: "metal_shim.h".}
+  proc metal_graph_run_c(pos, seq, slotIn, slotOut: cint): cint {.importc: "metal_graph_run", header: "metal_shim.h".}
+  proc metalGraphBegin*(maxSeqLen: int): bool = metal_graph_begin_c(cint(maxSeqLen)) != 0
+  proc metalGraphEnd*(): bool = metal_graph_end_c() != 0
+  proc metalGraphReady*(): bool = metal_graph_ready_c() != 0
+  proc metalGraphReset*() = metal_graph_reset_c()
+  proc metalGraphRun*(pos, seq, slotIn, slotOut: int): bool =
+    metal_graph_run_c(cint(pos), cint(seq), cint(slotIn), cint(slotOut)) != 0
   proc metal_rope_kv_enc_c(q, k, v, cs, sn, kAll, vAll: MetalBufferHandle,
       h, hkv, d, maxSeq, pos: cint, scale: cfloat): cint
       {.importc: "metal_rope_kv_enc", header: "metal_shim.h".}
@@ -916,6 +927,11 @@ when not defined(macosx):
       wq, scales, zeros, outs: array[3, MetalBufferHandle], res: MetalBufferHandle,
       k, groupSize, groupsPerRow: int, n, wqOffset: array[3, int],
       gamma: MetalBufferHandle = nil, eps: float32 = 0): bool = false
+  proc metalGraphBegin*(maxSeqLen: int): bool = false
+  proc metalGraphEnd*(): bool = false
+  proc metalGraphReady*(): bool = false
+  proc metalGraphReset*() = discard
+  proc metalGraphRun*(pos, seq, slotIn, slotOut: int): bool = false
   proc metalSessionRopeKvEnc*(q, k, v, cs, sn, kAll, vAll: MetalBufferHandle,
       h, hkv, d, maxSeq, pos: int, scale: float32): bool = false
   proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool = false

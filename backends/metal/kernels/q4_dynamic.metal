@@ -321,12 +321,14 @@ kernel void pack_scale_zero_f16_kernel(device const float* scales [[buffer(0)]],
 // the cache row, the last HKV*D copy V into the cache row.
 kernel void rope_kv_kernel(
     device float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
-    device const float* cs [[buffer(3)]], device const float* sn [[buffer(4)]],
+    device const float* csTab [[buffer(3)]], device const float* snTab [[buffer(4)]],   // [maxSeq][D/2]
     device float* kAll [[buffer(5)]], device float* vAll [[buffer(6)]],
     constant uint4& dims [[buffer(7)]],     // H, HKV, D, maxSeq
     constant uint& pos [[buffer(8)]], constant float& scale [[buffer(9)]],
     uint t [[thread_position_in_grid]]) {
     const uint H = dims.x, HKV = dims.y, D = dims.z, maxSeq = dims.w, half_ = D / 2;
+    device const float* cs = csTab + pos * half_;
+    device const float* sn = snTab + pos * half_;
     if (t < H * half_) {
         const uint h = t / half_, i = t % half_;
         device float* p = q + h * D;

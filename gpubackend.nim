@@ -2885,6 +2885,39 @@ proc sessionRopeKvEnc*(backend: GpuBackend, q, k, v, cosT, sinT, kAll, vAll: Ses
   else:
     return false
 
+proc sessionGraphBegin*(backend: GpuBackend, maxSeqLen: int): bool =
+  ## Starts recording the encode calls that follow (in the open session) into a replayable
+  ## graph instead of the command buffer. Metal only.
+  when defined(macosx):
+    if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
+      return metalGraphBegin(maxSeqLen)
+  false
+
+proc sessionGraphEnd*(backend: GpuBackend): bool =
+  ## Ends the recording; false when it cannot be replayed (nothing is kept).
+  when defined(macosx):
+    if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
+      return metalGraphEnd()
+  false
+
+proc sessionGraphReady*(backend: GpuBackend): bool =
+  when defined(macosx):
+    if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
+      return metalGraphReady()
+  false
+
+proc sessionGraphReset*(backend: GpuBackend) =
+  when defined(macosx):
+    if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
+      metalGraphReset()
+
+proc sessionGraphRun*(backend: GpuBackend, pos, seq, slotIn, slotOut: int): bool =
+  ## Replays the recorded graph in the open session for the token at `pos`.
+  when defined(macosx):
+    if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
+      return metalGraphRun(pos, seq, slotIn, slotOut)
+  false
+
 proc sessionEndAsync*(backend: GpuBackend): bool =
   ## Commits the open session without waiting (Metal only). Pair with sessionWaitOldest.
   var chosen = backend

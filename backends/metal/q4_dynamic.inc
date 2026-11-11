@@ -37,7 +37,7 @@ static BBQ4Plan *q4MakePlan(NSUInteger tg, NSUInteger rows, NSUInteger batch) {
     id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_dynamic"
         constantValues:constants error:&error];
     if (!fn) return nil;
-    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pso = bbNewPSO(fn, &error);
     if (!pso || tg > pso.maxTotalThreadsPerThreadgroup ||
         pso.staticThreadgroupMemoryLength + tg * rows * batch * sizeof(float) >
             gDevice.maxThreadgroupMemoryLength) return nil;
@@ -72,7 +72,7 @@ static BBQ4Plan *q4MakeMmPlan(void) {
     if (compileOnly) { NSLog(@"[q4-sg] library compiled (compile check only)"); return nil; }
     id<MTLFunction> fn = [lib newFunctionWithName:@"matmul_q4_mm_sg"];
     if (!fn) return nil;
-    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pso = bbNewPSO(fn, &error);
     if (!pso || pso.maxTotalThreadsPerThreadgroup < 128) return nil;
     plan = [BBQ4Plan new];
     plan.pipeline = pso; plan.threads = 128; plan.rows = 32; plan.batch = 32; plan.mm = YES;
@@ -115,7 +115,7 @@ static BBQ4Plan *q4MakeMm2Plan(uint32_t bn, uint32_t bk) {
         if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-sg] mm2 %ux%u function failed: %@", bn, bk, error);
         return nil;
     }
-    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pso = bbNewPSO(fn, &error);
     if (!pso || pso.maxTotalThreadsPerThreadgroup < bn * 4) {
         if (getenv("BYBY_Q4_TUNE_LOG")) NSLog(@"[q4-sg] mm2 %ux%u pipeline failed: %@", bn, bk, error);
         return nil;
@@ -146,7 +146,7 @@ static BBQ4Plan *q4MakeSimdPlan(NSUInteger sgs, NSUInteger rows, uint32_t packs,
     id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_simd"
         constantValues:constants error:&error];
     if (!fn) return nil;
-    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pso = bbNewPSO(fn, &error);
     if (!pso) return nil;
     NSUInteger threads = sgs * pso.threadExecutionWidth;
     if (threads > pso.maxTotalThreadsPerThreadgroup) return nil;

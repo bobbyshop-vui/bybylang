@@ -431,6 +431,13 @@ int metal_enc_max_tg_threads(void);
 int metal_jit_compile(const char* source, const char* kernelName);
 
 
+/* Decode graph: record one token's dispatches into an indirect command buffer, replay it per token. */
+int metal_graph_begin(int maxSeqLen);
+int metal_graph_end(void);
+int metal_graph_ready(void);
+void metal_graph_reset(void);
+int metal_graph_run(int pos, int seq, int slotIn, int slotOut);
+
 int metal_device_max_tg_threads(void);
 int metal_device_max_tg_bytes(void);
 

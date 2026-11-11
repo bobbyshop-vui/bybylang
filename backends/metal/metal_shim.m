@@ -35,6 +35,24 @@
 // Global state, initialised once, alive until the process exits.
 // ─────────────────────────────────────────────────────────────
 static id<MTLDevice> gDevice = nil;
+
+// Command streams recorded once and replayed (see "Decode graph" below) need pipelines
+// created for indirect command buffers. BYBY_ICB=0 turns that off.
+static BOOL gGraphRecording = NO;      // a decode graph is being recorded
+static BOOL gGraphRecordFailed = NO;   // something recorded cannot be replayed
+static BOOL bbIcbEnabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("BYBY_ICB"); v = !(e && e[0] == '0'); }
+    return v && gDevice != nil;
+}
+static id<MTLComputePipelineState> bbNewPSO(id<MTLFunction> fn, NSError **err) {
+    MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
+    d.computeFunction = fn;
+    d.label = fn.name;
+    if (bbIcbEnabled()) d.supportIndirectCommandBuffers = YES;
+    return [gDevice newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
+                                               reflection:nil error:err];
+}
 static id<MTLBuffer> poolTake(size_t bytes, BOOL *recycled);
 static void sessionBarrier(void);
 static void residencyAdd(id<MTLBuffer> buf);
@@ -127,6 +145,8 @@ static id<MTLComputePipelineState> getPipeline(NSString *fname) {
     MTLComputePipelineDescriptor *pdesc = [MTLComputePipelineDescriptor new];
     pdesc.computeFunction = fn;
     pdesc.maxCallStackDepth = 32;
+    pdesc.label = fname;
+    if (bbIcbEnabled()) pdesc.supportIndirectCommandBuffers = YES;
     id<MTLComputePipelineState> pipeline =
         [gDevice newComputePipelineStateWithDescriptor:pdesc
                                                options:MTLPipelineOptionNone
@@ -884,6 +904,7 @@ MetalBufferHandle metal_upload(const float* data, int n) {
         // the first metal_matmul (exactly the resident-upload case at model load).
         if (!gDevice) { NSLog(@"[metal_upload] gDevice not initialised - call metal_init() first"); return NULL; }
         size_t bytes = (size_t)n * sizeof(float);
+        if (gGraphRecording) gGraphRecordFailed = YES;   // per-token data would be baked into the graph
         BOOL recycled = NO;
         id<MTLBuffer> buf = poolTake(bytes, &recycled);
         if (!buf) { NSLog(@"[metal_upload] tao buffer FAILED (n=%d)", n); return NULL; }
@@ -1007,6 +1028,8 @@ static BOOL poolEnabled(void) {
 static id<MTLBuffer> poolTake(size_t bytes, BOOL *recycled) {
     *recycled = NO;
     if (bytes == 0) return nil;
+    if (gGraphRecording)   // a recorded graph keeps its buffers: they never go back to the pool
+        return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     if (!poolEnabled() || bytes > BB_POOL_MAX_BYTES)
         return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     os_unfair_lock_lock(&gPoolLock);
@@ -1488,6 +1511,184 @@ MetalBufferHandle metal_upload_bytes_private(const unsigned char* data, int n) {
     @autoreleasepool { return metalUploadPrivateRaw((const void*)data, (size_t)n); }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Decode graph: one token's dispatches recorded once into an indirect command buffer and
+// replayed for every following token, so the CPU no longer encodes ~150 dispatches per token.
+//
+// Recording swaps gSessionEncoder for BBRecEncoder, which implements the few
+// MTLComputeCommandEncoder calls the encode functions use and writes them into the
+// buffer instead. setBytes data goes into an arena (a command can only bind buffers), and
+// the values that change per token (position, sequence length, token ring slots) are
+// remembered by kernel and argument index so metal_graph_run can rewrite them.
+// Scratch buffers made while recording are never recycled (poolTake), and every buffer a
+// command binds is retained here and made resident with useResources on each replay.
+enum { BBDynPos = 1, BBDynSeq = 2, BBDynSlotIn = 3, BBDynSlotOut = 4 };
+
+@interface BBRecEncoder : NSObject
+@property(nonatomic, strong) id<MTLIndirectCommandBuffer> icb;
+@property(nonatomic, strong) id<MTLBuffer> arena;
+@property(nonatomic, strong) NSMutableOrderedSet *resources;   // buffers bound by any command
+@property(nonatomic, strong) NSMutableArray *psos;
+@property(nonatomic, strong) NSMutableArray<NSArray *> *dyn;   // @[kind, arena offset]
+@property(nonatomic, strong) id<MTLComputePipelineState> pso;
+@property(nonatomic) NSUInteger arenaUsed, count, maxCommands, tgCap;
+@end
+
+@implementation BBRecEncoder {
+    id<MTLBuffer> _buf[31];
+    NSUInteger _off[31];
+    NSUInteger _tgLen[4];
+}
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)p { _pso = p; [_psos addObject:p]; }
+- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
+    if (i < 31) { _buf[i] = b; _off[i] = o; if (b) [_resources addObject:b]; }
+}
+- (void)setBytes:(const void *)bytes length:(NSUInteger)len atIndex:(NSUInteger)i {
+    const NSUInteger slot = (_arenaUsed + 255) & ~(NSUInteger)255;
+    if (i >= 31 || slot + len > _arena.length) { gGraphRecordFailed = YES; return; }
+    memcpy((char *)_arena.contents + slot, bytes, len);
+    _arenaUsed = slot + len;
+    _buf[i] = _arena; _off[i] = slot;
+    NSString *name = _pso.label;
+    int kind = 0;
+    if (len == 4 && name) {
+        if ([name isEqualToString:@"attention_decode_all_heads_kernel"] && i == 7) kind = BBDynSeq;
+        else if ([name isEqualToString:@"rope_kv_kernel"] && i == 8) kind = BBDynPos;
+        else if ([name isEqualToString:@"embed_token_kernel"] && i == 4) kind = BBDynSlotIn;
+        else if ([name isEqualToString:@"argmax_token_kernel"] && i == 3) kind = BBDynSlotOut;
+    }
+    if (kind) [_dyn addObject:@[@(kind), @(slot)]];
+}
+- (void)setThreadgroupMemoryLength:(NSUInteger)len atIndex:(NSUInteger)i {
+    if (i >= 4) { gGraphRecordFailed = YES; return; }
+    // The attention kernel keeps its scores in threadgroup memory sized by the sequence
+    // length; a replayed command has one fixed size, so it gets the capacity.
+    if ([_pso.label isEqualToString:@"attention_decode_all_heads_kernel"] && i == 0) len = _tgCap;
+    _tgLen[i] = len;
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope { }
+- (void)emit:(MTLSize)grid threads:(MTLSize)tpt exact:(BOOL)exact {
+    if (_count >= _maxCommands || !_pso) { gGraphRecordFailed = YES; return; }
+    id<MTLIndirectComputeCommand> cmd = [_icb indirectComputeCommandAtIndex:_count];
+    [cmd setComputePipelineState:_pso];
+    for (int i = 0; i < 31; ++i)
+        if (_buf[i]) [cmd setKernelBuffer:_buf[i] offset:_off[i] atIndex:i];
+    for (int i = 0; i < 4; ++i)
+        if (_tgLen[i]) [cmd setThreadgroupMemoryLength:_tgLen[i] atIndex:i];
+    if (_count > 0) [cmd setBarrier];
+    if (exact) [cmd concurrentDispatchThreadgroups:grid threadsPerThreadgroup:tpt];
+    else [cmd concurrentDispatchThreads:grid threadsPerThreadgroup:tpt];
+    ++_count;
+}
+- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self emit:g threads:t exact:YES]; }
+- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t { [self emit:g threads:t exact:NO]; }
+@end
+
+static BBRecEncoder *gGraph = nil;              // the recorded graph (nil: none)
+static BBRecEncoder *gGraphRec = nil;           // being recorded
+static id<MTLComputeCommandEncoder> gGraphRealEncoder = nil;
+
+void metal_graph_reset(void) { gGraph = nil; }
+
+// Starts recording into the open session; the encode functions that follow go to the graph.
+int metal_graph_begin(int maxSeqLen) {
+    @autoreleasepool {
+        if (!gSessionEncoder || gGraphRec || !bbIcbEnabled()) {
+            if (getenv("BYBY_GRAPH_LOG")) NSLog(@"[graph] cannot record (encoder %d, icb %d)", gSessionEncoder != nil, bbIcbEnabled());
+            return 0;
+        }
+        MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+        d.commandTypes = MTLIndirectCommandTypeConcurrentDispatch | MTLIndirectCommandTypeConcurrentDispatchThreads;
+        d.inheritPipelineState = NO;
+        d.inheritBuffers = NO;
+        d.maxKernelBufferBindCount = 31;
+        const NSUInteger maxCommands = 1024;
+        id<MTLIndirectCommandBuffer> icb = [gDevice newIndirectCommandBufferWithDescriptor:d
+            maxCommandCount:maxCommands options:0];
+        id<MTLBuffer> arena = [gDevice newBufferWithLength:(1 << 20) options:MTLResourceStorageModeShared];
+        if (!icb || !arena) {
+            if (getenv("BYBY_GRAPH_LOG")) NSLog(@"[graph] cannot create the indirect command buffer (icb %d, arena %d)", icb != nil, arena != nil);
+            return 0;
+        }
+        BBRecEncoder *r = [BBRecEncoder new];
+        r.icb = icb; r.arena = arena; r.maxCommands = maxCommands;
+        r.resources = [NSMutableOrderedSet orderedSet];
+        [r.resources addObject:arena];
+        r.psos = [NSMutableArray array];
+        r.dyn = [NSMutableArray array];
+        const NSUInteger devTg = gDevice.maxThreadgroupMemoryLength;
+        r.tgCap = MIN((NSUInteger)maxSeqLen * 4, devTg > 4096 ? devTg - 2048 : devTg);
+        gGraphRec = r;
+        gGraphRecordFailed = NO;
+        gGraphRecording = YES;
+        gGraphRealEncoder = gSessionEncoder;
+        gSessionEncoder = (id<MTLComputeCommandEncoder>)(id)r;
+        return 1;
+    }
+}
+
+// Ends the recording; 0 when something could not be recorded (the graph is dropped).
+int metal_graph_end(void) {
+    @autoreleasepool {
+        if (!gGraphRec) return 0;
+        gSessionEncoder = gGraphRealEncoder;
+        gGraphRealEncoder = nil;
+        gGraphRecording = NO;
+        BBRecEncoder *r = gGraphRec;
+        gGraphRec = nil;
+        if (getenv("BYBY_GRAPH_LOG"))
+            NSLog(@"[graph] recorded %lu commands, %lu buffers, %lu dynamic values, %lu arena bytes%s",
+                  (unsigned long)r.count, (unsigned long)r.resources.count, (unsigned long)r.dyn.count,
+                  (unsigned long)r.arenaUsed, gGraphRecordFailed ? " - FAILED" : "");
+        if (gGraphRecordFailed || r.count == 0) { gGraph = nil; return 0; }
+        gGraph = r;
+        return 1;
+    }
+}
+
+int metal_graph_ready(void) { return gGraph != nil; }
+
+// Replays the graph in the open session. seq: sequence length of the token (pos + 1).
+int metal_graph_run(int pos, int seq, int slotIn, int slotOut) {
+    @autoreleasepool {
+        BBRecEncoder *g = gGraph;
+        if (!g || !gSessionEncoder || gGraphRecording) return 0;
+        if ((NSUInteger)seq * 4 > g.tgCap) return 0;
+        const double tRun0 = [NSProcessInfo processInfo].systemUptime;
+        char *base = (char *)g.arena.contents;
+        for (NSArray *e in g.dyn) {
+            uint32_t v = 0;
+            switch ([e[0] intValue]) {
+                case BBDynPos: v = (uint32_t)pos; break;
+                case BBDynSeq: v = (uint32_t)seq; break;
+                case BBDynSlotIn: v = (uint32_t)slotIn; break;
+                default: v = (uint32_t)slotOut; break;
+            }
+            *(uint32_t *)(base + [e[1] unsignedIntegerValue]) = v;
+        }
+        NSUInteger n = g.resources.count;
+        __unsafe_unretained id<MTLResource> *list = (__unsafe_unretained id<MTLResource> *)malloc(n * sizeof(id));
+        NSUInteger k = 0;
+        for (id<MTLResource> r in g.resources) list[k++] = r;
+        const double tRun1 = [NSProcessInfo processInfo].systemUptime;
+        [gSessionEncoder useResources:list count:n
+            usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+        free(list);
+        const double tRun2 = [NSProcessInfo processInfo].systemUptime;
+        NSUInteger runCount = g.count;
+        if (getenv("BYBY_GRAPH_LIMIT")) runCount = MIN(runCount, (NSUInteger)atoi(getenv("BYBY_GRAPH_LIMIT")));
+        [gSessionEncoder executeCommandsInBuffer:g.icb withRange:NSMakeRange(0, runCount)];
+        if (getenv("BYBY_GRAPH_LOG")) {
+            static int logged = 0;
+            if (++logged % 50 == 10)
+                NSLog(@"[graph] run: prepare %.3f ms, useResources %.3f ms, execute %.3f ms",
+                      (tRun1 - tRun0) * 1000, (tRun2 - tRun1) * 1000,
+                      ([NSProcessInfo processInfo].systemUptime - tRun2) * 1000);
+        }
+        return 1;
+    }
+}
+
 #include "q4_dynamic.inc"
 
 int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHandle kAll,
@@ -1569,7 +1770,7 @@ static id<MTLComputePipelineState> q4FusedPipeline(uint32_t mode, uint32_t hasRe
     id<MTLFunction> fn = [gLibrary newFunctionWithName:@"matmul_q4_fused"
         constantValues:constants error:&error];
     if (!fn) return nil;
-    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pso = bbNewPSO(fn, &error);
     // The kernel takes two simdgroups per threadgroup, so the group is twice the
     // SIMD width (64 threads on an Apple GPU).
     if (!pso || pso.maxTotalThreadsPerThreadgroup < 2 * pso.threadExecutionWidth) return nil;
