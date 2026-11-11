@@ -1514,6 +1514,38 @@ int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHan
     }
 }
 
+int metal_rope_kv_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBufferHandle v,
+        MetalBufferHandle cs, MetalBufferHandle sn, MetalBufferHandle kAll, MetalBufferHandle vAll,
+        int h, int hkv, int d, int maxSeq, int pos, float scale) {
+    @autoreleasepool {
+        if (!gSessionEncoder) return 0;
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("BYBY_FUSE_ROPE"); on = !(e && e[0] == '0'); }
+        if (!on) return 0;
+        id<MTLComputePipelineState> pso = getPipeline(@"rope_kv_kernel");
+        if (!pso) return 0;
+        uint32_t dims[4] = {(uint32_t)h, (uint32_t)hkv, (uint32_t)d, (uint32_t)maxSeq};
+        uint32_t p = (uint32_t)pos;
+        [gSessionEncoder setComputePipelineState:pso];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)q offset:0 atIndex:0];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)k offset:0 atIndex:1];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)v offset:0 atIndex:2];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)cs offset:0 atIndex:3];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)sn offset:0 atIndex:4];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)kAll offset:0 atIndex:5];
+        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)vAll offset:0 atIndex:6];
+        [gSessionEncoder setBytes:dims length:16 atIndex:7];
+        [gSessionEncoder setBytes:&p length:4 atIndex:8];
+        [gSessionEncoder setBytes:&scale length:4 atIndex:9];
+        const NSUInteger total = (NSUInteger)(h * (d / 2) + hkv * (d / 2) + hkv * d);
+        const NSUInteger tgs = MIN((NSUInteger)256, pso.maxTotalThreadsPerThreadgroup);
+        [gSessionEncoder dispatchThreads:MTLSizeMake(total, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];
+        sessionBarrier();
+        return 1;
+    }
+}
+
 // Fused decode GEMV (see matmul_q4_fused in kernels/q4_dynamic.metal).
 // mode 0: up to 3 matrices share `a` (count = number of used slots);
 // mode 1: slots 0/1 are gate/up and out[0] receives silu(gate)*up.

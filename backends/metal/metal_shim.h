@@ -245,6 +245,9 @@ MetalBufferHandle metal_upload_bytes_private(const unsigned char* data, int n);
 // exactly like metal_matmul_enc but reading packed int4 instead of fp32.
 // wqOffset: byte position of the packed weights inside wq (any value; a
 // weight wrapped in place inside an unaligned .nimq mmap).
+int metal_rope_kv_enc(MetalBufferHandle q, MetalBufferHandle k, MetalBufferHandle v,
+        MetalBufferHandle cs, MetalBufferHandle sn, MetalBufferHandle kAll, MetalBufferHandle vAll,
+        int h, int hkv, int d, int maxSeq, int pos, float scale);
 int metal_kv_append_enc(MetalBufferHandle k, MetalBufferHandle v, MetalBufferHandle kAll,
         MetalBufferHandle vAll, int hkv, int d, int maxSeq, int pos);
 // Fused Q4 decode GEMV: mode 0 = up to 3 matrices sharing the input (n[i]==0 ends the

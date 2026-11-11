@@ -300,6 +300,41 @@ kernel void kv_append_kernel(
     vAll[dst] = v[i];
 }
 
+// RoPE(Q) + Q scale + RoPE(K) + KV append in one dispatch (decode, one token).
+// Threads [0, H*half) rotate Q in place and scale it, the next HKV*half rotate K straight into
+// the cache row, the last HKV*D copy V into the cache row.
+kernel void rope_kv_kernel(
+    device float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+    device const float* cs [[buffer(3)]], device const float* sn [[buffer(4)]],
+    device float* kAll [[buffer(5)]], device float* vAll [[buffer(6)]],
+    constant uint4& dims [[buffer(7)]],     // H, HKV, D, maxSeq
+    constant uint& pos [[buffer(8)]], constant float& scale [[buffer(9)]],
+    uint t [[thread_position_in_grid]]) {
+    const uint H = dims.x, HKV = dims.y, D = dims.z, maxSeq = dims.w, half_ = D / 2;
+    if (t < H * half_) {
+        const uint h = t / half_, i = t % half_;
+        device float* p = q + h * D;
+        const float x1 = p[i], x2 = p[i + half_], c = cs[i], s = sn[i];
+        p[i] = (x1 * c - x2 * s) * scale;
+        p[i + half_] = (x2 * c + x1 * s) * scale;
+        return;
+    }
+    t -= H * half_;
+    if (t < HKV * half_) {
+        const uint h = t / half_, i = t % half_;
+        const float x1 = k[h * D + i], x2 = k[h * D + i + half_], c = cs[i], s = sn[i];
+        device float* dst = kAll + h * maxSeq * D + pos * D;
+        dst[i] = x1 * c - x2 * s;
+        dst[i + half_] = x2 * c + x1 * s;
+        return;
+    }
+    t -= HKV * half_;
+    if (t < HKV * D) {
+        const uint h = t / D, d = t % D;
+        vAll[h * maxSeq * D + pos * D + d] = v[t];
+    }
+}
+
 // ---- Pipelined decode: the next token is chosen on the GPU ----
 // ring[] holds token ids. A step reads its input token from one slot and
 // writes the next token to the following slot, so the CPU can encode the next

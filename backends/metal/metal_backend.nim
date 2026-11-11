@@ -718,6 +718,13 @@ when defined(macosx):
       addr outs[0], res, cint(k), cint(groupSize), cint(groupsPerRow),
       addr nn[0], addr off[0], gamma, cfloat(eps)) != 0
 
+  proc metal_rope_kv_enc_c(q, k, v, cs, sn, kAll, vAll: MetalBufferHandle,
+      h, hkv, d, maxSeq, pos: cint, scale: cfloat): cint
+      {.importc: "metal_rope_kv_enc", header: "metal_shim.h".}
+  proc metalSessionRopeKvEnc*(q, k, v, cs, sn, kAll, vAll: MetalBufferHandle,
+      h, hkv, d, maxSeq, pos: int, scale: float32): bool =
+    metal_rope_kv_enc_c(q, k, v, cs, sn, kAll, vAll, cint(h), cint(hkv), cint(d), cint(maxSeq),
+                        cint(pos), cfloat(scale)) != 0
   proc metal_kv_append_enc_c(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: cint): cint
       {.importc: "metal_kv_append_enc", header: "metal_shim.h".}
   proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool =
@@ -909,6 +916,8 @@ when not defined(macosx):
       wq, scales, zeros, outs: array[3, MetalBufferHandle], res: MetalBufferHandle,
       k, groupSize, groupsPerRow: int, n, wqOffset: array[3, int],
       gamma: MetalBufferHandle = nil, eps: float32 = 0): bool = false
+  proc metalSessionRopeKvEnc*(q, k, v, cs, sn, kAll, vAll: MetalBufferHandle,
+      h, hkv, d, maxSeq, pos: int, scale: float32): bool = false
   proc metalSessionKvAppendEnc*(k, v, kAll, vAll: MetalBufferHandle, hkv, d, maxSeq, pos: int): bool = false
   proc metalSessionEndAsync*(): bool = false
   proc metalSessionWaitOldest*(): bool = false

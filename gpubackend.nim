@@ -2871,6 +2871,20 @@ proc sessionKvAppendEnc*(backend: GpuBackend, k, v, kAll, vAll: SessionHandle,
   else:
     return false
 
+proc sessionRopeKvEnc*(backend: GpuBackend, q, k, v, cosT, sinT, kAll, vAll: SessionHandle,
+                       h, hkv, d, maxSeq, pos: int, scale: float32): bool =
+  ## One dispatch: RoPE+scale on Q (in place), RoPE on K and V copied into the combined caches
+  ## at `pos`. Metal only; false means the caller does the separate steps.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen != gbMetal: return false
+  when defined(macosx):
+    return metalSessionRopeKvEnc(q.metalHandle, k.metalHandle, v.metalHandle, cosT.metalHandle,
+                                 sinT.metalHandle, kAll.metalHandle, vAll.metalHandle,
+                                 h, hkv, d, maxSeq, pos, scale)
+  else:
+    return false
+
 proc sessionEndAsync*(backend: GpuBackend): bool =
   ## Commits the open session without waiting (Metal only). Pair with sessionWaitOldest.
   var chosen = backend
