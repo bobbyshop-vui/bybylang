@@ -2858,8 +2858,8 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
   else:
     return false
 
-proc sessionKvAppendEnc*(backend: GpuBackend, k, v, kAll, vAll: SessionHandle,
-                          hkv, d, maxSeq, pos: int): bool =
+proc sessionKvAppendEnc*(backend: GpuBackend, k, v: SessionHandle, kAll, vAll: var SessionHandle,
+                          hkv, d, maxSeq, pos: int): bool {.probed.} =
   ## One dispatch appending the token's K/V for all KV heads into the combined caches
   ## ([head][maxSeq][D]). Metal only; false means the caller uses per-head copies.
   var chosen = backend
@@ -2871,8 +2871,9 @@ proc sessionKvAppendEnc*(backend: GpuBackend, k, v, kAll, vAll: SessionHandle,
   else:
     return false
 
-proc sessionRopeKvEnc*(backend: GpuBackend, q, k, v, cosT, sinT, kAll, vAll: SessionHandle,
-                       h, hkv, d, maxSeq, pos: int, scale: float32): bool =
+proc sessionRopeKvEnc*(backend: GpuBackend, q, k, v, cosT, sinT: SessionHandle,
+                       kAll, vAll: var SessionHandle,
+                       h, hkv, d, maxSeq, pos: int, scale: float32): bool {.probed.} =
   ## One dispatch: RoPE+scale on Q (in place), RoPE on K and V copied into the combined caches
   ## at `pos`. Metal only; false means the caller does the separate steps.
   var chosen = backend
@@ -2975,6 +2976,7 @@ proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
   ## `res` is added to the result when hasRes. With hasNorm, `a` is the raw vector and
   ## RMSNorm (weight `gamma`, `eps`) is applied inside the kernel. Returns false when unsupported, so
   ## callers fall back to the unfused sequence. Output handles must already be allocated.
+  if firProbeOn: return false   # the recorder sees the unfused ops (norm, matmul, add, silu*mul)
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen != gbMetal: return false
