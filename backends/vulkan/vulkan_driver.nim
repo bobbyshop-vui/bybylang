@@ -6,7 +6,7 @@
 import std/dynlib
 import std/os
 import std/math
-import std/[osproc, hashes, strutils, sets, algorithm, monotimes, times]
+import std/[osproc, hashes, strutils, sets, algorithm, monotimes, times, json]
 import vulkan_caps
 import ../../probe
 export vulkan_caps.VulkanCaps
@@ -27,6 +27,8 @@ type
   VkCommandPool* = pointer
   VkCommandBuffer* = pointer
   VkFence* = pointer
+  VkQueryPool* = pointer
+  VkPipelineCache* = pointer
   VkResult* = int32
 
   # ---- Minimal Vulkan structs needed for step 1 (fields in the same order as
@@ -245,6 +247,21 @@ type
     pNext*: pointer
     flags*: uint32
 
+  VkQueryPoolCreateInfo* = object
+    sType*: uint32                           # VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO = 11
+    pNext*: pointer
+    flags*: uint32
+    queryType*: uint32                       # VK_QUERY_TYPE_TIMESTAMP = 2
+    queryCount*: uint32
+    pipelineStatistics*: uint32
+
+  VkPipelineCacheCreateInfo* = object
+    sType*: uint32                         # VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO = 17
+    pNext*: pointer
+    flags*: uint32
+    initialDataSize*: uint
+    pInitialData*: pointer
+
   VkPushConstantRange* = object
     stageFlags*: uint32
     offset*: uint32
@@ -269,6 +286,8 @@ const
   VK_STRUCTURE_TYPE_SUBMIT_INFO: uint32 = 4
   VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO: uint32 = 5
   VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: uint32 = 8
+  VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO: uint32 = 11
+  VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO: uint32 = 17
   VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: uint32 = 12
   VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO: uint32 = 18
   VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO: uint32 = 29
@@ -294,6 +313,8 @@ const
   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: uint32 = 0x00000004
   VK_MEMORY_PROPERTY_HOST_CACHED_BIT: uint32 = 0x00000008
   VK_PIPELINE_STAGE_HOST_BIT: uint32 = 0x00004000
+  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: uint32 = 0x00000001
+  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: uint32 = 0x00002000
   VK_ACCESS_HOST_READ_BIT: uint32 = 0x00002000
   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: uint32 = 7
   VK_PIPELINE_BIND_POINT_COMPUTE: uint32 = 1
@@ -305,6 +326,8 @@ const
   VK_PIPELINE_STAGE_TRANSFER_BIT: uint32 = 0x00001000
   VK_ACCESS_TRANSFER_READ_BIT: uint32 = 0x00000800
   VK_ACCESS_TRANSFER_WRITE_BIT: uint32 = 0x00001000
+  VK_QUERY_TYPE_TIMESTAMP: uint32 = 2
+  VK_QUERY_RESULT_64_BIT: uint32 = 0x00000001
   VK_SUCCESS*: VkResult = 0
 
   # MoltenVK/macOS REQUIRES these 2 portability flags when creating the instance (from
@@ -332,6 +355,9 @@ type
     vkCreateDescriptorSetLayout: proc(dev: VkDevice, pCreateInfo: ptr VkDescriptorSetLayoutCreateInfo, pAllocator: pointer, pLayout: ptr VkDescriptorSetLayout): VkResult {.cdecl.}
     vkCreatePipelineLayout: proc(dev: VkDevice, pCreateInfo: ptr VkPipelineLayoutCreateInfo, pAllocator: pointer, pLayout: ptr VkPipelineLayout): VkResult {.cdecl.}
     vkCreateComputePipelines: proc(dev: VkDevice, cache: pointer, count: uint32, pInfos: ptr VkComputePipelineCreateInfo, pAllocator: pointer, pPipelines: ptr VkPipeline): VkResult {.cdecl.}
+    vkCreatePipelineCache: proc(dev: VkDevice, pCreateInfo: ptr VkPipelineCacheCreateInfo, pAllocator: pointer, pCache: ptr VkPipelineCache): VkResult {.cdecl.}
+    vkDestroyPipelineCache: proc(dev: VkDevice, cache: VkPipelineCache, pAllocator: pointer) {.cdecl.}
+    vkGetPipelineCacheData: proc(dev: VkDevice, cache: VkPipelineCache, pDataSize: ptr uint, pData: pointer): VkResult {.cdecl.}
     vkCreateDescriptorPool: proc(dev: VkDevice, pCreateInfo: ptr VkDescriptorPoolCreateInfo, pAllocator: pointer, pPool: ptr VkDescriptorPool): VkResult {.cdecl.}
     vkAllocateDescriptorSets: proc(dev: VkDevice, pAllocInfo: ptr VkDescriptorSetAllocateInfo, pSets: ptr VkDescriptorSet): VkResult {.cdecl.}
     vkUpdateDescriptorSets: proc(dev: VkDevice, writeCount: uint32, pWrites: ptr VkWriteDescriptorSet, copyCount: uint32, pCopies: pointer) {.cdecl.}
@@ -348,6 +374,12 @@ type
       bufferMemoryBarrierCount: uint32, pBufferMemoryBarriers: pointer,
       imageMemoryBarrierCount: uint32, pImageMemoryBarriers: pointer) {.cdecl.}
     vkCreateFence: proc(dev: VkDevice, pCreateInfo: ptr VkFenceCreateInfo, pAllocator: pointer, pFence: ptr VkFence): VkResult {.cdecl.}
+    vkCreateQueryPool: proc(dev: VkDevice, pCreateInfo: ptr VkQueryPoolCreateInfo, pAllocator: pointer, pQueryPool: ptr VkQueryPool): VkResult {.cdecl.}
+    vkDestroyQueryPool: proc(dev: VkDevice, queryPool: VkQueryPool, pAllocator: pointer) {.cdecl.}
+    vkCmdResetQueryPool: proc(cmdBuf: VkCommandBuffer, queryPool: VkQueryPool, firstQuery, queryCount: uint32) {.cdecl.}
+    vkCmdWriteTimestamp: proc(cmdBuf: VkCommandBuffer, pipelineStage: uint32, queryPool: VkQueryPool, query: uint32) {.cdecl.}
+    vkGetQueryPoolResults: proc(dev: VkDevice, queryPool: VkQueryPool, firstQuery, queryCount: uint32,
+      dataSize: uint, pData: pointer, stride: uint64, flags: uint32): VkResult {.cdecl.}
     vkWaitForFences: proc(dev: VkDevice, count: uint32, pFences: ptr VkFence, waitAll: uint32, timeout: uint64): VkResult {.cdecl.}
     vkResetFences: proc(dev: VkDevice, count: uint32, pFences: ptr VkFence): VkResult {.cdecl.}
     vkQueueSubmit: proc(queue: VkQueue, count: uint32, pSubmits: ptr VkSubmitInfo, fence: VkFence): VkResult {.cdecl.}
@@ -426,6 +458,7 @@ var gFp16Fp4Logged = false
 var gDevice: VkDevice
 var gQueue: VkQueue
 var gQueueFamilyIndex: uint32
+var gQueueTimestampValidBits: uint32
 var gCommandPool: VkCommandPool
 
 proc tryLoad(): bool =
@@ -529,6 +562,9 @@ proc ensureInit() =
   lib.vkCreateDescriptorSetLayout = loadInstanceProc[typeof(lib.vkCreateDescriptorSetLayout)]("vkCreateDescriptorSetLayout")
   lib.vkCreatePipelineLayout = loadInstanceProc[typeof(lib.vkCreatePipelineLayout)]("vkCreatePipelineLayout")
   lib.vkCreateComputePipelines = loadInstanceProc[typeof(lib.vkCreateComputePipelines)]("vkCreateComputePipelines")
+  lib.vkCreatePipelineCache = loadInstanceProc[typeof(lib.vkCreatePipelineCache)]("vkCreatePipelineCache")
+  lib.vkDestroyPipelineCache = loadInstanceProc[typeof(lib.vkDestroyPipelineCache)]("vkDestroyPipelineCache")
+  lib.vkGetPipelineCacheData = loadInstanceProc[typeof(lib.vkGetPipelineCacheData)]("vkGetPipelineCacheData")
   lib.vkCreateDescriptorPool = loadInstanceProc[typeof(lib.vkCreateDescriptorPool)]("vkCreateDescriptorPool")
   lib.vkAllocateDescriptorSets = loadInstanceProc[typeof(lib.vkAllocateDescriptorSets)]("vkAllocateDescriptorSets")
   lib.vkUpdateDescriptorSets = loadInstanceProc[typeof(lib.vkUpdateDescriptorSets)]("vkUpdateDescriptorSets")
@@ -542,6 +578,11 @@ proc ensureInit() =
   lib.vkCmdPushConstants = loadInstanceProc[typeof(lib.vkCmdPushConstants)]("vkCmdPushConstants")
   lib.vkCmdPipelineBarrier = loadInstanceProc[typeof(lib.vkCmdPipelineBarrier)]("vkCmdPipelineBarrier")
   lib.vkCreateFence = loadInstanceProc[typeof(lib.vkCreateFence)]("vkCreateFence")
+  lib.vkCreateQueryPool = loadInstanceProc[typeof(lib.vkCreateQueryPool)]("vkCreateQueryPool")
+  lib.vkDestroyQueryPool = loadInstanceProc[typeof(lib.vkDestroyQueryPool)]("vkDestroyQueryPool")
+  lib.vkCmdResetQueryPool = loadInstanceProc[typeof(lib.vkCmdResetQueryPool)]("vkCmdResetQueryPool")
+  lib.vkCmdWriteTimestamp = loadInstanceProc[typeof(lib.vkCmdWriteTimestamp)]("vkCmdWriteTimestamp")
+  lib.vkGetQueryPoolResults = loadInstanceProc[typeof(lib.vkGetQueryPoolResults)]("vkGetQueryPoolResults")
   lib.vkWaitForFences = loadInstanceProc[typeof(lib.vkWaitForFences)]("vkWaitForFences")
   lib.vkResetFences = loadInstanceProc[typeof(lib.vkResetFences)]("vkResetFences")
   lib.vkQueueSubmit = loadInstanceProc[typeof(lib.vkQueueSubmit)]("vkQueueSubmit")
@@ -590,6 +631,7 @@ proc ensureInit() =
   for i in 0 ..< int(qCount):
     if (qProps[i].queueFlags and VK_QUEUE_COMPUTE_BIT) != 0:
       gQueueFamilyIndex = uint32(i)
+      gQueueTimestampValidBits = qProps[i].timestampValidBits
       foundQueue = true
       break
   gpuCheck(foundQueue, "No queue family supporting compute found")
@@ -1113,6 +1155,9 @@ type
     pushConstSize: uint32
 
 var gPipelineCache = initTable[string, PipelineEntry]()
+var gVkPipelineCacheObject: VkPipelineCache
+var gVkPipelineCacheLoaded = false
+var gVkPipelineCachePath = ""
 var gSessionCmdBuf: VkCommandBuffer
 var gSessionActive = false
 var gSessionCleanupPools: seq[VkDescriptorPool] = @[]
@@ -1126,6 +1171,56 @@ var gSessionInternalBufs: seq[VulkanBufferHandle] = @[]
 ## Destruction is deferred until vulkanSessionEnd has waited on the fence.
 var gSessionDeferredFree: seq[VulkanBufferHandle] = @[]
 var gVkLastError: string = ""   ## error description of the last failed vulkanSessionEnd
+
+proc vkPipelineCachePath(): string =
+  var uuid = ""
+  for b in gDeviceCaps.properties.pipelineCacheUUID: uuid.add(toHex(int(b), 2))
+  let override = getEnv("BYBY_VULKAN_JIT_DIR")
+  let cacheDir = if override.len > 0: override else: getTempDir() / "nimformers-vulkan-jit"
+  createDir(cacheDir)
+  cacheDir / ("pipeline-cache-vk" & uuid & "-drv" &
+    $gDeviceCaps.properties.driverVersion & ".bin")
+
+proc vkSavePipelineCache() {.noconv.} =
+  if gVkPipelineCacheObject == nil or gVkPipelineCachePath.len == 0: return
+  var size: uint
+  if lib.vkGetPipelineCacheData(gDevice, gVkPipelineCacheObject, addr size, nil) != VK_SUCCESS or size == 0:
+    return
+  if size > 256'u * 1024'u * 1024'u: return
+  var data = newString(int(size))
+  if lib.vkGetPipelineCacheData(gDevice, gVkPipelineCacheObject, addr size, addr data[0]) != VK_SUCCESS:
+    return
+  data.setLen(int(size))
+  try:
+    writeFile(gVkPipelineCachePath, data)
+  except CatchableError:
+    discard
+
+proc ensureVkPipelineCache() =
+  if gVkPipelineCacheLoaded: return
+  gVkPipelineCacheLoaded = true
+  gVkPipelineCachePath = vkPipelineCachePath()
+  var initial = ""
+  if fileExists(gVkPipelineCachePath):
+    try:
+      let size = getFileSize(gVkPipelineCachePath)
+      if size > 0 and size <= 256'i64 * 1024 * 1024:
+        initial = readFile(gVkPipelineCachePath)
+    except CatchableError:
+      initial.setLen(0)
+  var info = VkPipelineCacheCreateInfo(sType: VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+    initialDataSize: uint(initial.len),
+    pInitialData: (if initial.len > 0: cast[pointer](unsafeAddr initial[0]) else: nil))
+  if lib.vkCreatePipelineCache(gDevice, addr info, nil, addr gVkPipelineCacheObject) != VK_SUCCESS and
+      initial.len > 0:
+    initial.setLen(0)
+    info.initialDataSize = 0
+    info.pInitialData = nil
+    discard lib.vkCreatePipelineCache(gDevice, addr info, nil, addr gVkPipelineCacheObject)
+  if gVkPipelineCacheObject != nil:
+    addQuitProc(vkSavePipelineCache)
+    if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
+      stderr.writeLine "[vulkan] pipeline cache " & (if initial.len > 0: "loaded " & $initial.len & " bytes" else: "created empty")
 
 # ---- Buffer pool (dGPU scratch) ----
 # A decode step allocates the same few hundred scratch buffers every token.
@@ -1148,6 +1243,55 @@ var gSessionStaging: seq[VulkanBufferHandle] = @[]
 var gXferWritten = initHashSet[VkBuffer]()
 var gXferRead = initHashSet[VkBuffer]()
 var gXferPending = false
+## Optional timestamps used by BYBY_DECODE_PROFILE on Vulkan. Off during
+## ordinary inference; enabled only when BYBY_VULKAN_TIMESTAMPS=1.
+var gVkSessionQueryPool: VkQueryPool
+var gVkSessionTimingActive = false
+var gVkStatsEnabled = false
+var gVkGpuSecondsTotal = 0.0
+var gVkEndCommandSeconds, gVkFenceCreateSeconds = 0.0
+var gVkQueueSubmitSeconds, gVkFenceWaitSeconds, gVkCleanupSeconds = 0.0
+var gVkSessionEnds, gVkQueueSubmits = 0
+var gVkDispatches, gVkBarriers, gVkCopies, gVkDescriptorSets = 0
+
+proc vulkanSessionGpuSeconds*(): float = gVkGpuSecondsTotal
+
+proc vulkanSessionTimingReset*() =
+  gVkStatsEnabled = true
+  gVkGpuSecondsTotal = 0.0
+  gVkEndCommandSeconds = 0.0
+  gVkFenceCreateSeconds = 0.0
+  gVkQueueSubmitSeconds = 0.0
+  gVkFenceWaitSeconds = 0.0
+  gVkCleanupSeconds = 0.0
+  gVkSessionEnds = 0
+  gVkQueueSubmits = 0
+  gVkDispatches = 0
+  gVkBarriers = 0
+  gVkCopies = 0
+  gVkDescriptorSets = 0
+
+proc vulkanSessionTimingReport*(steps: int): string =
+  if not gVkStatsEnabled: return ""
+  let n = float(max(1, steps))
+  result = "sessions=" & formatFloat(float(gVkSessionEnds) / n, ffDecimal, 1) &
+    ", dispatches=" & formatFloat(float(gVkDispatches) / n, ffDecimal, 1) &
+    ", descriptorSets=" & formatFloat(float(gVkDescriptorSets) / n, ffDecimal, 1) &
+    ", copies=" & formatFloat(float(gVkCopies) / n, ffDecimal, 1) &
+    ", barriers=" & formatFloat(float(gVkBarriers) / n, ffDecimal, 1) &
+    ", gpu=" & formatFloat(gVkGpuSecondsTotal * 1000 / n, ffDecimal, 2) & " ms/token" &
+    ", vkEnd=" & formatFloat(gVkEndCommandSeconds * 1000 / n, ffDecimal, 2) & " ms/token" &
+    ", fenceCreate=" & formatFloat(gVkFenceCreateSeconds * 1000 / n, ffDecimal, 2) & " ms/token" &
+    ", queueSubmit=" & formatFloat(gVkQueueSubmitSeconds * 1000 / n, ffDecimal, 2) & " ms/token" &
+    ", fenceWait=" & formatFloat(gVkFenceWaitSeconds * 1000 / n, ffDecimal, 2) & " ms/token" &
+    ", cleanup=" & formatFloat(gVkCleanupSeconds * 1000 / n, ffDecimal, 2) & " ms/token"
+  if gQueueTimestampValidBits == 0 or
+      gDeviceCaps.properties.limits.timestampComputeAndGraphics == 0 or
+      gDeviceCaps.properties.limits.timestampPeriod <= 0:
+    result &= ", device timestamps unavailable"
+  elif getEnv("BYBY_VULKAN_TIMESTAMPS", "0") != "1":
+    result &= ", device timestamps disabled"
+  gVkStatsEnabled = false
 
 proc poolBucket(bytes: uint64): uint64 =
   ## Power-of-two buckets up to 1 MiB, then whole MiB: prefill-sized buffers
@@ -1269,6 +1413,7 @@ proc recordTransferBarrierIfNeeded(src, dst: VkBuffer) =
       dstAccessMask: VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT)
     lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, addr b, 0, nil, 0, nil)
+    if gVkStatsEnabled: inc gVkBarriers
     gXferWritten.clear()
     gXferRead.clear()
 
@@ -1278,6 +1423,7 @@ proc recordSessionCopy(src, dst: VkBuffer; srcOff, dstOff, bytes: uint64) =
   recordTransferBarrierIfNeeded(src, dst)
   var region = VkBufferCopy(srcOffset: srcOff, dstOffset: dstOff, size: bytes)
   lib.vkCmdCopyBuffer(gSessionCmdBuf, src, dst, 1, addr region)
+  if gVkStatsEnabled: inc gVkCopies
   gXferWritten.incl dst
   gXferRead.incl src
   gXferPending = true
@@ -1374,7 +1520,8 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
     stage: stageInfo, layout: pipelineLayout, basePipelineHandle: nil, basePipelineIndex: -1
   )
   var pipeline: VkPipeline
-  gpuCheck(lib.vkCreateComputePipelines(gDevice, nil, 1, addr pipelineInfo, nil, addr pipeline) == VK_SUCCESS,
+  ensureVkPipelineCache()
+  gpuCheck(lib.vkCreateComputePipelines(gDevice, gVkPipelineCacheObject, 1, addr pipelineInfo, nil, addr pipeline) == VK_SUCCESS,
     "vkCreateComputePipelines failed for " & shaderName)
 
   result = PipelineEntry(pipeline: pipeline, layout: pipelineLayout, setLayout: setLayout,
@@ -1444,6 +1591,7 @@ proc makeDescriptorSet(entry: PipelineEntry, buffers: openArray[VulkanBufferHand
       pImageInfo: nil, pBufferInfo: addr bufInfos[i], pTexelBufferView: nil
     )
   lib.vkUpdateDescriptorSets(gDevice, uint32(buffers.len), addr writes[0], 0, nil)
+  if gVkStatsEnabled: inc gVkDescriptorSets
   result = (pool, dset)
 
 proc vulkanSessionBegin*(): bool =
@@ -1461,6 +1609,18 @@ proc vulkanSessionBegin*(): bool =
   )
   if lib.vkBeginCommandBuffer(gSessionCmdBuf, addr beginInfo) != VK_SUCCESS:
     return false
+  gVkSessionTimingActive = false
+  if getEnv("BYBY_VULKAN_TIMESTAMPS", "0") == "1" and
+      gQueueTimestampValidBits > 0 and
+      gDeviceCaps.properties.limits.timestampComputeAndGraphics != 0 and
+      gDeviceCaps.properties.limits.timestampPeriod > 0:
+    var queryInfo = VkQueryPoolCreateInfo(sType: VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+      queryType: VK_QUERY_TYPE_TIMESTAMP, queryCount: 2)
+    if lib.vkCreateQueryPool(gDevice, addr queryInfo, nil, addr gVkSessionQueryPool) == VK_SUCCESS:
+      lib.vkCmdResetQueryPool(gSessionCmdBuf, gVkSessionQueryPool, 0, 2)
+      lib.vkCmdWriteTimestamp(gSessionCmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        gVkSessionQueryPool, 0)
+      gVkSessionTimingActive = true
   gSessionCleanupPools.setLen(0)
   gSessionInternalBufs.setLen(0)
   gXferWritten.clear()
@@ -1479,13 +1639,35 @@ proc vulkanSessionEnd*(): bool =
   if not gSessionActive: return false
   gSessionActive = false
   gVkLastError = ""
+  if gVkSessionTimingActive:
+    lib.vkCmdWriteTimestamp(gSessionCmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+      gVkSessionQueryPool, 1)
+  var endCmdStart: MonoTime
+  if gVkStatsEnabled: endCmdStart = getMonoTime()
   if lib.vkEndCommandBuffer(gSessionCmdBuf) != VK_SUCCESS:
     gVkLastError = "vkEndCommandBuffer that bai"
+    if gVkSessionQueryPool != nil:
+      lib.vkDestroyQueryPool(gDevice, gVkSessionQueryPool, nil)
+      gVkSessionQueryPool = nil
+      gVkSessionTimingActive = false
     return false
+  if gVkStatsEnabled:
+    gVkEndCommandSeconds += float((getMonoTime() - endCmdStart).inNanoseconds) / 1e9
+    inc gVkSessionEnds
+  var fenceCreateStart: MonoTime
+  if gVkStatsEnabled: fenceCreateStart = getMonoTime()
   var fenceInfo = VkFenceCreateInfo(sType: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, pNext: nil, flags: 0)
   var fence: VkFence
   if lib.vkCreateFence(gDevice, addr fenceInfo, nil, addr fence) != VK_SUCCESS:
+    if gVkStatsEnabled:
+      gVkFenceCreateSeconds += float((getMonoTime() - fenceCreateStart).inNanoseconds) / 1e9
+    if gVkSessionQueryPool != nil:
+      lib.vkDestroyQueryPool(gDevice, gVkSessionQueryPool, nil)
+      gVkSessionQueryPool = nil
+      gVkSessionTimingActive = false
     return false
+  if gVkStatsEnabled:
+    gVkFenceCreateSeconds += float((getMonoTime() - fenceCreateStart).inNanoseconds) / 1e9
   var cmdBufVar = gSessionCmdBuf
   var submitInfo = VkSubmitInfo(
     sType: VK_STRUCTURE_TYPE_SUBMIT_INFO, pNext: nil,
@@ -1493,10 +1675,34 @@ proc vulkanSessionEnd*(): bool =
     commandBufferCount: 1, pCommandBuffers: addr cmdBufVar,
     signalSemaphoreCount: 0, pSignalSemaphores: nil
   )
+  var submitStart: MonoTime
+  if gVkStatsEnabled: submitStart = getMonoTime()
   let submitOk = lib.vkQueueSubmit(gQueue, 1, addr submitInfo, fence) == VK_SUCCESS
+  if gVkStatsEnabled:
+    gVkQueueSubmitSeconds += float((getMonoTime() - submitStart).inNanoseconds) / 1e9
+    if submitOk: inc gVkQueueSubmits
+  var waitStart: MonoTime
+  if gVkStatsEnabled and submitOk: waitStart = getMonoTime()
   let waitOk = submitOk and (lib.vkWaitForFences(gDevice, 1, addr fence, 1, high(uint64)) == VK_SUCCESS)
+  if gVkStatsEnabled and submitOk:
+    gVkFenceWaitSeconds += float((getMonoTime() - waitStart).inNanoseconds) / 1e9
   if not submitOk: gVkLastError = "vkQueueSubmit that bai"
   elif not waitOk: gVkLastError = "vkWaitForFences that bai"
+  if waitOk and gVkSessionTimingActive:
+    var stamps: array[2, uint64]
+    let queryOk = lib.vkGetQueryPoolResults(gDevice, gVkSessionQueryPool, 0, 2,
+      uint(sizeof(stamps)), addr stamps[0], uint64(sizeof(uint64)), VK_QUERY_RESULT_64_BIT)
+    if queryOk == VK_SUCCESS:
+      var ticks = stamps[1] - stamps[0]
+      if gQueueTimestampValidBits < 64:
+        ticks = ticks and ((1'u64 shl int(gQueueTimestampValidBits)) - 1'u64)
+      gVkGpuSecondsTotal += float(ticks) * float(gDeviceCaps.properties.limits.timestampPeriod) / 1e9
+  if gVkSessionQueryPool != nil:
+    lib.vkDestroyQueryPool(gDevice, gVkSessionQueryPool, nil)
+    gVkSessionQueryPool = nil
+  gVkSessionTimingActive = false
+  var cleanupStart: MonoTime
+  if gVkStatsEnabled: cleanupStart = getMonoTime()
   lib.vkDestroyFence(gDevice, fence, nil)
   lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmdBufVar)
   if gDSetPool != nil:
@@ -1514,6 +1720,8 @@ proc vulkanSessionEnd*(): bool =
   gSessionDeferredFree.setLen(0)
   for h in gSessionStaging: releaseBuffer(h)
   gSessionStaging.setLen(0)
+  if gVkStatsEnabled:
+    gVkCleanupSeconds += float((getMonoTime() - cleanupStart).inNanoseconds) / 1e9
   result = waitOk
 
 proc vulkanGetLastError*(): string = gVkLastError
@@ -1531,6 +1739,10 @@ proc vulkanRecoverQueue*(): bool =
   if gSessionActive:
     gSessionActive = false
     discard lib.vkEndCommandBuffer(gSessionCmdBuf)
+    if gVkSessionQueryPool != nil:
+      lib.vkDestroyQueryPool(gDevice, gVkSessionQueryPool, nil)
+      gVkSessionQueryPool = nil
+      gVkSessionTimingActive = false
     var cb = gSessionCmdBuf
     lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cb)
     if gDSetPool != nil:
@@ -1746,6 +1958,7 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
       dstAccessMask: VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT)
     lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT,
       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, addr xfer, 0, nil, 0, nil)
+    if gVkStatsEnabled: inc gVkBarriers
     gXferPending = false
     gXferWritten.clear()
     gXferRead.clear()
@@ -1755,6 +1968,7 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
   if pushConstSize > 0:
     lib.vkCmdPushConstants(gSessionCmdBuf, entry.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstSize, pushConstBytes)
   lib.vkCmdDispatch(gSessionCmdBuf, groupX, groupY, groupZ)
+  if gVkStatsEnabled: inc gVkDispatches
   # Metal's command encoder orders compute dispatches with a buffer barrier;
   # Vulkan requires an explicit memory dependency for write->read visibility.
   # Also covers a copy recorded next (KV append, readback source).
@@ -1765,6 +1979,7 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
   lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or VK_PIPELINE_STAGE_TRANSFER_BIT,
     0, 1, addr barrier, 0, nil, 0, nil)
+  if gVkStatsEnabled: inc gVkBarriers
   result = true
 
 proc vulkanSessionMicroVmEnc*(code: VulkanBufferHandle, mem: VulkanBufferHandle,
@@ -2318,6 +2533,56 @@ void main() {
 }
 """)
 
+const RopeKvShader = (name: "rope_kv", source: """#version 450
+layout(local_size_x_id = 0) in;
+layout(std430, binding = 0) buffer QBuf { float q[]; };
+layout(std430, binding = 1) readonly buffer KBuf { float k[]; };
+layout(std430, binding = 2) readonly buffer VBuf { float v[]; };
+layout(std430, binding = 3) readonly buffer CosBuf { float cosTab[]; };
+layout(std430, binding = 4) readonly buffer SinBuf { float sinTab[]; };
+layout(std430, binding = 5) buffer KAllBuf { float kAll[]; };
+layout(std430, binding = 6) buffer VAllBuf { float vAll[]; };
+layout(push_constant) uniform Params {
+    uint H, HKV, D, maxSeqLen, pos;
+    float scale;
+} p;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint halfD = p.D / 2;
+    uint totalQ = p.H * halfD;
+    uint totalK = p.HKV * halfD;
+    uint totalV = p.HKV * p.D;
+    uint cacheBase = p.pos * p.D;
+    if (i < totalQ) {
+        uint h = i / halfD, d = i % halfD;
+        uint base = h * p.D;
+        float x1 = q[base + d], x2 = q[base + d + halfD];
+        float c = cosTab[cacheBase / p.D * halfD + d];
+        float s = sinTab[cacheBase / p.D * halfD + d];
+        q[base + d] = (x1 * c - x2 * s) * p.scale;
+        q[base + d + halfD] = (x2 * c + x1 * s) * p.scale;
+        return;
+    }
+    i -= totalQ;
+    if (i < totalK) {
+        uint h = i / halfD, d = i % halfD;
+        uint srcBase = h * p.D;
+        uint dstBase = h * p.maxSeqLen * p.D + cacheBase;
+        float x1 = k[srcBase + d], x2 = k[srcBase + d + halfD];
+        float c = cosTab[cacheBase / p.D * halfD + d];
+        float s = sinTab[cacheBase / p.D * halfD + d];
+        kAll[dstBase + d] = x1 * c - x2 * s;
+        kAll[dstBase + d + halfD] = x2 * c + x1 * s;
+        return;
+    }
+    i -= totalK;
+    if (i < totalV) {
+        uint h = i / p.D, d = i % p.D;
+        vAll[h * p.maxSeqLen * p.D + cacheBase + d] = v[i];
+    }
+}
+""")
+
 const flashScalarGlsl = staticRead("kernels/attention_prefill_flash.glsl")
 const flashFp16Glsl = staticRead("kernels/attention_prefill_flash_fp16.glsl")
 const flashCoopGlsl = staticRead("kernels/attention_prefill_flash_coop.glsl")
@@ -2353,6 +2618,50 @@ proc vulkanSessionKvScatterEnc*(src, dst: VulkanBufferHandle; T, HKV, D, pos, ma
   let total = T * HKV * D
   dispatchGeneric(KvScatterShader.name, [src, dst], addr pc[0], 20,
     uint32((total + 255) div 256), 1, 1, 256, spv)
+
+proc vulkanSessionKvAppendEnc*(k, v: VulkanBufferHandle;
+    kAll, vAll: var VulkanBufferHandle; HKV, D, maxSeqLen, pos: int): bool =
+  ## Append both FP32 KV tensors into the combined resident caches. This
+  ## replaces four per-head vkCmdCopyBuffer operations per KV head (K/V into
+  ## both per-head and combined caches) with two contiguous GPU scatters.
+  if not gSessionActive or k.buf == nil or v.buf == nil or
+      kAll.buf == nil or vAll.buf == nil or HKV <= 0 or D <= 0:
+    return false
+  let need = uint64(HKV * maxSeqLen * D) * 4
+  if kAll.sizeBytes < need or vAll.sizeBytes < need: return false
+  let kOk = vulkanSessionKvScatterEnc(k, kAll, 1, HKV, D, pos, maxSeqLen)
+  let vOk = vulkanSessionKvScatterEnc(v, vAll, 1, HKV, D, pos, maxSeqLen)
+  kOk and vOk
+
+proc vulkanSessionRopeKvEnc*(q, k, v, cosT, sinT: VulkanBufferHandle;
+    kAll, vAll: var VulkanBufferHandle; H, HKV, D, maxSeqLen, pos: int;
+    scale: float32): bool =
+  ## Fuse decode RoPE(Q/K), Q scaling, and K/V append into one dispatch.
+  ## This mirrors Metal's rope_kv kernel and avoids host-built per-token
+  ## cosine/sine slices plus five intermediate dispatches on the scalar path.
+  if not gSessionActive or q.buf == nil or k.buf == nil or v.buf == nil or
+      cosT.buf == nil or sinT.buf == nil or kAll.buf == nil or vAll.buf == nil:
+    return false
+  if H <= 0 or HKV <= 0 or D <= 0 or D mod 2 != 0 or pos < 0 or pos >= maxSeqLen:
+    return false
+  if q.sizeBytes < uint64(H * D) * 4 or k.sizeBytes < uint64(HKV * D) * 4 or
+      v.sizeBytes < uint64(HKV * D) * 4 or cosT.sizeBytes < uint64(maxSeqLen * D div 2) * 4 or
+      sinT.sizeBytes < uint64(maxSeqLen * D div 2) * 4:
+    return false
+  let cacheNeed = uint64(HKV * maxSeqLen * D) * 4
+  if kAll.sizeBytes < cacheNeed or vAll.sizeBytes < cacheNeed: return false
+  if getEnv("BYBY_FUSE_ROPE", "1") == "0": return false
+  var spv: string
+  try:
+    spv = compileVulkanJitShader(RopeKvShader.name, RopeKvShader.source)
+  except CatchableError as e:
+    stderr.writeLine "[vulkan] rope_kv unavailable: " & e.msg.splitLines()[0]
+    return false
+  var pc = (H: uint32(H), HKV: uint32(HKV), D: uint32(D),
+            maxSeqLen: uint32(maxSeqLen), pos: uint32(pos), scale: scale)
+  let total = H * (D div 2) + HKV * (D div 2) + HKV * D
+  dispatchGeneric(RopeKvShader.name, [q, k, v, cosT, sinT, kAll, vAll],
+    addr pc, 24, uint32((total + 255) div 256), 1, 1, 256, spv)
 
 proc encodeFlash(kind: string; q, kAll, vAll, o: VulkanBufferHandle;
                  T, H, HKV, D, pos, maxSeqLen: int; scale: float32): bool =

@@ -2441,12 +2441,26 @@ proc sessionRecoverQueue*(backend: GpuBackend): bool {.probed.} =
     return false
 
 proc sessionGpuSeconds*(backend: GpuBackend): float =
-  ## Summed GPU execution time of the session command buffers so far (Metal only,
-  ## 0 elsewhere).
+  ## Summed GPU execution time of the session command buffers so far. Vulkan
+  ## reports it only when BYBY_VULKAN_TIMESTAMPS=1.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbMetal: return metalSessionGpuSeconds()
+  if chosen == gbVulkan: return vulkanSessionGpuSeconds()
   0.0
+
+proc sessionTimingReset*(backend: GpuBackend) =
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  if chosen == gbVulkan and getEnv("BYBY_VULKAN_PROFILE", "0") == "1":
+    vulkanSessionTimingReset()
+
+proc sessionTimingReport*(backend: GpuBackend, steps: int): string =
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbCuda: chosen = gbVulkan
+  if chosen == gbVulkan: return vulkanSessionTimingReport(steps)
 
 proc sessionGetLastError*(backend: GpuBackend): string {.probed.} =
   ## NEW: the REAL NSError/error description of the last failed sessionEnd()
@@ -2861,13 +2875,20 @@ proc sessionMatmulQ4*(backend: GpuBackend, a: SessionHandle, w: ResidentWeightHa
 proc sessionKvAppendEnc*(backend: GpuBackend, k, v: SessionHandle, kAll, vAll: var SessionHandle,
                           hkv, d, maxSeq, pos: int): bool {.probed.} =
   ## One dispatch appending the token's K/V for all KV heads into the combined caches
-  ## ([head][maxSeq][D]). Metal only; false means the caller uses per-head copies.
+  ## ([head][maxSeq][D]). Vulkan scatters each contiguous tensor; Metal uses its
+  ## native append kernel. False means the caller uses the per-head fallback.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
-  if chosen != gbMetal: return false
-  when defined(macosx):
-    return metalSessionKvAppendEnc(k.metalHandle, v.metalHandle, kAll.metalHandle,
-                                   vAll.metalHandle, hkv, d, maxSeq, pos)
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return metalSessionKvAppendEnc(k.metalHandle, v.metalHandle, kAll.metalHandle,
+                                     vAll.metalHandle, hkv, d, maxSeq, pos)
+    else:
+      return false
+  of gbVulkan:
+    return vulkanSessionKvAppendEnc(k.vulkanHandle, v.vulkanHandle,
+      kAll.vulkanHandle, vAll.vulkanHandle, hkv, d, maxSeq, pos)
   else:
     return false
 
@@ -2875,14 +2896,21 @@ proc sessionRopeKvEnc*(backend: GpuBackend, q, k, v, cosT, sinT: SessionHandle,
                        kAll, vAll: var SessionHandle,
                        h, hkv, d, maxSeq, pos: int, scale: float32): bool {.probed.} =
   ## One dispatch: RoPE+scale on Q (in place), RoPE on K and V copied into the combined caches
-  ## at `pos`. Metal only; false means the caller does the separate steps.
+  ## at `pos`. False means the caller does the separate steps.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
-  if chosen != gbMetal: return false
-  when defined(macosx):
-    return metalSessionRopeKvEnc(q.metalHandle, k.metalHandle, v.metalHandle, cosT.metalHandle,
-                                 sinT.metalHandle, kAll.metalHandle, vAll.metalHandle,
-                                 h, hkv, d, maxSeq, pos, scale)
+  case chosen
+  of gbMetal:
+    when defined(macosx):
+      return metalSessionRopeKvEnc(q.metalHandle, k.metalHandle, v.metalHandle, cosT.metalHandle,
+                                   sinT.metalHandle, kAll.metalHandle, vAll.metalHandle,
+                                   h, hkv, d, maxSeq, pos, scale)
+    else:
+      return false
+  of gbVulkan:
+    return vulkanSessionRopeKvEnc(q.vulkanHandle, k.vulkanHandle, v.vulkanHandle,
+      cosT.vulkanHandle, sinT.vulkanHandle, kAll.vulkanHandle, vAll.vulkanHandle,
+      h, hkv, d, maxSeq, pos, scale)
   else:
     return false
 
@@ -2971,7 +2999,7 @@ proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
                             outs: openArray[SessionHandle],
                             res: SessionHandle, hasRes: bool,
                             gamma = SessionHandle(), eps = 0'f32, hasNorm = false): bool =
-  ## Fused decode GEMV (M=1) on Metal. mode 0: ws.len (1..3) matrices share `a` and each
+  ## Fused decode GEMV (M=1). mode 0: ws.len (1..3) matrices share `a` and each
   ## writes its own outs[i]; mode 1: ws = [gate, up], outs[0] = silu(gate)*up.
   ## `res` is added to the result when hasRes. With hasNorm, `a` is the raw vector and
   ## RMSNorm (weight `gamma`, `eps`) is applied inside the kernel. Returns false when unsupported, so
@@ -2979,6 +3007,22 @@ proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
   if firProbeOn: return false   # the recorder sees the unfused ops (norm, matmul, add, silu*mul)
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbVulkan:
+    if ws.len < 1 or ws.len > 3 or outs.len < ws.len or (mode == 1 and ws.len != 2): return false
+    if hasRes and res.vulkanHandle.buf == nil: return false
+    if hasNorm and gamma.vulkanHandle.buf == nil: return false
+    var wq, sc, zr, o: array[3, VulkanBufferHandle]
+    var n, off: array[3, int]
+    for i in 0 ..< ws.len:
+      if ws[i].kind != gbVulkan or outs[i].vulkanHandle.buf == nil: return false
+      if ws[i].k != ws[0].k or ws[i].groupSize != ws[0].groupSize or
+         ws[i].nGroupsPerRow != ws[0].nGroupsPerRow: return false
+      wq[i] = ws[i].vulkanWq; sc[i] = ws[i].vulkanScales; zr[i] = ws[i].vulkanZeros
+      o[i] = outs[i].vulkanHandle; n[i] = ws[i].n; off[i] = ws[i].wqOffset
+    return vulkanSessionMatmulQ4FusedEnc(mode, a.vulkanHandle, wq, sc, zr, o,
+      (if hasRes: res.vulkanHandle else: VulkanBufferHandle()),
+      (if hasNorm: gamma.vulkanHandle else: VulkanBufferHandle()),
+      ws[0].k, ws[0].groupSize, ws[0].nGroupsPerRow, n, off, eps, hasNorm, hasRes)
   if chosen != gbMetal: return false
   when defined(macosx):
     if ws.len < 1 or ws.len > 3 or outs.len < ws.len or (mode == 1 and ws.len != 2): return false
