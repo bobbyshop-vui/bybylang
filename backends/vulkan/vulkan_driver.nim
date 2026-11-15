@@ -1616,7 +1616,17 @@ proc releaseInflight(): bool =
     lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmd)
   gSessionInflight.setLen(0)
 
-proc vulkanSessionBegin*(): bool =
+## A session begun with vulkanSessionBegin(reusable = true) keeps its command buffer and
+## descriptor pools at vulkanSessionEnd (when nothing it recorded is released there), so
+## vulkanReplay can submit the very same commands again without encoding them.
+type VulkanRecording = object
+  cmd: VkCommandBuffer
+  pools: seq[VkDescriptorPool]
+var gSessionRecording = false
+var gRecordings: seq[VulkanRecording] = @[]
+var gLastRecording = -1
+
+proc vulkanSessionBegin*(reusable = false): bool =
   ensureInit()
   if gSessionActive: return false
   # A failed sessionEnd() can leave submitted command buffers behind.
@@ -1629,12 +1639,15 @@ proc vulkanSessionBegin*(): bool =
     return false
   var beginInfo = VkCommandBufferBeginInfo(
     sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, pNext: nil,
-    flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, pInheritanceInfo: nil
+    flags: (if reusable: 0'u32 else: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT), pInheritanceInfo: nil
   )
   if lib.vkBeginCommandBuffer(gSessionCmdBuf, addr beginInfo) != VK_SUCCESS:
     return false
+  gSessionRecording = reusable
+  gLastRecording = -1
   gVkSessionTimingActive = false
-  if getEnv("BYBY_VULKAN_TIMESTAMPS", "0") == "1" and
+  # A replayed command buffer must not write to a query pool that sessionEnd destroys.
+  if not reusable and getEnv("BYBY_VULKAN_TIMESTAMPS", "0") == "1" and
       gQueueTimestampValidBits > 0 and
       gDeviceCaps.properties.limits.timestampComputeAndGraphics != 0 and
       gDeviceCaps.properties.limits.timestampPeriod > 0:
@@ -1662,6 +1675,8 @@ proc vulkanSessionBegin*(): bool =
 proc vulkanSessionEnd*(): bool =
   if not gSessionActive: return false
   gSessionActive = false
+  let recording = gSessionRecording
+  gSessionRecording = false
   gVkLastError = ""
   if gVkSessionTimingActive:
     lib.vkCmdWriteTimestamp(gSessionCmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
@@ -1728,12 +1743,26 @@ proc vulkanSessionEnd*(): bool =
   var cleanupStart: MonoTime
   if gVkStatsEnabled: cleanupStart = getMonoTime()
   lib.vkDestroyFence(gDevice, fence, nil)
-  lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmdBufVar)
   # Earlier command buffers of this session (vulkanSessionCommitContinue) must be done
   # before their descriptor pools and buffers are released below.
   let inflightOk = releaseInflight()
   if not inflightOk and waitOk:
     gVkLastError = "vkWaitForFences (committed command buffers) that bai"
+  # A reusable session is kept for vulkanReplay only when it ran and references nothing
+  # this cleanup releases (staging copies, buffers freed or created during the session).
+  if recording and waitOk and inflightOk and gSessionStaging.len == 0 and
+      gSessionDeferredFree.len == 0 and gSessionInternalBufs.len == 0:
+    var kept = VulkanRecording(cmd: cmdBufVar)
+    if gDSetPool != nil:
+      kept.pools.add gDSetPool
+      gDSetPool = nil
+      gDSetPoolLeft = 0
+    for p in gSessionCleanupPools: kept.pools.add p
+    gSessionCleanupPools.setLen(0)
+    gRecordings.add kept
+    gLastRecording = gRecordings.high
+  else:
+    lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmdBufVar)
   if gDSetPool != nil:
     lib.vkDestroyDescriptorPool(gDevice, gDSetPool, nil)
     gDSetPool = nil
@@ -1764,6 +1793,8 @@ proc vulkanSessionCommitContinue*(): bool =
   ## vulkanSessionEnd, which waits on these submissions too. BYBY_VULKAN_COMMIT_WAIT=1 (and a
   ## FIR probe run, which records a host wait here) keeps the old end-and-begin behaviour.
   if not gSessionActive: return false
+  # A reusable session stays one command buffer: vulkanReplay submits it whole.
+  if gSessionRecording: return true
   if firProbeOn or getEnv("BYBY_VULKAN_COMMIT_WAIT", "0") == "1":
     if not vulkanSessionEnd(): return false
     return vulkanSessionBegin()
@@ -1807,6 +1838,7 @@ proc vulkanRecoverQueue*(): bool =
   ## Vulkan has no "poisoned queue" like MTLCommandQueue. If a session is stuck
   ## (gSessionActive = true after an error), drop it so the next session can open. Returns true = ready.
   discard releaseInflight()
+  gSessionRecording = false
   if gSessionActive:
     gSessionActive = false
     discard lib.vkEndCommandBuffer(gSessionCmdBuf)
@@ -1890,6 +1922,73 @@ proc vulkanSessionCopyInto*(src: VulkanBufferHandle, dst: var VulkanBufferHandle
   # a barrier pair around each one stalled the GPU thousands of times a token.
   recordSessionCopy(src.buf, dst.buf, uint64(srcOffsetElems * sizeof(float32)),
     uint64(dstOffsetElems * sizeof(float32)), uint64(n * sizeof(float32)))
+  result = true
+
+proc vulkanLastRecording*(): int =
+  ## The recording the last vulkanSessionEnd kept (a session begun reusable), else -1.
+  gLastRecording
+
+proc vulkanReplay*(id: int): bool =
+  ## Submits a kept recording again and waits for it, outside any session. The buffers it
+  ## references keep their handles, so it reads whatever the host wrote into them since.
+  if gSessionActive or id < 0 or id >= gRecordings.len or gRecordings[id].cmd == nil:
+    return false
+  gVkLastError = ""
+  var fenceInfo = VkFenceCreateInfo(sType: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, pNext: nil, flags: 0)
+  var fence: VkFence
+  if lib.vkCreateFence(gDevice, addr fenceInfo, nil, addr fence) != VK_SUCCESS:
+    gVkLastError = "vkCreateFence (replay) that bai"
+    return false
+  var cmd = gRecordings[id].cmd
+  var submitInfo = VkSubmitInfo(
+    sType: VK_STRUCTURE_TYPE_SUBMIT_INFO, pNext: nil,
+    waitSemaphoreCount: 0, pWaitSemaphores: nil, pWaitDstStageMask: nil,
+    commandBufferCount: 1, pCommandBuffers: addr cmd,
+    signalSemaphoreCount: 0, pSignalSemaphores: nil)
+  if lib.vkQueueSubmit(gQueue, 1, addr submitInfo, fence) != VK_SUCCESS:
+    gVkLastError = "vkQueueSubmit (replay) that bai"
+  elif lib.vkWaitForFences(gDevice, 1, addr fence, 1, high(uint64)) != VK_SUCCESS:
+    gVkLastError = "vkWaitForFences (replay) that bai"
+  else:
+    result = true
+  if gVkStatsEnabled and result: inc gVkQueueSubmits
+  lib.vkDestroyFence(gDevice, fence, nil)
+
+proc vulkanFreeRecording*(id: int) =
+  if id < 0 or id >= gRecordings.len or gRecordings[id].cmd == nil:
+    return
+  var cmd = gRecordings[id].cmd
+  lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmd)
+  for p in gRecordings[id].pools:
+    lib.vkDestroyDescriptorPool(gDevice, p, nil)
+  gRecordings[id] = VulkanRecording()
+
+proc vulkanHostBuffer*(n: int; readback = false): VulkanBufferHandle =
+  ## A host-visible, persistently mapped buffer of n floats: the host writes or reads it
+  ## directly (vulkanHostWrite / vulkanHostRead) and sessions copy into or out of it.
+  ensureInit()
+  acquirePooled(if readback: pkReadback else: pkUpload, uint64(max(n, 1) * sizeof(float32)))
+
+proc vulkanHostWrite*(h: VulkanBufferHandle; data: openArray[float32]): bool =
+  if h.mapped == nil or uint64(data.len * sizeof(float32)) > h.sizeBytes: return false
+  if data.len > 0: copyMem(h.mapped, unsafeAddr data[0], data.len * sizeof(float32))
+  result = true
+
+proc vulkanHostRead*(h: VulkanBufferHandle; n: int): seq[float32] =
+  ## The host view of a vulkanHostBuffer; a session that wrote it must have recorded
+  ## vulkanSessionHostReadBarrier after the write and have completed.
+  if h.mapped == nil or uint64(n * sizeof(float32)) > h.sizeBytes: return @[]
+  result = newSeq[float32](n)
+  if n > 0: copyMem(addr result[0], h.mapped, n * sizeof(float32))
+
+proc vulkanSessionHostReadBarrier*(): bool =
+  ## Makes the transfers recorded so far visible to host reads once the session completes.
+  if not gSessionActive: return false
+  var b = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
+    srcAccessMask: VK_ACCESS_TRANSFER_WRITE_BIT or VK_ACCESS_SHADER_WRITE_BIT,
+    dstAccessMask: VK_ACCESS_HOST_READ_BIT)
+  lib.vkCmdPipelineBarrier(gSessionCmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT or VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    VK_PIPELINE_STAGE_HOST_BIT, 0, 1, addr b, 0, nil, 0, nil)
   result = true
 
 proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =

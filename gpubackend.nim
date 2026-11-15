@@ -2423,6 +2423,57 @@ proc sessionCommitContinue*(backend: GpuBackend): bool {.probed.} =
   else:
     return false
 
+proc sessionVulkanTarget(backend: GpuBackend): bool =
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  chosen == gbVulkan or chosen == gbCuda
+
+proc sessionCanRecord*(backend: GpuBackend): bool =
+  ## True when the backend can keep a finished session and submit it again
+  ## (sessionBeginRecording / sessionReplay). Vulkan only.
+  sessionVulkanTarget(backend)
+
+proc sessionBeginRecording*(backend: GpuBackend): bool =
+  ## Like sessionBegin, but the session's command buffer is kept by sessionEnd when
+  ## it is self-contained (no staging, deferred frees or internal buffers); see
+  ## sessionLastRecording. Mid-session commits are skipped while recording.
+  if not sessionVulkanTarget(backend): return false
+  vulkanSessionBegin(reusable = true)
+
+proc sessionLastRecording*(backend: GpuBackend): int =
+  ## The id the last sessionEnd kept, or -1 when the session could not be kept.
+  if not sessionVulkanTarget(backend): return -1
+  vulkanLastRecording()
+
+proc sessionReplay*(backend: GpuBackend, id: int): bool =
+  ## Submits a kept recording again and waits for it (outside any session).
+  if not sessionVulkanTarget(backend): return false
+  vulkanReplay(id)
+
+proc sessionFreeRecording*(backend: GpuBackend, id: int) =
+  if sessionVulkanTarget(backend): vulkanFreeRecording(id)
+
+proc sessionHostBuffer*(backend: GpuBackend, n: int, readback = false): SessionHandle =
+  ## A persistently mapped host-visible buffer of n floats that sessions can copy into
+  ## or out of; the host writes it with sessionHostWrite and reads it with sessionHostRead.
+  ## Free it with sessionFree.
+  if not sessionVulkanTarget(backend): return
+  result.kind = gbVulkan
+  result.vulkanHandle = vulkanHostBuffer(n, readback)
+
+proc sessionHostWrite*(backend: GpuBackend, h: SessionHandle, data: openArray[float32]): bool =
+  if not sessionVulkanTarget(backend): return false
+  vulkanHostWrite(h.vulkanHandle, data)
+
+proc sessionHostRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] =
+  if not sessionVulkanTarget(backend): return @[]
+  vulkanHostRead(h.vulkanHandle, n)
+
+proc sessionHostReadBarrier*(backend: GpuBackend): bool =
+  ## Records a barrier making earlier copies into host buffers visible to the host.
+  if not sessionVulkanTarget(backend): return false
+  vulkanSessionHostReadBarrier()
+
 proc sessionRecoverQueue*(backend: GpuBackend): bool {.probed.} =
   ## NEW: call right after sessionEnd() returns false - recreates the
   ## "poisoned" MTLCommandQueue (see the details in
