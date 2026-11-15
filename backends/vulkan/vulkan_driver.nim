@@ -1161,6 +1161,9 @@ var gVkPipelineCachePath = ""
 var gSessionCmdBuf: VkCommandBuffer
 var gSessionActive = false
 var gSessionCleanupPools: seq[VkDescriptorPool] = @[]
+## Command buffers that vulkanSessionCommitContinue submitted without waiting. The session's
+## buffers and descriptor pools stay alive until vulkanSessionEnd has waited on every fence.
+var gSessionInflight: seq[tuple[cmd: VkCommandBuffer, fence: VkFence]] = @[]
 # Internal-only session buffers (multiBuf dummy slots). Freed in
 # vulkanSessionEnd. MUST NOT track buffers returned to callers that still
 # read/free after End (vulkanMatmul/VecOp/Activation: AllocScratch → End →
@@ -1600,9 +1603,24 @@ proc makeDescriptorSet(entry: PipelineEntry, buffers: openArray[VulkanBufferHand
   if gVkStatsEnabled: inc gVkDescriptorSets
   result = (pool, dset)
 
+proc releaseInflight(): bool =
+  ## Waits on every command buffer vulkanSessionCommitContinue submitted, then frees them.
+  result = true
+  if gSessionInflight.len == 0: return
+  var fences = newSeq[VkFence](gSessionInflight.len)
+  for i, item in gSessionInflight: fences[i] = item.fence
+  result = lib.vkWaitForFences(gDevice, uint32(fences.len), addr fences[0], 1, high(uint64)) == VK_SUCCESS
+  for item in gSessionInflight:
+    lib.vkDestroyFence(gDevice, item.fence, nil)
+    var cmd = item.cmd
+    lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmd)
+  gSessionInflight.setLen(0)
+
 proc vulkanSessionBegin*(): bool =
   ensureInit()
   if gSessionActive: return false
+  # A failed sessionEnd() can leave submitted command buffers behind.
+  discard releaseInflight()
   var cmdAllocInfo = VkCommandBufferAllocateInfo(
     sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, pNext: nil,
     commandPool: gCommandPool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount: 1
@@ -1711,6 +1729,11 @@ proc vulkanSessionEnd*(): bool =
   if gVkStatsEnabled: cleanupStart = getMonoTime()
   lib.vkDestroyFence(gDevice, fence, nil)
   lib.vkFreeCommandBuffers(gDevice, gCommandPool, 1, addr cmdBufVar)
+  # Earlier command buffers of this session (vulkanSessionCommitContinue) must be done
+  # before their descriptor pools and buffers are released below.
+  let inflightOk = releaseInflight()
+  if not inflightOk and waitOk:
+    gVkLastError = "vkWaitForFences (committed command buffers) that bai"
   if gDSetPool != nil:
     lib.vkDestroyDescriptorPool(gDevice, gDSetPool, nil)
     gDSetPool = nil
@@ -1733,15 +1756,57 @@ proc vulkanSessionEnd*(): bool =
 proc vulkanGetLastError*(): string = gVkLastError
 
 proc vulkanSessionCommitContinue*(): bool =
-  ## Equivalent of metalSessionCommitContinue: closes the current command buffer (waits for the GPU) and opens
-  ## a new session so the caller can keep encoding. This driver has no "commit without waiting" on Vulkan.
+  ## Equivalent of metalSessionCommitContinue: submits the commands recorded so far WITHOUT
+  ## waiting and keeps encoding the same session into a new command buffer, so the GPU runs
+  ## while the host encodes the rest. Every dispatch ends with a pipeline barrier, and a barrier
+  ## orders all earlier commands of the queue in submission order, across command buffers.
+  ## The session's buffers, descriptor pools and staging copies stay alive until
+  ## vulkanSessionEnd, which waits on these submissions too. BYBY_VULKAN_COMMIT_WAIT=1 (and a
+  ## FIR probe run, which records a host wait here) keeps the old end-and-begin behaviour.
   if not gSessionActive: return false
-  if not vulkanSessionEnd(): return false
-  result = vulkanSessionBegin()
+  if firProbeOn or getEnv("BYBY_VULKAN_COMMIT_WAIT", "0") == "1":
+    if not vulkanSessionEnd(): return false
+    return vulkanSessionBegin()
+  if lib.vkEndCommandBuffer(gSessionCmdBuf) != VK_SUCCESS:
+    gVkLastError = "vkEndCommandBuffer (commit) that bai"
+    return false
+  var fenceInfo = VkFenceCreateInfo(sType: VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, pNext: nil, flags: 0)
+  var fence: VkFence
+  if lib.vkCreateFence(gDevice, addr fenceInfo, nil, addr fence) != VK_SUCCESS:
+    gVkLastError = "vkCreateFence (commit) that bai"
+    return false
+  var cmdBufVar = gSessionCmdBuf
+  var submitInfo = VkSubmitInfo(
+    sType: VK_STRUCTURE_TYPE_SUBMIT_INFO, pNext: nil,
+    waitSemaphoreCount: 0, pWaitSemaphores: nil, pWaitDstStageMask: nil,
+    commandBufferCount: 1, pCommandBuffers: addr cmdBufVar,
+    signalSemaphoreCount: 0, pSignalSemaphores: nil)
+  if lib.vkQueueSubmit(gQueue, 1, addr submitInfo, fence) != VK_SUCCESS:
+    lib.vkDestroyFence(gDevice, fence, nil)
+    gVkLastError = "vkQueueSubmit (commit) that bai"
+    return false
+  if gVkStatsEnabled: inc gVkQueueSubmits
+  gSessionInflight.add((cmdBufVar, fence))
+  var cmdAllocInfo = VkCommandBufferAllocateInfo(
+    sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, pNext: nil,
+    commandPool: gCommandPool, level: VK_COMMAND_BUFFER_LEVEL_PRIMARY, commandBufferCount: 1)
+  if lib.vkAllocateCommandBuffers(gDevice, addr cmdAllocInfo, addr gSessionCmdBuf) != VK_SUCCESS:
+    # The submitted buffer is owned by gSessionInflight now; there is no open one to record into.
+    gSessionActive = false
+    gVkLastError = "vkAllocateCommandBuffers (commit) that bai"
+    return false
+  var beginInfo = VkCommandBufferBeginInfo(
+    sType: VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, pNext: nil,
+    flags: VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, pInheritanceInfo: nil)
+  if lib.vkBeginCommandBuffer(gSessionCmdBuf, addr beginInfo) != VK_SUCCESS:
+    gVkLastError = "vkBeginCommandBuffer (commit) that bai"
+    return false
+  result = true
 
 proc vulkanRecoverQueue*(): bool =
   ## Vulkan has no "poisoned queue" like MTLCommandQueue. If a session is stuck
   ## (gSessionActive = true after an error), drop it so the next session can open. Returns true = ready.
+  discard releaseInflight()
   if gSessionActive:
     gSessionActive = false
     discard lib.vkEndCommandBuffer(gSessionCmdBuf)
