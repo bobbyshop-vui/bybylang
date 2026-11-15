@@ -202,9 +202,8 @@ proc resolveImports(filename: string, visited: var seq[string]): seq[Token] =
 proc tokenizeFile(filename: string): seq[Token] =
   traceInfo("Tokenizing file: " & filename)
   var visited: seq[string] = @[]
-  let result = resolveImports(filename, visited)
+  result = resolveImports(filename, visited)
   traceInfo("Total tokens: " & $result.len)
-  return result
 
 # --------------------------
 # Source mapping: every generated Nim line gets a trailing `#bb:<line>:<file>` comment, so an

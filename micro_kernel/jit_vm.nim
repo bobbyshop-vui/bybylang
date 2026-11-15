@@ -660,6 +660,7 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
       .replace("@N@", $N)
       .replace("@GROUP_SIZE@", $groupSize)
       .replace("@N_GROUPS@", $nGroups)
+      .replace("@BM@", $q4CoopRowTile(int(M), int(N)))
     return
   var st = LowerState(indent: 2, glsl: true)
   st.lowerAll(p)

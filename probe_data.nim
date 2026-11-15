@@ -1,5 +1,5 @@
 ## Versioned sampled content identity. Only 5*64 bytes are inspected per upload.
-import std/[strutils, os]
+import std/strutils
 
 proc fingerprintOffsets*(bytes: int): seq[int] =
   if bytes <= 0: return

@@ -276,6 +276,16 @@ proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) =
 proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
   p.emit OP_Q4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
+
+proc q4CoopRowTile*(M, N: int): int =
+  ## Rows one 128-thread workgroup of the Q4 cooperative-matrix micro-kernel computes (its
+  ## columns are always 64). Every row tile dequantizes the whole Q4 weight again, so tall
+  ## tiles save weight reads and dequantization; 32 rows keep at least 128 workgroups on a
+  ## narrow layer. The lifter sizes the grid and the Vulkan JIT sizes the shader from this.
+  let cols = (N + 63) div 64
+  if M <= 16: 16
+  elif M <= 32 or cols * ((M + 63) div 64) < 128: 32
+  else: 64
 proc emitSimdW*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_W, ud)
 proc emitSimdGid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_GID, ud)
 proc emitUTgid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_TGID, ud)

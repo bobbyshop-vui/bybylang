@@ -4,7 +4,7 @@
 ## CUDA libraries are not required by this backend.
 
 import std/dynlib
-import std/os
+import std/[os, exitprocs]
 import std/math
 import std/[osproc, hashes, strutils, sets, algorithm, monotimes, times, json]
 import vulkan_caps
@@ -1218,7 +1218,7 @@ proc ensureVkPipelineCache() =
     info.pInitialData = nil
     discard lib.vkCreatePipelineCache(gDevice, addr info, nil, addr gVkPipelineCacheObject)
   if gVkPipelineCacheObject != nil:
-    addQuitProc(vkSavePipelineCache)
+    addExitProc(vkSavePipelineCache)
     if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
       stderr.writeLine "[vulkan] pipeline cache " & (if initial.len > 0: "loaded " & $initial.len & " bytes" else: "created empty")
 
@@ -2218,6 +2218,18 @@ proc vulkanCooperativeGemmEnabled*(): bool =
   ## scalar fallback kernels need not be compiled ahead of time.
   ensureInit()
   gFp8CoopEnabled or (gCoopEnabled and gDeviceCaps.cooperativeMatrix)
+
+proc vulkanFixedSubgroupWidth*(): int =
+  ## Subgroup width a generated micro-kernel may rely on (subgroups are contiguous runs of
+  ## that many workgroup invocations). Only NVIDIA guarantees it: every compute subgroup is a
+  ## 32-wide warp. Elsewhere the driver may pick the width per pipeline (Intel, AMD, MoltenVK),
+  ## so this returns 0.
+  ensureInit()
+  if gDeviceCaps.properties.vendorID == 0x10de'u32 and gDeviceCaps.subgroupArithmetic and
+      "VK_KHR_portability_subset" notin gDeviceCaps.extensions:
+    gDeviceCaps.subgroupSize
+  else:
+    0
 
 proc vulkanCoopPrewarmJobs*(): seq[tuple[name, source: string]] =
   ## Cooperative GEMM shaders for vulkanJitPrewarm. They are otherwise compiled

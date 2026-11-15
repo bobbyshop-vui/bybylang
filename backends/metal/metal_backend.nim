@@ -1,6 +1,7 @@
 # metal_backend.nim - Metal GPU backend wrapper (compiled on macOS only).
-import std/os
-import ../../probe
+when defined(macosx):
+  import std/os
+  import ../../probe
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 
 when defined(macosx):

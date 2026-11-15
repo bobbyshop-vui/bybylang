@@ -825,8 +825,6 @@ proc gpuMatmulQ4*(backend: GpuBackend, a: seq[float32], wq: seq[uint8], scales, 
         return cpuDequantMatmulQ4Fallback(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
     of gbCpu, gbAuto:
       return cpu.matmulQ4(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
-    else:
-      raise newException(ValueError, "gpuMatmulQ4: backend " & $chosen & " does not support matmul_q4 yet")
   except CatchableError as e:
     handleGpuFailure(chosen, "matmul_q4", e)
     return cpuDequantMatmulQ4Fallback(a, wq, scales, zeros, m, k, n, groupSize, nGroupsPerRow)
@@ -1078,6 +1076,11 @@ proc sessionCooperativeGemmJobs*(backend: GpuBackend):
 proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool {.probed.} =
   ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
   normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
+
+proc gpuFixedSubgroupWidth*(backend: GpuBackend): int =
+  ## Vulkan subgroup width that micro-kernels using subgroup reductions may assume, or 0 when
+  ## the device does not guarantee one (see vulkanFixedSubgroupWidth).
+  if normalizeBackend(backend) == gbVulkan: vulkanFixedSubgroupWidth() else: 0
 
 proc sessionTensorCoreRequired*(backend: GpuBackend): bool {.probed.} =
   ## True when every prefill GEMM (M > 1) must run on the tensor cores
