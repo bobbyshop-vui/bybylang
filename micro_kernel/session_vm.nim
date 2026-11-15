@@ -277,15 +277,21 @@ proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
   p.emit OP_Q4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
 
-proc q4CoopRowTile*(M, N: int): int =
-  ## Rows one 128-thread workgroup of the Q4 cooperative-matrix micro-kernel computes (its
-  ## columns are always 64). Every row tile dequantizes the whole Q4 weight again, so tall
-  ## tiles save weight reads and dequantization; 32 rows keep at least 128 workgroups on a
-  ## narrow layer. The lifter sizes the grid and the Vulkan JIT sizes the shader from this.
+const Q4CoopRowTiles* = [64, 32, 16]   ## row tiles the Q4 cooperative-matrix shader is built for
+
+proc q4CoopRowTile*(rows, N: int; computeUnits = 0; perUnit = 2): int =
+  ## Rows one 128-thread workgroup of the Q4 cooperative-matrix micro-kernel computes for a
+  ## dispatch of `rows` rows (its columns are always 64). Each row tile dequantizes the Q4
+  ## weights again, so the tallest tile wins while the grid still gives every SM/CU `perUnit`
+  ## workgroups; a tile is never more than twice the rows it holds. The FIR runtime calls this
+  ## per dispatch with the device's SM/CU count and the rows actually run; computeUnits = 0
+  ## (unknown device, e.g. at lift time) assumes 64.
+  let units = if computeUnits > 0: computeUnits else: 64
   let cols = (N + 63) div 64
-  if M <= 16: 16
-  elif M <= 32 or cols * ((M + 63) div 64) < 128: 32
-  else: 64
+  result = 16
+  for bm in [64, 32]:
+    if rows > bm div 2 and ((rows + bm - 1) div bm) * cols >= perUnit * units:
+      return bm
 proc emitSimdW*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_W, ud)
 proc emitSimdGid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_GID, ud)
 proc emitUTgid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_TGID, ud)

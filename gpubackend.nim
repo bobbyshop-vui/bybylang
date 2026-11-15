@@ -1077,6 +1077,10 @@ proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool {.probed.} =
   ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
   normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
 
+proc gpuComputeUnits*(backend: GpuBackend): int =
+  ## SM/CU count of a Vulkan device (0: unknown or another backend).
+  if normalizeBackend(backend) == gbVulkan: vulkanComputeUnits() else: 0
+
 proc gpuFixedSubgroupWidth*(backend: GpuBackend): int =
   ## Vulkan subgroup width that micro-kernels using subgroup reductions may assume, or 0 when
   ## the device does not guarantee one (see vulkanFixedSubgroupWidth).

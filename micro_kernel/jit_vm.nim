@@ -636,32 +636,43 @@ kernel void """ & kernelName & """(
 }
 """
 
+proc isQ4CoopProgram*(p: VmProgram): bool =
+  p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM
+
+proc q4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+  ## Shape carried by a Q4 cooperative-matrix micro-kernel program.
+  if not p.isQ4CoopProgram or p.words.len != 7 or p.words[6] != OP_HALT:
+    raise newException(ValueError, "Q4 cooperative micro-kernel must be one shape op followed by halt")
+  result = (int(p.words[1]), int(p.words[2]), int(p.words[3]), int(p.words[4]), int(p.words[5]))
+  if result.M == 0 or result.K == 0 or result.N == 0 or result.K mod 64 != 0 or result.N < 16 or
+      result.groupSize < 2 or result.groupSize mod 2 != 0 or result.K mod result.groupSize != 0 or
+      result.nGroups != result.K div result.groupSize:
+    raise newException(ValueError, "unsupported Q4 cooperative micro-kernel shape")
+
+proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int): string =
+  ## The Q4 cooperative-matrix shader built for one row tile (Q4CoopRowTiles). The runtime
+  ## builds the tiles a graph can need and picks one per dispatch (q4CoopRowTile).
+  if rowTile notin Q4CoopRowTiles:
+    raise newException(ValueError, "Q4 cooperative micro-kernel row tile must be 16, 32 or 64")
+  let s = q4CoopShape(p)
+  const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_q4_coop_micro.glsl")
+  shaderTemplate
+    .replace("@KERNEL@", kernelName)
+    .replace("@M@", $s.M)
+    .replace("@K@", $s.K)
+    .replace("@N@", $s.N)
+    .replace("@GROUP_SIZE@", $s.groupSize)
+    .replace("@N_GROUPS@", $s.nGroups)
+    .replace("@BM@", $rowTile)
+
 proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
   ## Static Vulkan counterpart to the Metal bytecode JIT. In contrast to the
   ## generic interpreter, this emits barriers at uniform static control-flow
   ## locations, which is required by Vulkan when per-lane IF/loop paths diverge.
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM:
-    if p.words.len != 7 or p.words[6] != OP_HALT:
-      raise newException(ValueError, "Q4 cooperative micro-kernel must be one shape op followed by halt")
-    let M = p.words[1]
-    let K = p.words[2]
-    let N = p.words[3]
-    let groupSize = p.words[4]
-    let nGroups = p.words[5]
-    if M == 0 or K == 0 or N == 0 or K mod 64 != 0 or N < 16 or
-        groupSize < 2 or groupSize mod 2 != 0 or K mod groupSize != 0 or
-        nGroups != K div groupSize:
-      raise newException(ValueError, "unsupported Q4 cooperative micro-kernel shape")
-    const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_q4_coop_micro.glsl")
-    result = shaderTemplate
-      .replace("@KERNEL@", kernelName)
-      .replace("@M@", $M)
-      .replace("@K@", $K)
-      .replace("@N@", $N)
-      .replace("@GROUP_SIZE@", $groupSize)
-      .replace("@N_GROUPS@", $nGroups)
-      .replace("@BM@", $q4CoopRowTile(int(M), int(N)))
-    return
+  if p.isQ4CoopProgram:
+    # Default tile for a device of unknown size; the FIR runtime builds its own per dispatch.
+    let s = q4CoopShape(p)
+    return lowerQ4CoopGlsl(p, kernelName, q4CoopRowTile(s.M, s.N))
   var st = LowerState(indent: 2, glsl: true)
   st.lowerAll(p)
   st.closeBlocks()

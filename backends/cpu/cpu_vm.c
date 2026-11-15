@@ -403,11 +403,11 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                     group_size % 2 || K % group_size || n_groups != K / group_size) {
                     result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported Q4 cooperative shape"); goto done;
                 }
-                /* The CPU reference executes one tile per workgroup from lane zero. */
-                if (lid == 0) {
-                    const uint32_t n_tiles = (N + 63u) / 64u;
-                    const uint32_t row0 = ((uint32_t)tgid / n_tiles) * 16u;
-                    const uint32_t col0 = ((uint32_t)tgid % n_tiles) * 64u;
+                /* The CPU reference computes the whole product from lane zero of the first
+                   workgroup, so it is right for any grid: the GPU runtime picks the row tile
+                   (16, 32 or 64 rows per workgroup) per dispatch. */
+                if (tgid == 0 && lid == 0) {
+                    const uint32_t row0 = 0u, col0 = 0u;
                     const float* x = (in_f32 ? in_f32 : mem) + t->base_in;
                     const int x_len = (in_f32 ? in_len : mem_len) - (int)t->base_in;
                     if (!packed || !lut || x_len < 0 || (int)t->base_u8 > packed_len ||
@@ -421,10 +421,10 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                     const uint32_t row_bytes = K / 2u;
                     const uint32_t scale_base = (N * row_bytes + 3u) / 4u;
                     const uint32_t zero_base = scale_base + N * n_groups;
-                    for (uint32_t r = 0; r < 16u; ++r) {
+                    for (uint32_t r = 0; r < M; ++r) {
                         const uint32_t row = row0 + r;
                         if (row >= M) continue;
-                        for (uint32_t c2 = 0; c2 < 64u; ++c2) {
+                        for (uint32_t c2 = 0; c2 < N; ++c2) {
                             const uint32_t col = col0 + c2;
                             if (col >= N) continue;
                             float sum = 0.0f;

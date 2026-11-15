@@ -2219,6 +2219,11 @@ proc vulkanCooperativeGemmEnabled*(): bool =
   ensureInit()
   gFp8CoopEnabled or (gCoopEnabled and gDeviceCaps.cooperativeMatrix)
 
+proc vulkanComputeUnits*(): int =
+  ## SM (NVIDIA) or CU (AMD) count of the device, 0 when the driver does not report it.
+  ensureInit()
+  gDeviceCaps.computeUnits
+
 proc vulkanFixedSubgroupWidth*(): int =
   ## Subgroup width a generated micro-kernel may rely on (subgroups are contiguous runs of
   ## that many workgroup invocations). Only NVIDIA guarantees it: every compute subgroup is a
