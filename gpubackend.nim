@@ -915,6 +915,9 @@ proc probeValue*(be: GpuBackend): string =
   ## `$GpuBackend` already yields the canonical lowercase name.
   let name = $normalizeBackend(be)
   probeBackend(name)
+  if name == "vulkan" and not probeDeviceKnown():
+    # Lets the lifter target what this device runs (FIRLIFT_Q4_GEMM=auto: Tensor Core GEMMs).
+    probeDevice(if vulkanCooperativeGemmEnabled(): "coopmatrix" else: "plain")
   name
 
 proc probeBackendValue*(be: GpuBackend) =

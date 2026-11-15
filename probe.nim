@@ -34,6 +34,7 @@ type
     offset, bytes: int
   ProbeStateObj = object
     path, backendName: string
+    deviceCaps: string                  ## device features a lifter may target, e.g. "coopmatrix"
     events: seq[string]
     buffers: seq[BufferRecord]
     identities: Table[uint64, int]
@@ -109,6 +110,16 @@ proc probeEvent*(line: string) =
 proc probeBackend*(name: string) =
   probeLocked()
   if name notin ["auto", "unknown"]: state.backendName = name
+
+proc probeDeviceKnown*(): bool =
+  probeLocked()
+  state != nil and state.deviceCaps.len > 0
+
+proc probeDevice*(caps: string) =
+  ## Device features of the recorded run, written as `device=` on the backend line
+  ## (no spaces; "plain" when the device has none a lifter cares about).
+  probeLocked()
+  if state != nil: state.deviceCaps = caps
 
 proc probeNewIdentity*(): uint64 =
   probeLocked()
@@ -425,7 +436,8 @@ proc probeFlush*() =
   if state.path.len == 0: return
   # A pipe takes the finished trace once, when the recorder stops.
   if state.streaming and not probeFinal: return
-  var output = probeVersion & "\nbackend " & state.backendName & " device=\"unspecified\" build=" &
+  let device = if state.deviceCaps.len > 0: state.deviceCaps else: "unspecified"
+  var output = probeVersion & "\nbackend " & state.backendName & " device=\"" & device & "\" build=" &
     probeQuote(probeBuild) & " launch=\"session\"\n"
   for i, b in state.buffers:
     output.add "buf b" & $i & " bytes=" & $b.bytes & " origin="
@@ -513,6 +525,7 @@ proc firProbeStart*(path: string; steps = "") =
   # Prepared JIT pipelines and code buffers may outlive a recording. Preserve
   # their bytecode registries across start/stop; neither contains tensor data.
   state.backendName = "unknown"
+  state.deviceCaps = ""
   state.encoderPipeline = ""; state.encoderBindings.clear(); state.encoderTgBytes = 0
   activeOp = 0; state.nextOp = 0; state.nextDisp = 0; state.nextTransfer = 0
   state.seenStep = false; state.selectedStep = false; state.insideStep = false
