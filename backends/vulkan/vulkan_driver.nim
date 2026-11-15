@@ -4,7 +4,7 @@
 ## CUDA libraries are not required by this backend.
 
 import std/dynlib
-import std/[os, exitprocs]
+import std/os
 import std/math
 import std/[osproc, hashes, strutils, sets, algorithm, monotimes, times, json]
 import vulkan_caps
@@ -1181,6 +1181,8 @@ proc vkPipelineCachePath(): string =
   cacheDir / ("pipeline-cache-vk" & uuid & "-drv" &
     $gDeviceCaps.properties.driverVersion & ".bin")
 
+proc cAtExit(fn: proc() {.noconv.}): cint {.importc: "atexit", header: "<stdlib.h>".}
+
 proc vkSavePipelineCache() {.noconv.} =
   if gVkPipelineCacheObject == nil or gVkPipelineCachePath.len == 0: return
   var size: uint
@@ -1218,7 +1220,11 @@ proc ensureVkPipelineCache() =
     info.pInitialData = nil
     discard lib.vkCreatePipelineCache(gDevice, addr info, nil, addr gVkPipelineCacheObject)
   if gVkPipelineCacheObject != nil:
-    addExitProc(vkSavePipelineCache)
+    # A C atexit handler registered now, after the driver initialised, runs before the
+    # driver's own exit handlers. std/exitprocs registers one handler at its first use,
+    # which the trace recorder makes before Vulkan starts; the save would then run after
+    # the driver tore down and crash (exit 139 under `firlift --run`).
+    discard cAtExit(vkSavePipelineCache)
     if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
       stderr.writeLine "[vulkan] pipeline cache " & (if initial.len > 0: "loaded " & $initial.len & " bytes" else: "created empty")
 
