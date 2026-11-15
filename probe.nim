@@ -52,6 +52,10 @@ type
     nextOp, nextDisp, nextTransfer, nextAutoFlush: int
     captureFile: File
     captureOpen: bool
+    streaming: bool                     ## BYBY_FIR_PROBE=fd:T[,D]: pipes, nothing on the disk
+    traceFd, dataFd: int
+    captureNext: int                    ## bytes sent down the data pipe so far
+    captureSeen: Table[string, int]     ## payload size:hash -> offset it was sent at
     seenStep, selectedStep, insideStep: bool
     decodeLimit, prefillLimit, decodeSeen, prefillSeen: int
   ProbeState = ref ProbeStateObj
@@ -87,6 +91,7 @@ proc probeShape*(shape: openArray[int]): string =
 
 proc probeFlush*() {.gcsafe.}
 var probeExitRegistered = false
+var probeFinal = false   ## the recorder is stopping: a pipe gets its trace now
 
 proc capturing(): bool = not state.seenStep or (state.insideStep and state.selectedStep)
 proc probeEvent*(line: string) =
@@ -179,6 +184,13 @@ proc probeSmallData*[T](data: openArray[T]): string =
   else:
     ""
 
+proc payloadHash(data: pointer; bytes: int): string =
+  ## FNV-1a over the whole payload (the sampled fingerprint is too coarse to share a copy).
+  var hash = 0xcbf29ce484222325'u64
+  let p = cast[ptr UncheckedArray[uint8]](data)
+  for i in 0 ..< bytes: hash = (hash xor uint64(p[i])) * 0x100000001b3'u64
+  toHex(hash, 16)
+
 proc probeCapture*(data: pointer; bytes: int): string =
   ## Fingerprints are cheap; optional exact bytes also preserve auxiliary uploads
   ## (composite arenas, LUTs, adapters) that need not exist in a checkpoint.
@@ -193,12 +205,27 @@ proc probeCapture*(data: pointer; bytes: int): string =
               except ValueError: -1
   if limit > 0 and bytes > limit: return
   if not state.captureOpen:
-    state.captureFile = open(state.path & ".data", fmWrite)
+    if state.streaming:
+      if state.dataFd < 0: return        # no data pipe: fingerprints only
+      if not open(state.captureFile, FileHandle(state.dataFd), fmWrite):
+        raise newException(IOError, "cannot open the FIR probe data pipe")
+    else:
+      state.captureFile = open(state.path & ".data", fmWrite)
     state.captureOpen = true
-  let offset = state.captureFile.getFilePos()
+  var offset: int
+  if state.streaming:
+    # A pipe has no file position, and the same payload (a table uploaded again) goes down once.
+    let key = $bytes & ":" & payloadHash(data, bytes)
+    if state.captureSeen.hasKey(key):
+      return result & " capture=" & $state.captureSeen[key] & ":" & $bytes
+    offset = state.captureNext
+    state.captureSeen[key] = offset
+  else:
+    offset = state.captureFile.getFilePos()
   if state.captureFile.writeBuffer(data, bytes) != bytes:
     raise newException(IOError, "cannot write FIR probe upload data")
   state.captureFile.flushFile()
+  if state.streaming: state.captureNext += bytes
   result.add " capture=" & $offset & ":" & $bytes
 
 proc probeCapture*[T](data: openArray[T]): string =
@@ -396,6 +423,8 @@ proc probeFlush*() =
   if state == nil: return
   probeLocked()
   if state.path.len == 0: return
+  # A pipe takes the finished trace once, when the recorder stops.
+  if state.streaming and not probeFinal: return
   var output = probeVersion & "\nbackend " & state.backendName & " device=\"unspecified\" build=" &
     probeQuote(probeBuild) & " launch=\"session\"\n"
   for i, b in state.buffers:
@@ -415,6 +444,18 @@ proc probeFlush*() =
       output.add " " & toHex(word, 8).toLowerAscii
       if j mod 16 == 15 or j == program.len - 1: output.add '\n'
   output.add "end\n"
+  if state.streaming:
+    if state.traceFd < 0: return
+    var pipeFile: File
+    if not open(pipeFile, FileHandle(state.traceFd), fmWrite):
+      raise newException(IOError, "cannot open the FIR probe trace pipe")
+    state.traceFd = -1
+    try:
+      if pipeFile.writeBuffer(addr output[0], output.len) != output.len:
+        raise newException(IOError, "cannot write the FIR probe trace pipe")
+    finally:
+      pipeFile.close()
+    return
   # Rename a complete snapshot in the same directory. SIGTERM may interrupt a
   # rewrite, but the published trace always remains a complete previous snapshot.
   let pending = state.path & ".tmp"
@@ -426,7 +467,9 @@ proc firProbeStop*() =
   if state == nil: return
   probeLocked()
   if firProbeOn:
-    probeFlush()
+    probeFinal = true
+    try: probeFlush()
+    finally: probeFinal = false
     firProbeOn = false
   if state.captureOpen:
     state.captureFile.close()
@@ -436,6 +479,7 @@ proc firProbeShutdown() {.noconv.} =
   probeLocked()
   try:
     if firProbeOn and state != nil and state.events.len > 0:
+      probeFinal = true
       probeFlush()
   finally:
     firProbeOn = false
@@ -484,6 +528,19 @@ proc firProbeStart*(path: string; steps = "") =
       let n = parseInt(pair[1])
       if n < 0: raise newException(ValueError, "negative probe step limit")
       if pair[0] == "decode": state.decodeLimit = n else: state.prefillLimit = n
+  state.streaming = false; state.traceFd = -1; state.dataFd = -1
+  state.captureNext = 0; state.captureSeen.clear()
+  if path.startsWith("fd:"):
+    # BYBY_FIR_PROBE=fd:T[,D]: write ends of pipes the lifter reads (`firlift --run`).
+    let parts = path[3 .. ^1].split(',')
+    try:
+      state.traceFd = parseInt(parts[0])
+      if parts.len > 1: state.dataFd = parseInt(parts[1])
+    except ValueError:
+      raise newException(ValueError, "invalid BYBY_FIR_PROBE descriptor: " & path)
+    if state.traceFd < 0 or parts.len > 2:
+      raise newException(ValueError, "invalid BYBY_FIR_PROBE descriptor: " & path)
+    state.streaming = true
   state.path = path
   if not probeExitRegistered:
     addExitProc(firProbeShutdown)

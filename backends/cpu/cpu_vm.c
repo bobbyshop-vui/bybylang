@@ -51,8 +51,8 @@ typedef struct {
 
 typedef struct {
     int pc;
-    float r[32];
-    uint32_t u[32];
+    float* r;          /* registers, sized from the program (see vm_register_count) */
+    uint32_t* u;
     int sp;
     VmLoop loops[VM_MAX_LOOPS];
     size_t base_f32, base_u8, base_lut, base_in;
@@ -64,11 +64,11 @@ typedef struct {
 } VmThread;
 
 static inline uint32_t op_of(uint32_t w) { return w & 0xFFu; }
-/* 5-bit register fields (32 R[] and 32 U[]), matching pack3 in session_vm.nim
-   and the decoder in jit_vm.nim. */
-static inline uint32_t a_of(uint32_t w) { return (w >> 8) & 0x1Fu; }
-static inline uint32_t b_of(uint32_t w) { return (w >> 13) & 0x1Fu; }
-static inline uint32_t c_of(uint32_t w) { return (w >> 18) & 0x1Fu; }
+/* 8-bit register fields, matching pack3 in session_vm.nim and the decoder in jit_vm.nim:
+   the low 5 bits at 8/13/18, the 3 high bits at 23/26/29. */
+static inline uint32_t a_of(uint32_t w) { return ((w >> 8) & 0x1Fu) | (((w >> 23) & 0x7u) << 5); }
+static inline uint32_t b_of(uint32_t w) { return ((w >> 13) & 0x1Fu) | (((w >> 26) & 0x7u) << 5); }
+static inline uint32_t c_of(uint32_t w) { return ((w >> 18) & 0x1Fu) | (((w >> 29) & 0x7u) << 5); }
 
 static int extra_words(uint32_t op) {
     switch (op) {
@@ -94,6 +94,22 @@ static int next_pc(const uint32_t* code, int n, int pc) {
     uint32_t op = op_of(code[pc]);
     int npc = pc + 1 + extra_words(op);
     return npc > n ? n : npc;
+}
+
+/* Registers the program names: every thread gets exactly that many R[] and U[] (at least 32). */
+static int vm_register_count(const uint32_t* code, int n) {
+    uint32_t top = 31;
+    for (int pc = 0; pc < n; pc = next_pc(code, n, pc)) {
+        uint32_t w = code[pc];
+        uint32_t op = op_of(w);
+        uint32_t a = a_of(w), b = b_of(w), c = c_of(w);
+        if (op == OP_U_LOAD_IN4) a += 3;
+        if (a > top) top = a;
+        if (b > top) top = b;
+        if (c > top) top = c;
+        if (op == OP_FMA && pc + 1 < n && (code[pc + 1] & 0xFFu) > top) top = code[pc + 1] & 0xFFu;
+    }
+    return (int)top + 1;
 }
 
 /* Skip a nested FOR/IF block.  pc points just after the opening word. */
@@ -156,8 +172,18 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
     }
     VmThread* threads = (VmThread*)calloc((size_t)n_threads, sizeof(VmThread));
     if (!threads) { free(tg); if (err && err_len > 0) snprintf(err, (size_t)err_len, "CPU VM thread alloc failed"); return -1; }
+    const int n_regs = vm_register_count(code, n_words);
+    float* reg_f = (float*)calloc((size_t)n_threads * (size_t)n_regs, sizeof(float));
+    uint32_t* reg_u = (uint32_t*)calloc((size_t)n_threads * (size_t)n_regs, sizeof(uint32_t));
+    if (!reg_f || !reg_u) {
+        free(reg_f); free(reg_u); free(threads); free(tg);
+        if (err && err_len > 0) snprintf(err, (size_t)err_len, "CPU VM register alloc failed");
+        return -1;
+    }
     for (int i = 0; i < n_threads; ++i) {
         threads[i].pc = 0;
+        threads[i].r = reg_f + (size_t)i * (size_t)n_regs;
+        threads[i].u = reg_u + (size_t)i * (size_t)n_regs;
         threads[i].r[0] = (float)i;
         threads[i].halted = 0;
     }
@@ -244,7 +270,7 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
             case OP_DIV: t->r[a] = t->r[b] / t->r[c]; break;
             case OP_FMA: {
                 if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
-                uint32_t rc = code[npc++] & 0x1Fu;
+                uint32_t rc = code[npc++] & 0xFFu;
                 t->r[a] = fmaf(t->r[b], t->r[c], t->r[rc]);
                 break;
             }
@@ -534,6 +560,8 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
     goto done;
 done:
     for (int i = 0; i < n_threads; ++i) free(threads[i].mm);
+    free(reg_f);
+    free(reg_u);
     free(threads);
     free(tg);
     return result;

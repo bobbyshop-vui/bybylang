@@ -78,6 +78,45 @@ type LowerState = object
   ctrlBuf: bool         ## grid control words live in their own buffer (slot 5), selected by the 0xFFFFFFFF sentinel
   od: bool              ## uses one-dispatch ops (persistent kernel) -> the kernel has its own prologue
   vtgModes: seq[uint32] ## mode stack of the open OP_VTG_BEGIN blocks
+  maxReg: uint32        ## highest register index the program names (R[] and U[] are sized from it)
+
+const RegCountMark = "@NREG@"   ## placeholder for the register array size, known once the program is lowered
+
+proc scalarRegisters(line: string): string =
+  ## `R[7]` -> `R_7`, `U[7]` -> `U_7` (constant indices only, which is all the lowering emits).
+  ## Separate locals stay in GPU registers whatever their number; a large register array is kept
+  ## in private memory by some shader compilers (Intel), which makes wide accumulator tiles slow.
+  var i = 0
+  while i < line.len:
+    let c = line[i]
+    if (c == 'R' or c == 'U') and i + 2 < line.len and line[i+1] == '[' and
+        (i == 0 or not (line[i-1].isAlphaNumeric or line[i-1] == '_')):
+      var j = i + 2
+      while j < line.len and line[j] in {'0'..'9'}: inc j
+      if j > i + 2 and j < line.len and line[j] == ']':
+        result.add c
+        result.add '_'
+        result.add line[i+2 ..< j]
+        i = j + 1
+        continue
+    result.add c
+    inc i
+
+proc scalarDecl(kind, name, first, zero: string; n: int): string =
+  ## One declaration of n separate registers: `float R_0 = <first>, R_1 = 0.f, ...;`
+  result = "  " & kind & " " & name & "_0 = " & first
+  for i in 1 ..< n: result.add ", " & name & "_" & $i & " = " & zero
+  result.add ";"
+
+proc wideRegisters(st: LowerState): bool =
+  ## Programs beyond the 32 registers every kernel had before use separate locals; the others
+  ## keep their arrays, so their generated source does not change.
+  not st.od and int(st.maxReg) + 1 > 32
+
+proc regCount(st: LowerState): string =
+  ## Registers the kernel declares: what the program uses, never fewer than the 32 every kernel
+  ## had before (so those kernels keep their exact source).
+  $max(32, int(st.maxReg) + 1)
 
 proc ind(st: LowerState): string = "  ".repeat(st.indent)
 
@@ -87,19 +126,57 @@ proc imm(st: var LowerState; p: VmProgram): uint32 =
     result = p.words[st.pc]
     inc st.pc
 
+proc vec4Access(): bool =
+  ## BYBY_JIT_VEC4=0 keeps one scalar access per float (to compare on a device).
+  getEnv("BYBY_JIT_VEC4") != "0"
+
 proc lowerStep(st: var LowerState; p: VmProgram) =
   let w = p.words[st.pc]
   inc st.pc
   let op = w and 0xFF'u32
-  let a = (w shr 8) and 0x1F
-  let b = (w shr 13) and 0x1F
-  let c = (w shr 18) and 0x1F
+  let a = vmRegA(w)
+  let b = vmRegB(w)
+  let c = vmRegC(w)
+  st.maxReg = max(st.maxReg, max(a, max(b, c)))
+  if op == OP_U_LOAD_IN4: st.maxReg = max(st.maxReg, a + 3)
   if op >= OP_U_TGID and op <= OP_U_ATOMIC_ADD: st.usesU = true
   if op == OP_U_LOAD_IN or op == OP_U_LOAD_IN4: st.usesIn = true
   if op == OP_SIMD_SUM or op == OP_SIMD_LANE or op == OP_SIMD_ID: st.usesSimd = true
   if op in [OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID]: st.usesU = true
   if op == OP_SIMD_W or op == OP_SIMD_GID: st.usesSimd = true
   if op >= OP_MM_ZERO and op <= OP_MM_STORE_MEM: st.usesMm = true; st.usesU = true
+  # Four loads (or stores) of consecutive floats through the same index register become one
+  # 16-byte access: a GPU without a load-merging compiler pays one memory message per scalar.
+  if not st.glsl and not st.ctrlBuf and vec4Access() and
+      op in [OP_TG_LOAD_F32, OP_TG_STORE_F32, OP_U_LOAD_F32, OP_U_STORE_F32] and
+      st.pc + 7 <= p.words.len:
+    let off = p.words[st.pc]
+    var regs = @[a]
+    var run = true
+    for i in 1 .. 3:
+      let wi = p.words[st.pc - 1 + 2*i]
+      if (wi and 0xFF'u32) != op or vmRegB(wi) != b or p.words[st.pc + 2*i] != off + uint32(i):
+        run = false
+        break
+      regs.add vmRegA(wi)
+    if run and op in [OP_TG_LOAD_F32, OP_U_LOAD_F32]:
+      for i in 0 .. 3:
+        if op == OP_TG_LOAD_F32 and regs[i] == b: run = false
+        for j in 0 ..< i:
+          if regs[i] == regs[j]: run = false
+    if run:
+      st.pc += 7
+      for r in regs: st.maxReg = max(st.maxReg, r)
+      let space = (if op in [OP_TG_LOAD_F32, OP_TG_STORE_F32]: "threadgroup" else: "device")
+      let address = (if op in [OP_TG_LOAD_F32, OP_TG_STORE_F32]: &"tgF32 + (uint)R[{b}] + {off}u"
+                     else: &"memF32 + U[{b}] + {off}u")
+      if op in [OP_TG_LOAD_F32, OP_U_LOAD_F32]:
+        st.body.add st.ind() & &"{{ const float4 v4 = float4(*(({space} const packed_float4*)({address})));" &
+          &" R[{regs[0]}] = v4.x; R[{regs[1]}] = v4.y; R[{regs[2]}] = v4.z; R[{regs[3]}] = v4.w; }}"
+      else:
+        st.body.add st.ind() & &"*(({space} packed_float4*)({address})) = " &
+          &"packed_float4(R[{regs[0]}], R[{regs[1]}], R[{regs[2]}], R[{regs[3]}]);"
+      return
   case op
   of OP_NOP:
     discard
@@ -137,7 +214,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   of OP_MUL:
     st.body.add st.ind() & &"R[{a}] = R[{b}] * R[{c}];"
   of OP_FMA:
-    let rc = st.imm(p) and 0x1F
+    let rc = st.imm(p) and 0xFF
+    st.maxReg = max(st.maxReg, rc)
     st.body.add st.ind() & &"R[{a}] = fma(R[{b}], R[{c}], R[{rc}]);"
   of OP_LUT_U8:
     if st.glsl:
@@ -419,8 +497,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & &"    const uint lid = gLid & {sub - 1}u;"
       st.body.add st.ind() & &"    const uint tid = tgid * {sub}u + lid;"
       st.body.add st.ind() & &"    threadgroup float* tgF32 = tgF32_ + vSub * {stride}u;"
-      st.body.add st.ind() & "    float R[32]; for (int i=0;i<32;++i) R[i]=0.f; R[0] = (float)tid;"
-      st.body.add st.ind() & "    uint U[32]; for (int i=0;i<32;++i) U[i]=0u;"
+      st.body.add st.ind() & "    float R[" & RegCountMark & "]; for (int i=0;i<" & RegCountMark & ";++i) R[i]=0.f; R[0] = (float)tid;"
+      st.body.add st.ind() & "    uint U[" & RegCountMark & "]; for (int i=0;i<" & RegCountMark & ";++i) U[i]=0u;"
       st.indent += 2
     else:
       st.body.add st.ind() & &"for (uint vIt = gTgid; vIt < {nVirt}u; vIt += gNtg) {{"
@@ -429,8 +507,8 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
       st.body.add st.ind() & "  const uint tid = vIt * gTgs + gLid;"
       st.body.add st.ind() & "  const bool vact = true;"
       st.body.add st.ind() & "  threadgroup float* tgF32 = tgF32_;"
-      st.body.add st.ind() & "  float R[32]; for (int i=0;i<32;++i) R[i]=0.f; R[0] = (float)tid;"
-      st.body.add st.ind() & "  uint U[32]; for (int i=0;i<32;++i) U[i]=0u;"
+      st.body.add st.ind() & "  float R[" & RegCountMark & "]; for (int i=0;i<" & RegCountMark & ";++i) R[i]=0.f; R[0] = (float)tid;"
+      st.body.add st.ind() & "  uint U[" & RegCountMark & "]; for (int i=0;i<" & RegCountMark & ";++i) U[i]=0u;"
       st.indent += 1
       if a == 2:
         # mode guard: run the body only if tid < NT (the body must NOT contain barrier_tg)
@@ -477,6 +555,11 @@ proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
       st.ctrlBuf = true
   st.lowerAll(p)
   st.closeBlocks()
+  let nReg = st.regCount()
+  let wide = st.wideRegisters()
+  for line in st.body.mitems:
+    if RegCountMark in line: line = line.replace(RegCountMark, nReg)
+    if wide: line = scalarRegisters(line)
   if st.od:
     ## ── ONE-DISPATCH persistent kernel ───────────────────────────────────
     ## The original *_ names keep the buffers; memF32/memU8/lut/inF32 are pointers whose base MAY change
@@ -489,11 +572,11 @@ proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
                 "  const uint gLid = lid, gTgid = tgid, gNtg = ntg, gTgs = tgs;",
                 "  uint gbEpoch = 0u;",
                 "  const bool vact = true;",
-                "  float R[32];",
-                "  for (int i=0;i<32;++i) R[i]=0.f;",
+                "  float R[" & nReg & "];",
+                "  for (int i=0;i<" & nReg & ";++i) R[i]=0.f;",
                 "  R[0] = (float)tid;",
-                "  uint U[32];",
-                "  for (int i=0;i<32;++i) U[i]=0u;"]
+                "  uint U[" & nReg & "];",
+                "  for (int i=0;i<" & nReg & ";++i) U[i]=0u;"]
     return """
 #include <metal_stdlib>
 using namespace metal;
@@ -523,13 +606,15 @@ kernel void """ & kernelName & """(
 """
   # U[]/inF32 are declared only when the program REALLY uses them (flag set while decoding,
   # so no separate pre-scan) -> the existing kernels do not change by a single character.
-  let uDecl = if st.usesU:
-      @["  uint U[32];", "  for (int i=0;i<32;++i) U[i]=0u;"]
-    else: newSeq[string]()
+  let uDecl = if not st.usesU: newSeq[string]()
+    elif wide: @[scalarDecl("uint", "U", "0u", "0u", parseInt(nReg))]
+    else: @["  uint U[" & nReg & "];", "  for (int i=0;i<" & nReg & ";++i) U[i]=0u;"]
   let mmDecl = if st.usesMm: @["  simdgroup_float8x8 MM[16];"] else: newSeq[string]()
-  let lines = @["  float R[32];",
-                "  for (int i=0;i<32;++i) R[i]=0.f;",
-                "  R[0] = (float)tid;"] & uDecl & mmDecl & st.body
+  let rDecl = if wide: @[scalarDecl("float", "R", "(float)tid", "0.f", parseInt(nReg))]
+    else: @["  float R[" & nReg & "];",
+            "  for (int i=0;i<" & nReg & ";++i) R[i]=0.f;",
+            "  R[0] = (float)tid;"]
+  let lines = rDecl & uDecl & mmDecl & st.body
   result = """
 #include <metal_stdlib>
 """ & (if st.usesMm: "#include <metal_simdgroup_matrix>\n" else: "") & """using namespace metal;
@@ -556,17 +641,26 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
   var st = LowerState(indent: 2, glsl: true)
   st.lowerAll(p)
   st.closeBlocks()
-  let uDecl = if st.usesU:
-      @[
-        "  uint U[32];",
-        "  for (int i=0; i<32; ++i) U[i]=0u;"
+  if st.usesMm:
+    raise newException(ValueError, "simdgroup_matrix bytecode is Metal-only and cannot be compiled by the Vulkan JIT")
+  let nReg = st.regCount()
+  let wide = st.wideRegisters()
+  for line in st.body.mitems:
+    if RegCountMark in line: line = line.replace(RegCountMark, nReg)
+    if wide: line = scalarRegisters(line)
+  let uDecl = if not st.usesU: newSeq[string]()
+    elif wide: @[scalarDecl("uint", "U", "0u", "0u", parseInt(nReg))]
+    else: @[
+        "  uint U[" & nReg & "];",
+        "  for (int i=0; i<" & nReg & "; ++i) U[i]=0u;"
       ]
-    else: newSeq[string]()
-  let lines = @[
-    "  float R[32];",
-    "  for (int i=0; i<32; ++i) R[i]=0.0;",
-    "  R[0] = float(tid);"
-  ] & uDecl & st.body
+  let rDecl = if wide: @[scalarDecl("float", "R", "float(tid)", "0.0", parseInt(nReg))]
+    else: @[
+      "  float R[" & nReg & "];",
+      "  for (int i=0; i<" & nReg & "; ++i) R[i]=0.0;",
+      "  R[0] = float(tid);"
+    ]
+  let lines = rDecl & uDecl & st.body
   let simdExt = if st.usesSimd:
       "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_arithmetic : require\n"
     else: ""

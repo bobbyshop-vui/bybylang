@@ -101,18 +101,28 @@ type
   VmProgram* = object
     words*: seq[uint32]
 
+const VmMaxRegisters* = 256   ## register index limit of the encoding (8-bit fields); a program uses what it needs
+
+proc regField(r, lowShift, highShift: uint32): uint32 {.inline.} =
+  ((r and 0x1F) shl lowShift) or (((r shr 5) and 0x7) shl highShift)
+
 proc pack3(op, a, b, c: uint32): uint32 {.inline.} =
-  ## 5-bit register fields: 32 float registers R[] and 32 int registers U[].
-  ## (Was 4 bits = 16.) The hot FP4 GEMM needs 16 accumulators (8 rows x 2
-  ## output columns) plus 4 vector-loaded inputs, 8 decoded weights, 2 group
-  ## scales and a loop counter; 16 registers could not express that.
-  (op and 0xFF'u32) or ((a and 0x1F) shl 8) or ((b and 0x1F) shl 13) or ((c and 0x1F) shl 18)
+  ## 8-bit register fields. The low 5 bits sit where the 5-bit fields always were (a: 8..12,
+  ## b: 13..17, c: 18..22) and the 3 high bits use the top of the word (a: 23..25, b: 26..28,
+  ## c: 29..31), so every program written with registers 0..31 has the same words as before.
+  ## No engine fixes the register count: the lowering and the interpreters size R[] and U[] from
+  ## the program (a tiled GEMM keeps an 8 x 8 accumulator tile, 64 registers, per thread).
+  (op and 0xFF'u32) or regField(a, 8, 23) or regField(b, 13, 26) or regField(c, 18, 29)
 
 proc pack2(op, a, b: uint32): uint32 {.inline.} =
-  (op and 0xFF'u32) or ((a and 0x1F) shl 8) or ((b and 0x1F) shl 13)
+  (op and 0xFF'u32) or regField(a, 8, 23) or regField(b, 13, 26)
 
 proc pack1(op, a: uint32): uint32 {.inline.} =
-  (op and 0xFF'u32) or ((a and 0x1F) shl 8)
+  (op and 0xFF'u32) or regField(a, 8, 23)
+
+proc vmRegA*(w: uint32): uint32 {.inline.} = ((w shr 8) and 0x1F) or (((w shr 23) and 0x7) shl 5)
+proc vmRegB*(w: uint32): uint32 {.inline.} = ((w shr 13) and 0x1F) or (((w shr 26) and 0x7) shl 5)
+proc vmRegC*(w: uint32): uint32 {.inline.} = ((w shr 18) and 0x1F) or (((w shr 29) and 0x7) shl 5)
 
 # ── Emit (writes a "file" in RAM) ──────────────────────────────
 
@@ -152,7 +162,7 @@ proc emitMul*(p: var VmProgram; rd, ra, rb: uint32) =
 
 proc emitFma*(p: var VmProgram; rd, ra, rb, rc: uint32) =
   p.emit pack3(OP_FMA, rd, ra, rb)
-  p.emit (rc and 0x1F)
+  p.emit (rc and 0xFF)
 
 proc emitLutU8*(p: var VmProgram; rd, ri: uint32) =
   ## R[rd] = lut[uint(R[ri]) & 255]

@@ -3385,6 +3385,46 @@ static id<MTLComputePipelineState> gEncCurrentPipeline = nil;
 /* Cache pipeline tu metal_jit_compile (bytecode -> Metal source). */
 static NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* gJitPipelines = nil;
 
+/* The MTLFunction of every JIT kernel, kept so a pipeline made for indirect command buffers can be
+   built the first time a decode graph records that kernel (the ordinary pipelines above are not
+   created for them), and the cache of those pipelines. */
+static NSMutableDictionary<NSString*, id<MTLFunction>>* gJitFunctions = nil;
+static NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* gJitIcbPipelines = nil;
+
+/* A command recorded into the decode graph must use a pipeline created with
+   supportIndirectCommandBuffers; replaying one that was not gives wrong results without any error
+   (the "garbage token" bug of the Mamba-3 graph). BYBY_JIT_ICB=0 keeps the ordinary pipeline and
+   exists only to show that failure in tests.
+   These pipelines are built lazily, when a graph first records the kernel, and not for every JIT
+   kernel up front: measured on Intel Iris Plus 640, Mamba-3 decode took 47.9 ms/token with every
+   JIT kernel created for indirect command buffers against 27.3 ms/token with the ordinary ones. */
+static BOOL metal_jit_info_logging_enabled(void);
+
+static id<MTLComputePipelineState> bbJitIcbPipeline(NSString *name) {
+    id<MTLComputePipelineState> hit = gJitIcbPipelines[name];
+    if (hit) return hit;
+    id<MTLFunction> fn = gJitFunctions[name];
+    if (!fn || !gDevice) return nil;
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
+    d.computeFunction = fn;
+    d.maxCallStackDepth = 32;
+    d.label = name;
+    d.supportIndirectCommandBuffers = YES;
+    NSError *err = nil;
+    id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithDescriptor:d
+        options:MTLPipelineOptionNone reflection:nil error:&err];
+    if (!pso) {
+        NSLog(@"[metal_enc_pipeline] cannot build the indirect-command pipeline for %@ (%@)", name, err);
+        return nil;
+    }
+    if (!gJitIcbPipelines) gJitIcbPipelines = [NSMutableDictionary dictionary];
+    gJitIcbPipelines[name] = pso;
+    if (metal_jit_info_logging_enabled())
+        NSLog(@"[metal_jit] indirect-command pipeline %@: %.0f ms", name, (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    return pso;
+}
+
 int metal_enc_pipeline(const char* kernelName) {
     @autoreleasepool {
         if (!gSessionEncoder) {
@@ -3395,6 +3435,14 @@ int metal_enc_pipeline(const char* kernelName) {
         NSString *name = [NSString stringWithUTF8String:kernelName];
         id<MTLComputePipelineState> p = nil;
         if (gJitPipelines) p = gJitPipelines[name];
+        if (p && gGraphRecording && bbIcbEnabled()) {
+            static int jitIcb = -1;
+            if (jitIcb < 0) { const char *e = getenv("BYBY_JIT_ICB"); jitIcb = !(e && e[0] == '0'); }
+            if (jitIcb) {
+                p = bbJitIcbPipeline(name);
+                if (!p) { gGraphRecordFailed = YES; return 0; }
+            }
+        }
         if (!p) p = getPipeline(name);
         if (!p) {
             NSLog(@"[metal_enc_pipeline] kernel not found: %@", name);
@@ -3453,6 +3501,7 @@ int metal_enc_dispatch(int gridX, int gridY, int gridZ, int tgX, int tgY, int tg
         NSUInteger tgz = tgZ > 0 ? (NSUInteger)tgZ : 1;
         NSUInteger maxTG = gEncCurrentPipeline.maxTotalThreadsPerThreadgroup;
         if (tgx * tgy * tgz > maxTG) {
+            if (gGraphRecording) gGraphRecordFailed = YES;   // a recorded graph must not change the group size
             tgx = maxTG;
             tgy = 1;
             tgz = 1;
@@ -3476,6 +3525,7 @@ int metal_enc_dispatch_threads(int threadsX, int threadsY, int threadsZ,
         NSUInteger tgz = tgZ > 0 ? (NSUInteger)tgZ : 1;
         NSUInteger maxTG = gEncCurrentPipeline.maxTotalThreadsPerThreadgroup;
         if (tgx * tgy * tgz > maxTG) {
+            if (gGraphRecording) gGraphRecordFailed = YES;   // a recorded graph must not change the group size
             tgx = maxTG; tgy = 1; tgz = 1;
         }
         MTLSize tg = MTLSizeMake(tgx, tgy, tgz);
@@ -3691,6 +3741,8 @@ int metal_jit_compile(const char* source, const char* kernelName) {
             return 0;
         }
         gJitPipelines[name] = pso;
+        if (!gJitFunctions) gJitFunctions = [NSMutableDictionary dictionary];
+        gJitFunctions[name] = fn;
         if (metal_jit_info_logging_enabled()) NSLog(@"[metal_jit] OK kernel=%@", name);
         return 1;
     }
