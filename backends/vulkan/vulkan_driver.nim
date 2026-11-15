@@ -2053,9 +2053,13 @@ proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
           " exit=" & $code & " (retried on first dispatch)"
     pending.setLen(0)
   var spawned = 0
+  # Callers list a shader once per layer; two glslc processes must never write one file.
+  var queued = initHashSet[string]()
   for job in jobs:
     if job.name.len == 0 or job.source.len == 0: continue
     let (srcPath, spvPath) = vulkanJitShaderPaths(job.name, job.source)
+    if spvPath in queued: continue
+    queued.incl spvPath
     if fileExists(spvPath):
       gJitSpvPaths[job.name] = (job.source, spvPath)
       continue

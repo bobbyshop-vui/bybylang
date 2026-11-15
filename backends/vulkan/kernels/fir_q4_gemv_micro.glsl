@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_control_flow_attributes : require
 // FIR custom micro-kernel for asymmetric Q4 decode GEMV (y[m, n] = x[m, :] . W[n, :]).
 // It is compiled by the micro-VM JIT and dispatched as a normal FIR micro node; it
 // does not call the native Q4/session API. The algorithm matches the native
@@ -71,23 +72,25 @@ void main() {
     // SHARED_REDUCE: SG_COUNT * ROWS == ROWS_PER_GROUP, one trip for every invocation.
     for (uint chunk = SG_ID * ROWS; chunk < ROWS_PER_GROUP; chunk += SG_COUNT * ROWS) {
         const uint row0 = rowBase + chunk;
+        // Every loop over ROWS or the 8 activation vectors is unrolled, so acc[] and a[]
+        // keep constant indices and stay in registers.
         float acc[ROWS];
-        for (uint r = 0u; r < ROWS; ++r) acc[r] = 0.0;
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) acc[r] = 0.0;
         for (uint j = lane; j < UNITS; j += SG_SIZE) {
             const uint k = j * 8u * VEC;
             const uint g = k / Q4_GROUP_SIZE;
 #if VEC == 4
             vec4 a[8];
-            for (uint t = 0u; t < 8u; ++t) a[t] = in4[aBase + k / 4u + t];
+            [[unroll]] for (uint t = 0u; t < 8u; ++t) a[t] = in4[aBase + k / 4u + t];
             const float asum = dot(a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7], vec4(1.0));
 #else
             const vec4 lo = in4[aBase + k / 4u];
             const vec4 hi = in4[aBase + k / 4u + 1u];
             const float asum = dot(lo + hi, vec4(1.0));
 #endif
-            for (uint r = 0u; r < ROWS; ++r) {
+            [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
                 const uint n = row0 + r;
-                if (n >= Q4_N) break;
+                if (n >= Q4_N) continue;
 #if VEC == 4
                 const uvec4 q = memU8[n * UNITS + j];
                 const float d = dotWord(q.x, a[0], a[1]) + dotWord(q.y, a[2], a[3]) +
@@ -99,7 +102,7 @@ void main() {
                 acc[r] += lut[SCALE_BASE + gi] * (d - lut[ZERO_BASE + gi] * asum);
             }
         }
-        for (uint r = 0u; r < ROWS; ++r) {
+        [[unroll]] for (uint r = 0u; r < ROWS; ++r) {
 #if SHARED_REDUCE
             red[gl_LocalInvocationID.x] = acc[r];
             barrier();
