@@ -42,7 +42,7 @@ enum {
     OP_SIMD_SUM = 0xA0, OP_SIMD_LANE = 0xA1, OP_SIMD_ID = 0xA2,
     OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4,
     OP_MM_ZERO = 0xA5, OP_MM_LOAD = 0xA6, OP_MM_MAC = 0xA7, OP_MM_STORE_TG = 0xA8, OP_MM_STORE_MEM = 0xA9,
-    OP_Q4_COOP_GEMM = 0xAA
+    OP_Q4_COOP_GEMM = 0xAA, OP_Q4_GEMV = 0xAB
 };
 
 typedef struct {
@@ -85,7 +85,7 @@ static int extra_words(uint32_t op) {
         return 1;
     case OP_VTG_BEGIN:
         return 2;
-    case OP_Q4_COOP_GEMM:
+    case OP_Q4_COOP_GEMM: case OP_Q4_GEMV:
         return 5;
     default:
         return 0;
@@ -393,19 +393,22 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 }
                 break;
             }
-            case OP_Q4_COOP_GEMM: {
+            case OP_Q4_COOP_GEMM: case OP_Q4_GEMV: {
                 if (npc + 5 > n_words) {
-                    result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated Q4 cooperative GEMM"); goto done;
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated Q4 shape op"); goto done;
                 }
                 uint32_t M = code[npc++], K = code[npc++], N = code[npc++];
                 uint32_t group_size = code[npc++], n_groups = code[npc++];
-                if (!M || !N || N < 16 || !K || K % 64 || group_size < 2 ||
-                    group_size % 2 || K % group_size || n_groups != K / group_size) {
-                    result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported Q4 cooperative shape"); goto done;
+                const int coop = op == OP_Q4_COOP_GEMM;
+                if (!M || !N || !K || !group_size || K % group_size || n_groups != K / group_size ||
+                    (coop && (N < 16 || K % 64 || group_size % 2)) ||
+                    (!coop && (K % 8 || group_size % 8))) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported Q4 %s shape",
+                        coop ? "cooperative" : "GEMV"); goto done;
                 }
                 /* The CPU reference computes the whole product from lane zero of the first
                    workgroup, so it is right for any grid: the GPU runtime picks the row tile
-                   (16, 32 or 64 rows per workgroup) per dispatch. */
+                   (Tensor Core) or rows per subgroup (GEMV) per dispatch. */
                 if (tgid == 0 && lid == 0) {
                     const uint32_t row0 = 0u, col0 = 0u;
                     const float* x = (in_f32 ? in_f32 : mem) + t->base_in;

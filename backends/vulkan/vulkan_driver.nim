@@ -2063,8 +2063,11 @@ proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
       continue
     writeFile(srcPath, job.source)
     var args = @["-fshader-stage=compute"]
+    # Same targets as compileVulkanJitShader: subgroup builtins need SPIR-V 1.3.
     if job.source.contains("GL_KHR_cooperative_matrix"):
       args.add "--target-env=vulkan1.3"
+    elif job.source.contains("GL_KHR_shader_subgroup"):
+      args.add "--target-env=vulkan1.1"
     args.add srcPath
     args.add "-o"
     args.add spvPath

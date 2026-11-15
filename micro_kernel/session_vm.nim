@@ -95,6 +95,7 @@ const
   OP_MM_STORE_TG*  = 0xA8'u32   # simdgroup_store(MM[a], tgF32 + U[b], ld = next word)
   OP_MM_STORE_MEM* = 0xA9'u32   # simdgroup_store(MM[a], memF32 + U[b], ld = next word)
   OP_Q4_COOP_GEMM* = 0xAA'u32   # Vulkan micro-kernel: Q4 GEMM via KHR cooperative matrices; next 5 words are M,K,N,group,nGroups
+  OP_Q4_GEMV*      = 0xAB'u32   # Vulkan micro-kernel: subgroup Q4 GEMV for decode; next 5 words are M,K,N,group,nGroups
   OP_SIMD_GID*     = 0xA4'u32   # U[a] = global thread id / threads_per_simdgroup (grid-wide simdgroup index)
   OP_GRID_EPILOGUE* = 0x9C'u32  # next word = ctrl index; the last TG resets the counter, copies err -> lastErr
 
@@ -258,7 +259,7 @@ proc opHasWord*(op: uint32): bool {.inline.} =
 proc opImmediateWords*(op: uint32): int {.inline.} =
   ## Number of immediate words following an instruction. Most opcodes have
   ## zero or one; custom shape-specialized micro-kernels may carry more.
-  if op == OP_Q4_COOP_GEMM: return 5
+  if op in [OP_Q4_COOP_GEMM, OP_Q4_GEMV]: return 5
   if opHasWord(op): return 1
   0
 
@@ -276,6 +277,28 @@ proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) =
 proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
   p.emit OP_Q4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
+
+proc emitQ4Gemv*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
+  p.emit OP_Q4_GEMV
+  p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
+
+const Q4GemvThreads* = 128             ## workgroup width of the Q4 GEMV micro-kernel
+const Q4GemvRowChoices* = [1, 2, 4]    ## output rows one 32-lane subgroup computes
+const Q4GemvDefaultRows* = 2
+
+proc q4GemvSupported*(K, groupSize, nGroups: int): bool =
+  ## Shapes the Q4 GEMV micro-kernel handles: whole 32-bit words inside one group.
+  K > 0 and K mod 8 == 0 and groupSize > 0 and groupSize mod 8 == 0 and
+    K mod groupSize == 0 and nGroups == K div groupSize
+
+proc q4GemvRowsPerGroup*(rowsPerSubgroup: int; threads = Q4GemvThreads): int =
+  ## Output rows of one Q4 GEMV workgroup: one 32-lane group of invocations per
+  ## `rowsPerSubgroup` rows. The grid is ceil(N / this) workgroups per activation row.
+  rowsPerSubgroup * (threads div 32)
+
+proc q4GemvThreadCount*(M, N, rowsPerSubgroup: int; threads = Q4GemvThreads): int =
+  let perGroup = q4GemvRowsPerGroup(rowsPerSubgroup, threads)
+  M * ((N + perGroup - 1) div perGroup) * threads
 
 const Q4CoopRowTiles* = [64, 32, 16]   ## row tiles the Q4 cooperative-matrix shader is built for
 

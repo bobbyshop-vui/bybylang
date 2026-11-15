@@ -3,20 +3,27 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_control_flow_attributes : require
 
 // FIR custom micro-kernel for asymmetric Q4 prefill. This is compiled by the
 // micro-VM JIT and dispatched as a normal FIR micro node. It does not call the
-// native Q4/session GEMM path. One 128-thread workgroup computes BM rows x 64
-// columns (BM = q4CoopRowTile(M, N): 16, 32 or 64). Each K step dequantizes the
-// 64-column Q4 weight tile once into shared FP16 and reuses it for all BM rows,
-// so a 64-row prefill block reads and dequantizes every weight once instead of
-// once per 16 rows. Each subgroup owns 16-column fragments and keeps one
-// accumulator per 16-row tile.
+// native Q4/session GEMM path; its body follows the native tiled kernel
+// (matmul_fp4km_tiled.glsl, format 2).
+// One 128-invocation workgroup computes BM rows x 64 columns (BM =
+// q4CoopRowTile(rows, N): 16, 32 or 64, chosen per dispatch). Each 64-deep K
+// step dequantizes the 64-column Q4 weight tile once into shared FP16 (one
+// invocation per column half: one uvec4 = 32 K values) and reuses it for every
+// live 16-row tile. Each subgroup owns a 16-column fragment (FRAGS fragments when
+// the workgroup has fewer than four subgroups) with one accumulator per row tile;
+// all loops over fragments and row tiles are unrolled, so the accumulators stay
+// in registers.
+// Slots: memF32 = output [M, N]; memU8 = packed nibbles [N, K/2] followed by the
+// FP32 scales and zero points [N, N_GROUPS] (read through lut); input = x [M, K].
 layout(local_size_x_id = 0) in;
 layout(std430, set=0, binding=0) buffer MemF32Buf { float memF32[]; };
-layout(std430, set=0, binding=1) readonly buffer MemU8Buf { uint memU8[]; };
+layout(std430, set=0, binding=1) readonly buffer MemU8Buf { uvec4 memU8[]; };
 layout(std430, set=0, binding=2) readonly buffer LutBuf { float lut[]; };
-layout(std430, set=0, binding=3) readonly buffer InputBuf { float inF32[]; };
+layout(std430, set=0, binding=3) readonly buffer InputBuf { vec4 in4[]; };
 
 const uint Q4_M = @M@u;
 const uint Q4_K = @K@u;
@@ -24,50 +31,51 @@ const uint Q4_N = @N@u;
 const uint Q4_GROUP_SIZE = @GROUP_SIZE@u;
 const uint Q4_N_GROUPS = @N_GROUPS@u;
 const uint BM = @BM@u;
+const uint FRAGS = @FRAGS@u;               // 16-column fragments per subgroup
 const uint BN = 64u;
 const uint BK = 64u;
-const uint LDS = 72u;
+const uint LDS = BK + 8u;                  // padded row (halves): 144 bytes, 16-byte aligned
 const uint ROW_TILES = BM / 16u;
 const uint N_TILES = (Q4_N + BN - 1u) / BN;
-const uint ROW_WORDS = Q4_K / 8u;          // packed 32-bit words per weight row
+const uint ROW_UNITS = Q4_K / 32u;         // uvec4 units per weight row
+const uint K_VEC = Q4_K / 4u;
 const uint SCALE_BASE = (Q4_N * (Q4_K / 2u) + 3u) / 4u;
 const uint ZERO_BASE = SCALE_BASE + Q4_N * Q4_N_GROUPS;
-// A packed word holds 8 consecutive K values; they share one quantization group
-// whenever the group size is a multiple of 8.
-const bool WORD_GROUP = (Q4_GROUP_SIZE % 8u) == 0u;
+// A uvec4 holds 32 consecutive K values of one column; they share one
+// quantization group whenever the group size is a multiple of 32.
+const bool UNIT_GROUP = (Q4_GROUP_SIZE % 32u) == 0u;
 
 shared float16_t aTile[BM * LDS];
 shared float16_t bTile[BN * LDS];
-shared float cTile[4u * 256u];
+shared float cStage[4u * 256u];
 
 void main() {
     uint lid = gl_LocalInvocationID.x;
     uint threads = gl_WorkGroupSize.x;
-    uint subgroup = gl_SubgroupID;
+    uint sg = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
-    uint subgroupCount = gl_WorkGroupSize.x / gl_SubgroupSize;
+    uint subgroupCount = gl_NumSubgroups;
     uint row0 = (gl_WorkGroupID.x / N_TILES) * BM;
     uint col0 = (gl_WorkGroupID.x % N_TILES) * BN;
     // Uniform per workgroup. A graph lifted with a shorter row tile launches
     // workgroups past the last row; they have nothing to do.
     if (row0 >= Q4_M) return;
     uint liveTiles = min(ROW_TILES, (Q4_M - row0 + 15u) / 16u);
+    uint bCol = lid >> 1;
+    uint bHalf = lid & 1u;
+    uint gCol = col0 + bCol;
 
-    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[2u * ROW_TILES];
-    for (uint i = 0u; i < 2u * ROW_TILES; ++i)
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FRAGS * ROW_TILES];
+    [[unroll]] for (uint i = 0u; i < FRAGS * ROW_TILES; ++i)
         acc[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
 
     for (uint base = 0u; base < Q4_K; base += BK) {
-        // Stage the live row tiles of activations as FP16 (rows past M are zero).
+        // Activations: only live row tiles, 16 vec4 per row (rows past M are zero).
         for (uint i = lid; i < liveTiles * 16u * (BK / 4u); i += threads) {
-            uint r = i >> 4u;
+            uint r = i >> 4;
             uint q = i & 15u;
             uint row = row0 + r;
-            vec4 v = vec4(0.0);
-            if (row < Q4_M) {
-                uint x = row * Q4_K + base + q * 4u;
-                v = vec4(inF32[x], inF32[x + 1u], inF32[x + 2u], inF32[x + 3u]);
-            }
+            vec4 v = row < Q4_M ? in4[row * K_VEC + (base >> 2) + q] : vec4(0.0);
             uint o = r * LDS + q * 4u;
             aTile[o] = float16_t(v.x);
             aTile[o + 1u] = float16_t(v.y);
@@ -75,54 +83,48 @@ void main() {
             aTile[o + 3u] = float16_t(v.w);
         }
 
-        // Dequantize the 64-column x 64-K Q4 tile once: one packed word
-        // (8 K values of one column) per step, neighbouring lanes on the same row.
-        for (uint i = lid; i < BN * (BK / 8u); i += threads) {
-            uint c = i >> 3u;
-            uint w = i & 7u;
-            uint col = col0 + c;
-            uint k = base + w * 8u;
-            uint o = c * LDS + w * 8u;
-            if (col >= Q4_N) {
-                for (uint j = 0u; j < 8u; ++j) bTile[o + j] = float16_t(0.0);
-                continue;
+        // Weights: invocation (column, half) decodes one uvec4 = 32 K values.
+        if (lid < 2u * BN) {
+            uint kb = base + bHalf * 32u;
+            uvec4 packed = uvec4(0u);
+            if (gCol < Q4_N) packed = memU8[gCol * ROW_UNITS + (kb >> 5)];
+            uint ob = bCol * LDS + bHalf * 32u;
+            uint gBase = gCol * Q4_N_GROUPS;
+            float sc = 0.0;
+            float zr = 0.0;
+            if (UNIT_GROUP && gCol < Q4_N) {
+                sc = lut[SCALE_BASE + gBase + kb / Q4_GROUP_SIZE];
+                zr = lut[ZERO_BASE + gBase + kb / Q4_GROUP_SIZE];
             }
-            uint word = memU8[col * ROW_WORDS + (k >> 3u)];
-            uint group = col * Q4_N_GROUPS + k / Q4_GROUP_SIZE;
-            float scale = lut[SCALE_BASE + group];
-            float zero = lut[ZERO_BASE + group];
-            for (uint b = 0u; b < 4u; ++b) {
-                if (!WORD_GROUP && b > 0u) {
-                    uint pairGroup = col * Q4_N_GROUPS + (k + 2u * b) / Q4_GROUP_SIZE;
-                    if (pairGroup != group) {
-                        group = pairGroup;
-                        scale = lut[SCALE_BASE + group];
-                        zero = lut[ZERO_BASE + group];
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                uint word = packed[j];
+                [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                    if (!UNIT_GROUP && gCol < Q4_N) {
+                        uint g = gBase + (kb + 8u * j + 2u * b) / Q4_GROUP_SIZE;
+                        sc = lut[SCALE_BASE + g];
+                        zr = lut[ZERO_BASE + g];
                     }
+                    uint byteV = (word >> (8u * b)) & 255u;
+                    bTile[ob + 8u * j + 2u * b] = float16_t((float(byteV & 15u) - zr) * sc);
+                    bTile[ob + 8u * j + 2u * b + 1u] = float16_t((float(byteV >> 4) - zr) * sc);
                 }
-                uint byteValue = (word >> (8u * b)) & 255u;
-                bTile[o + 2u * b] = float16_t((float(byteValue & 15u) - zero) * scale);
-                bTile[o + 2u * b + 1u] = float16_t((float(byteValue >> 4u) - zero) * scale);
             }
         }
         barrier();
 
-        // Four subgroups on T4 own one 16-column fragment each; two wave64
-        // subgroups own two. Every fragment is multiplied with each live row tile.
-        for (uint kk = 0u; kk < BK; kk += 16u) {
-            for (uint fragment = 0u; fragment < 2u; ++fragment) {
-                uint colFragment = subgroup + fragment * subgroupCount;
+        [[unroll]] for (uint kk = 0u; kk < BK; kk += 16u) {
+            [[unroll]] for (uint f = 0u; f < FRAGS; ++f) {
+                uint colFragment = sg + f * subgroupCount;
                 if (colFragment < 4u) {
                     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bm;
                     coopMatLoad(bm, bTile, colFragment * 16u * LDS + kk, LDS,
                         gl_CooperativeMatrixLayoutColumnMajor);
-                    for (uint rt = 0u; rt < ROW_TILES; ++rt) {
-                        if (rt < liveTiles) {
+                    [[unroll]] for (uint r = 0u; r < ROW_TILES; ++r) {
+                        if (r < liveTiles) {
                             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> am;
-                            coopMatLoad(am, aTile, rt * 16u * LDS + kk, LDS,
+                            coopMatLoad(am, aTile, r * 16u * LDS + kk, LDS,
                                 gl_CooperativeMatrixLayoutRowMajor);
-                            acc[fragment * ROW_TILES + rt] =
-                                coopMatMulAdd(am, bm, acc[fragment * ROW_TILES + rt]);
+                            acc[f * ROW_TILES + r] = coopMatMulAdd(am, bm, acc[f * ROW_TILES + r]);
                         }
                     }
                 }
@@ -131,20 +133,21 @@ void main() {
         barrier();
     }
 
-    for (uint fragment = 0u; fragment < 2u; ++fragment) {
-        uint colFragment = subgroup + fragment * subgroupCount;
+    // Each subgroup stages its own 16x16 tile, then writes the in-bounds elements.
+    [[unroll]] for (uint f = 0u; f < FRAGS; ++f) {
+        uint colFragment = sg + f * subgroupCount;
         if (colFragment < 4u) {
-            for (uint rt = 0u; rt < ROW_TILES; ++rt) {
-                if (rt < liveTiles) {
-                    coopMatStore(acc[fragment * ROW_TILES + rt], cTile, colFragment * 256u, 16,
+            [[unroll]] for (uint r = 0u; r < ROW_TILES; ++r) {
+                if (r < liveTiles) {
+                    coopMatStore(acc[f * ROW_TILES + r], cStage, colFragment * 256u, 16,
                         gl_CooperativeMatrixLayoutRowMajor);
                     subgroupMemoryBarrierShared();
                     subgroupBarrier();
                     for (uint e = lane; e < 256u; e += gl_SubgroupSize) {
-                        uint row = row0 + rt * 16u + (e >> 4u);
+                        uint row = row0 + r * 16u + (e >> 4);
                         uint col = col0 + colFragment * 16u + (e & 15u);
                         if (row < Q4_M && col < Q4_N)
-                            memF32[row * Q4_N + col] = cTile[colFragment * 256u + e];
+                            memF32[row * Q4_N + col] = cStage[colFragment * 256u + e];
                     }
                     subgroupBarrier();
                 }

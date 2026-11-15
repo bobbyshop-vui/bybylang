@@ -547,8 +547,8 @@ proc closeBlocks(st: var LowerState) =
 
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM:
-    raise newException(ValueError, "Q4 cooperative micro-kernel is Vulkan-only")
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV]:
+    raise newException(ValueError, "Q4 Tensor Core and subgroup GEMV micro-kernels are Vulkan-only")
   var st = LowerState(indent: 2)
   # A chain kernel (grid control buffer) reads data other threadgroups wrote during the same
   # dispatch; those loads go through relaxed atomics, which are served from the coherent level.
@@ -649,11 +649,15 @@ proc q4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
       result.nGroups != result.K div result.groupSize:
     raise newException(ValueError, "unsupported Q4 cooperative micro-kernel shape")
 
-proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int): string =
+proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
   ## The Q4 cooperative-matrix shader built for one row tile (Q4CoopRowTiles). The runtime
   ## builds the tiles a graph can need and picks one per dispatch (q4CoopRowTile).
+  ## `fragments`: 16-column fragments per subgroup. 1 needs four subgroups per 128-invocation
+  ## workgroup (32-wide subgroups, guaranteed on NVIDIA); 2 also covers 64-wide subgroups.
   if rowTile notin Q4CoopRowTiles:
     raise newException(ValueError, "Q4 cooperative micro-kernel row tile must be 16, 32 or 64")
+  if fragments notin [1, 2]:
+    raise newException(ValueError, "Q4 cooperative micro-kernel fragments must be 1 or 2")
   let s = q4CoopShape(p)
   const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_q4_coop_micro.glsl")
   shaderTemplate
@@ -664,6 +668,42 @@ proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int): string =
     .replace("@GROUP_SIZE@", $s.groupSize)
     .replace("@N_GROUPS@", $s.nGroups)
     .replace("@BM@", $rowTile)
+    .replace("@FRAGS@", $fragments)
+
+proc isQ4GemvProgram*(p: VmProgram): bool =
+  p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV
+
+proc q4GemvShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+  ## Shape carried by a Q4 GEMV micro-kernel program.
+  if not p.isQ4GemvProgram or p.words.len != 7 or p.words[6] != OP_HALT:
+    raise newException(ValueError, "Q4 GEMV micro-kernel must be one shape op followed by halt")
+  result = (int(p.words[1]), int(p.words[2]), int(p.words[3]), int(p.words[4]), int(p.words[5]))
+  if result.M == 0 or result.N == 0 or not q4GemvSupported(result.K, result.groupSize, result.nGroups):
+    raise newException(ValueError, "unsupported Q4 GEMV micro-kernel shape")
+
+proc lowerQ4GemvGlsl*(p: VmProgram; kernelName: string; rowsPerSubgroup = Q4GemvDefaultRows;
+                      sharedReduce = true; threads = Q4GemvThreads): string =
+  ## The Q4 GEMV shader for `rowsPerSubgroup` output rows per 32 invocations. sharedReduce=false
+  ## sums with subgroupAdd and needs compute subgroups that are exactly 32 wide (NVIDIA); the
+  ## shared-memory sum runs on any device. The grid is q4GemvThreadCount(M, N, rows, threads).
+  if rowsPerSubgroup notin Q4GemvRowChoices:
+    raise newException(ValueError, "Q4 GEMV rows per subgroup must be 1, 2 or 4")
+  if threads <= 0 or threads mod 32 != 0:
+    raise newException(ValueError, "Q4 GEMV workgroup width must be a multiple of 32")
+  let s = q4GemvShape(p)
+  let vec = if s.K mod 32 == 0 and s.groupSize mod 32 == 0: 4 else: 1
+  const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_q4_gemv_micro.glsl")
+  shaderTemplate
+    .replace("@KERNEL@", kernelName)
+    .replace("@M@", $s.M)
+    .replace("@K@", $s.K)
+    .replace("@N@", $s.N)
+    .replace("@GROUP_SIZE@", $s.groupSize)
+    .replace("@N_GROUPS@", $s.nGroups)
+    .replace("@VEC@", $vec)
+    .replace("@ROWS@", $rowsPerSubgroup)
+    .replace("@WG@", $threads)
+    .replace("@SHARED_REDUCE@", (if sharedReduce: "1" else: "0"))
 
 proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
   ## Static Vulkan counterpart to the Metal bytecode JIT. In contrast to the
@@ -673,6 +713,9 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
     # Default tile for a device of unknown size; the FIR runtime builds its own per dispatch.
     let s = q4CoopShape(p)
     return lowerQ4CoopGlsl(p, kernelName, q4CoopRowTile(s.M, s.N))
+  if p.isQ4GemvProgram:
+    # Portable default (shared-memory sum); the FIR runtime picks the subgroup sum where it can.
+    return lowerQ4GemvGlsl(p, kernelName)
   var st = LowerState(indent: 2, glsl: true)
   st.lowerAll(p)
   st.closeBlocks()
