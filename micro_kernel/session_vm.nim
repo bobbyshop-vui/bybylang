@@ -94,6 +94,7 @@ const
   OP_MM_MAC*       = 0xA7'u32   # MM[a] = MM[b] * MM[c] + MM[a]
   OP_MM_STORE_TG*  = 0xA8'u32   # simdgroup_store(MM[a], tgF32 + U[b], ld = next word)
   OP_MM_STORE_MEM* = 0xA9'u32   # simdgroup_store(MM[a], memF32 + U[b], ld = next word)
+  OP_Q4_COOP_GEMM* = 0xAA'u32   # Vulkan micro-kernel: Q4 GEMM via KHR cooperative matrices; next 5 words are M,K,N,group,nGroups
   OP_SIMD_GID*     = 0xA4'u32   # U[a] = global thread id / threads_per_simdgroup (grid-wide simdgroup index)
   OP_GRID_EPILOGUE* = 0x9C'u32  # next word = ctrl index; the last TG resets the counter, copies err -> lastErr
 
@@ -254,6 +255,13 @@ proc opHasWord*(op: uint32): bool {.inline.} =
      OP_U_LOAD_F32, OP_U_ATOMIC_ADD, OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM: true
   else: false
 
+proc opImmediateWords*(op: uint32): int {.inline.} =
+  ## Number of immediate words following an instruction. Most opcodes have
+  ## zero or one; custom shape-specialized micro-kernels may carry more.
+  if op == OP_Q4_COOP_GEMM: return 5
+  if opHasWord(op): return 1
+  0
+
 proc emitSimdSum*(p: var VmProgram; rd, rs: uint32) = p.emit pack2(OP_SIMD_SUM, rd, rs)
 proc emitSimdLane*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_LANE, ud)
 proc emitSimdId*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_ID, ud)
@@ -265,6 +273,9 @@ proc emitMmStoreTg*(p: var VmProgram; ma, ub, ld: uint32) =
   p.emit pack2(OP_MM_STORE_TG, ma, ub); p.emit ld
 proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) =
   p.emit pack2(OP_MM_STORE_MEM, ma, ub); p.emit ld
+proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
+  p.emit OP_Q4_COOP_GEMM
+  p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
 proc emitSimdW*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_W, ud)
 proc emitSimdGid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_GID, ud)
 proc emitUTgid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_TGID, ud)

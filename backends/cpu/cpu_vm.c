@@ -41,7 +41,8 @@ enum {
     OP_GRID_EPILOGUE = 0x9C, OP_U_LOAD_U32 = 0x9D, OP_U_LOAD_IN4 = 0x9E,
     OP_SIMD_SUM = 0xA0, OP_SIMD_LANE = 0xA1, OP_SIMD_ID = 0xA2,
     OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4,
-    OP_MM_ZERO = 0xA5, OP_MM_LOAD = 0xA6, OP_MM_MAC = 0xA7, OP_MM_STORE_TG = 0xA8, OP_MM_STORE_MEM = 0xA9
+    OP_MM_ZERO = 0xA5, OP_MM_LOAD = 0xA6, OP_MM_MAC = 0xA7, OP_MM_STORE_TG = 0xA8, OP_MM_STORE_MEM = 0xA9,
+    OP_Q4_COOP_GEMM = 0xAA
 };
 
 typedef struct {
@@ -84,6 +85,8 @@ static int extra_words(uint32_t op) {
         return 1;
     case OP_VTG_BEGIN:
         return 2;
+    case OP_Q4_COOP_GEMM:
+        return 5;
     default:
         return 0;
     }
@@ -386,6 +389,66 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                         int64_t idx = base + (int64_t)i * ld + j + (int64_t)t->base_f32;
                         if (!check_idx(idx, mem_len, "mm_store", err, err_len)) { result = -1; goto done; }
                         mem[idx] = t->mm[a][i * 8 + j];
+                    }
+                }
+                break;
+            }
+            case OP_Q4_COOP_GEMM: {
+                if (npc + 5 > n_words) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated Q4 cooperative GEMM"); goto done;
+                }
+                uint32_t M = code[npc++], K = code[npc++], N = code[npc++];
+                uint32_t group_size = code[npc++], n_groups = code[npc++];
+                if (!M || !N || N < 16 || !K || K % 64 || group_size < 2 ||
+                    group_size % 2 || K % group_size || n_groups != K / group_size) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported Q4 cooperative shape"); goto done;
+                }
+                /* The CPU reference executes one tile per workgroup from lane zero. */
+                if (lid == 0) {
+                    const uint32_t n_tiles = (N + 63u) / 64u;
+                    const uint32_t row0 = ((uint32_t)tgid / n_tiles) * 16u;
+                    const uint32_t col0 = ((uint32_t)tgid % n_tiles) * 64u;
+                    const float* x = (in_f32 ? in_f32 : mem) + t->base_in;
+                    const int x_len = (in_f32 ? in_len : mem_len) - (int)t->base_in;
+                    if (!packed || !lut || x_len < 0 || (int)t->base_u8 > packed_len ||
+                        (int)t->base_lut > lut_len) {
+                        result = -1; snprintf(err, (size_t)err_len, "CPU VM Q4 cooperative slot is missing"); goto done;
+                    }
+                    const uint8_t* qdata = packed + t->base_u8;
+                    const int q_len = packed_len - (int)t->base_u8;
+                    const float* params = lut + t->base_lut;
+                    const int params_len = lut_len - (int)t->base_lut;
+                    const uint32_t row_bytes = K / 2u;
+                    const uint32_t scale_base = (N * row_bytes + 3u) / 4u;
+                    const uint32_t zero_base = scale_base + N * n_groups;
+                    for (uint32_t r = 0; r < 16u; ++r) {
+                        const uint32_t row = row0 + r;
+                        if (row >= M) continue;
+                        for (uint32_t c2 = 0; c2 < 64u; ++c2) {
+                            const uint32_t col = col0 + c2;
+                            if (col >= N) continue;
+                            float sum = 0.0f;
+                            for (uint32_t k = 0; k < K; ++k) {
+                                const uint32_t byte_idx = col * row_bytes + (k >> 1u);
+                                const uint32_t group = col * n_groups + k / group_size;
+                                const uint32_t scale_idx = scale_base + group;
+                                const uint32_t zero_idx = zero_base + group;
+                                const uint32_t x_idx = row * K + k;
+                                if (byte_idx >= (uint32_t)q_len || scale_idx >= (uint32_t)params_len ||
+                                    zero_idx >= (uint32_t)params_len || x_idx >= (uint32_t)x_len) {
+                                    result = -1; snprintf(err, (size_t)err_len, "CPU VM Q4 cooperative input out of range"); goto done;
+                                }
+                                const uint32_t qbyte = qdata[byte_idx];
+                                const uint32_t q = (qbyte >> ((k & 1u) * 4u)) & 15u;
+                                const float weight = ((float)q - params[zero_idx]) * params[scale_idx];
+                                sum = fmaf(x[x_idx], weight, sum);
+                            }
+                            const uint32_t out_idx = t->base_f32 + row * N + col;
+                            if (!check_idx((int64_t)out_idx, mem_len, "q4_coop_store", err, err_len)) {
+                                result = -1; goto done;
+                            }
+                            mem[out_idx] = sum;
+                        }
                     }
                 }
                 break;

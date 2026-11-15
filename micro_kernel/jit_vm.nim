@@ -547,6 +547,8 @@ proc closeBlocks(st: var LowerState) =
 
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM:
+    raise newException(ValueError, "Q4 cooperative micro-kernel is Vulkan-only")
   var st = LowerState(indent: 2)
   # A chain kernel (grid control buffer) reads data other threadgroups wrote during the same
   # dispatch; those loads go through relaxed atomics, which are served from the coherent level.
@@ -638,6 +640,27 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
   ## Static Vulkan counterpart to the Metal bytecode JIT. In contrast to the
   ## generic interpreter, this emits barriers at uniform static control-flow
   ## locations, which is required by Vulkan when per-lane IF/loop paths diverge.
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM:
+    if p.words.len != 7 or p.words[6] != OP_HALT:
+      raise newException(ValueError, "Q4 cooperative micro-kernel must be one shape op followed by halt")
+    let M = p.words[1]
+    let K = p.words[2]
+    let N = p.words[3]
+    let groupSize = p.words[4]
+    let nGroups = p.words[5]
+    if M == 0 or K == 0 or N == 0 or K mod 64 != 0 or N < 16 or
+        groupSize < 2 or groupSize mod 2 != 0 or K mod groupSize != 0 or
+        nGroups != K div groupSize:
+      raise newException(ValueError, "unsupported Q4 cooperative micro-kernel shape")
+    const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_q4_coop_micro.glsl")
+    result = shaderTemplate
+      .replace("@KERNEL@", kernelName)
+      .replace("@M@", $M)
+      .replace("@K@", $K)
+      .replace("@N@", $N)
+      .replace("@GROUP_SIZE@", $groupSize)
+      .replace("@N_GROUPS@", $nGroups)
+    return
   var st = LowerState(indent: 2, glsl: true)
   st.lowerAll(p)
   st.closeBlocks()
@@ -1011,10 +1034,11 @@ proc mergePart(dst: var VmProgram; part: VmProgram; pc: int; dropHalt: bool) =
   let op = w and 0xFF'u32
   if op == OP_HALT and dropHalt:
     dst.mergePart(part, pc + 1, dropHalt)
-  elif opHasWord(op) and pc + 1 < part.words.len:
+  elif opImmediateWords(op) > 0 and pc + opImmediateWords(op) < part.words.len:
     dst.words.add w
-    dst.words.add part.words[pc + 1]
-    dst.mergePart(part, pc + 2, dropHalt)
+    for i in 1 .. opImmediateWords(op):
+      dst.words.add part.words[pc + i]
+    dst.mergePart(part, pc + 1 + opImmediateWords(op), dropHalt)
   else:
     dst.words.add w
     dst.mergePart(part, pc + 1, dropHalt)

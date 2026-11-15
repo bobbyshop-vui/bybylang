@@ -28,6 +28,9 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
     of OP_LOAD_U8, OP_U_LOAD_U8, OP_U_LOAD_U32: result.reads.incl "u8"
     of OP_LUT_U8, OP_U_LOAD_CONSTF, OP_U_LOAD_META: result.reads.incl "lut"
     of OP_U_LOAD_IN, OP_U_LOAD_IN4: result.reads.incl "input"
+    of OP_Q4_COOP_GEMM:
+      result.reads.incl "u8"; result.reads.incl "lut"; result.reads.incl "input"
+      result.writes.incl "mem"
     of OP_GRID_BARRIER, OP_GRID_EPILOGUE:
       # Their control words refer to a device-side synchronization buffer.
       result.reads.incl "u32"; result.writes.incl "u32"
@@ -41,6 +44,7 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
        OP_U_LOAD_META, OP_GRID_BARRIER, OP_GRID_EPILOGUE,
        OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM: extra = 1
     of OP_VTG_BEGIN: extra = 2
+    of OP_Q4_COOP_GEMM: extra = 5
     of OP_NOP, OP_HALT, OP_LOAD_F32_IDX, OP_STORE_F32_IDX, OP_LOAD_LID,
        OP_LOAD_TGID, OP_ADD, OP_MUL, OP_SUB, OP_EXP, OP_NEG, OP_SIGMOID,
        OP_DIV, OP_SOFTPLUS, OP_RSQRT, OP_LUT_U8, OP_FOR_BEGIN, OP_FOR_END,
