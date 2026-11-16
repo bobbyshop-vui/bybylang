@@ -96,6 +96,7 @@ const
   OP_MM_STORE_MEM* = 0xA9'u32   # simdgroup_store(MM[a], memF32 + U[b], ld = next word)
   OP_Q4_COOP_GEMM* = 0xAA'u32   # Vulkan micro-kernel: Q4 GEMM via KHR cooperative matrices; next 5 words are M,K,N,group,nGroups
   OP_Q4_GEMV*      = 0xAB'u32   # Vulkan micro-kernel: subgroup Q4 GEMV for decode; next 5 words are M,K,N,group,nGroups
+  OP_FP4_COOP_GEMM* = 0xAC'u32  # Vulkan micro-kernel: FP4-KM GEMM via KHR cooperative matrices; next 5 words are M,K,N,32,K/32
   OP_SIMD_GID*     = 0xA4'u32   # U[a] = global thread id / threads_per_simdgroup (grid-wide simdgroup index)
   OP_GRID_EPILOGUE* = 0x9C'u32  # next word = ctrl index; the last TG resets the counter, copies err -> lastErr
 
@@ -259,7 +260,7 @@ proc opHasWord*(op: uint32): bool {.inline.} =
 proc opImmediateWords*(op: uint32): int {.inline.} =
   ## Number of immediate words following an instruction. Most opcodes have
   ## zero or one; custom shape-specialized micro-kernels may carry more.
-  if op in [OP_Q4_COOP_GEMM, OP_Q4_GEMV]: return 5
+  if op in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM]: return 5
   if opHasWord(op): return 1
   0
 
@@ -276,6 +277,12 @@ proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) =
   p.emit pack2(OP_MM_STORE_MEM, ma, ub); p.emit ld
 proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
   p.emit OP_Q4_COOP_GEMM
+  p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
+
+proc emitFp4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
+  ## FP4-KM GEMM shape op. The format fixes groupSize = 32 and nGroups = K / 32; both words are
+  ## kept so every cooperative-matrix shape op has the same five-word layout.
+  p.emit OP_FP4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
 
 proc emitQ4Gemv*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
@@ -300,7 +307,17 @@ proc q4GemvThreadCount*(M, N, rowsPerSubgroup: int; threads = Q4GemvThreads): in
   let perGroup = q4GemvRowsPerGroup(rowsPerSubgroup, threads)
   M * ((N + perGroup - 1) div perGroup) * threads
 
-const Q4CoopRowTiles* = [64, 32, 16]   ## row tiles the Q4 cooperative-matrix shader is built for
+const Q4CoopRowTiles* = [64, 32, 16]   ## row tiles the Q4 and FP4-KM cooperative-matrix shaders are built for
+
+proc fp4CoopSupported*(K, N, groupSize, nGroups: int): bool =
+  ## Shapes the FP4-KM cooperative-matrix micro-kernel handles: 64-deep K steps (two 32-value
+  ## groups, one uvec4 each) and at least one 16-column fragment.
+  K > 0 and K mod 64 == 0 and N >= 16 and groupSize == 32 and nGroups == K div 32
+
+proc fp4CoopLutWord*(K, N: int): int =
+  ## Float word of the 272-float decode table in an FP4-KM blob: after the nibble bytes
+  ## [N, K/2] and the scale bytes [N, K/32], padded to whole words.
+  (N * (K div 2) + N * (K div 32) + 3) div 4
 
 proc q4CoopRowTile*(rows, N: int; computeUnits = 0; perUnit = 2): int =
   ## Rows one 128-thread workgroup of the Q4 cooperative-matrix micro-kernel computes for a

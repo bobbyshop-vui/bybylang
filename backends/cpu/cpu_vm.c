@@ -42,7 +42,7 @@ enum {
     OP_SIMD_SUM = 0xA0, OP_SIMD_LANE = 0xA1, OP_SIMD_ID = 0xA2,
     OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4,
     OP_MM_ZERO = 0xA5, OP_MM_LOAD = 0xA6, OP_MM_MAC = 0xA7, OP_MM_STORE_TG = 0xA8, OP_MM_STORE_MEM = 0xA9,
-    OP_Q4_COOP_GEMM = 0xAA, OP_Q4_GEMV = 0xAB
+    OP_Q4_COOP_GEMM = 0xAA, OP_Q4_GEMV = 0xAB, OP_FP4_COOP_GEMM = 0xAC
 };
 
 typedef struct {
@@ -85,7 +85,7 @@ static int extra_words(uint32_t op) {
         return 1;
     case OP_VTG_BEGIN:
         return 2;
-    case OP_Q4_COOP_GEMM: case OP_Q4_GEMV:
+    case OP_Q4_COOP_GEMM: case OP_Q4_GEMV: case OP_FP4_COOP_GEMM:
         return 5;
     default:
         return 0;
@@ -448,6 +448,64 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                             }
                             const uint32_t out_idx = t->base_f32 + row * N + col;
                             if (!check_idx((int64_t)out_idx, mem_len, "q4_coop_store", err, err_len)) {
+                                result = -1; goto done;
+                            }
+                            mem[out_idx] = sum;
+                        }
+                    }
+                }
+                break;
+            }
+            case OP_FP4_COOP_GEMM: {
+                if (npc + 5 > n_words) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated FP4 shape op"); goto done;
+                }
+                uint32_t M = code[npc++], K = code[npc++], N = code[npc++];
+                uint32_t group_size = code[npc++], n_groups = code[npc++];
+                if (!M || !K || K % 64u || N < 16u || group_size != 32u || n_groups != K / 32u) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported FP4 cooperative shape"); goto done;
+                }
+                /* FP4-KM blob in the u8/lut slots: nibble bytes [N, K/2] (byte j of a 32-value
+                   group holds element j in the low nibble and j+16 in the high one), the E4M3
+                   scale bytes [N, K/32], padding to a whole word, then 272 floats: 16 FP4
+                   values and 256 scale values. weight = lut[nibble] * lut[16 + scale byte].
+                   Like the Q4 op, lane zero of the first workgroup computes the whole product,
+                   so the result does not depend on the grid the GPU runtime picks. */
+                if (tgid == 0 && lid == 0) {
+                    const float* x = (in_f32 ? in_f32 : mem) + t->base_in;
+                    const int64_t x_len = (int64_t)(in_f32 ? in_len : mem_len) - (int64_t)t->base_in;
+                    if (!packed || !lut || (int64_t)t->base_u8 > (int64_t)packed_len ||
+                        (int64_t)t->base_lut > (int64_t)lut_len) {
+                        result = -1; snprintf(err, (size_t)err_len, "CPU VM FP4 cooperative slot is missing"); goto done;
+                    }
+                    const uint8_t* qdata = packed + t->base_u8;
+                    const int64_t q_len = (int64_t)packed_len - (int64_t)t->base_u8;
+                    const float* params = lut + t->base_lut;
+                    const int64_t params_len = (int64_t)lut_len - (int64_t)t->base_lut;
+                    const uint64_t row_bytes = K / 2u;
+                    const uint64_t scale_bytes = (uint64_t)N * row_bytes;
+                    const uint64_t lut_base = (scale_bytes + (uint64_t)N * n_groups + 3u) / 4u;
+                    if ((int64_t)(scale_bytes + (uint64_t)N * n_groups) > q_len ||
+                        (int64_t)(lut_base + 272u) > params_len ||
+                        (int64_t)M * (int64_t)K > x_len) {
+                        result = -1; snprintf(err, (size_t)err_len, "CPU VM FP4 cooperative input out of range"); goto done;
+                    }
+                    const float* fp4 = params + lut_base;
+                    const float* scales = fp4 + 16;
+                    for (uint32_t row = 0; row < M; ++row) {
+                        for (uint32_t col = 0; col < N; ++col) {
+                            float sum = 0.0f;
+                            for (uint32_t g = 0; g < n_groups; ++g) {
+                                const float scale = scales[qdata[scale_bytes + (uint64_t)col * n_groups + g]];
+                                const uint8_t* bytes = qdata + (uint64_t)col * row_bytes + (uint64_t)g * 16u;
+                                const float* xg = x + (uint64_t)row * K + (uint64_t)g * 32u;
+                                for (uint32_t j = 0; j < 16u; ++j)
+                                    sum = fmaf(xg[j], fp4[bytes[j] & 15u] * scale, sum);
+                                for (uint32_t j = 0; j < 16u; ++j)
+                                    sum = fmaf(xg[16u + j], fp4[bytes[j] >> 4] * scale, sum);
+                            }
+                            const int64_t out_idx = (int64_t)t->base_f32 + (int64_t)row * N + col;
+                            if (!check_idx(out_idx, mem_len, "fp4_coop_store", err, err_len)) {
                                 result = -1; goto done;
                             }
                             mem[out_idx] = sum;

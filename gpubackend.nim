@@ -2575,6 +2575,9 @@ proc sessionFree*(backend: GpuBackend, h: var SessionHandle) {.probed.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
+  # A pooled device buffer comes back under the same raw handle; the recorder must not
+  # tie the next allocation to the freed buffer's identity (and its earlier writers).
+  if unlikely(firProbeOn) and h.kind in {gbMetal, gbVulkan}: probeForget(probeRaw(h))
 
   case chosen
   of gbMetal:

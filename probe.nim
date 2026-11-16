@@ -202,9 +202,12 @@ proc payloadHash(data: pointer; bytes: int): string =
   for i in 0 ..< bytes: hash = (hash xor uint64(p[i])) * 0x100000001b3'u64
   toHex(hash, 16)
 
-proc probeCapture*(data: pointer; bytes: int): string =
+proc probeCapture*(data: pointer; bytes: int; always = false): string =
   ## Fingerprints are cheap; optional exact bytes also preserve auxiliary uploads
   ## (composite arenas, LUTs, adapters) that need not exist in a checkpoint.
+  ## `always` keeps the bytes of a payload above BYBY_FIR_PROBE_DATA_MAX: content that no
+  ## checkpoint holds (a buffer rewritten on the device, read back once), so no fingerprint
+  ## can stand in for it.
   if not firProbeOn or data == nil or bytes <= 0: return ""
   probeLocked()
   if not capturing(): return ""
@@ -214,7 +217,7 @@ proc probeCapture*(data: pointer; bytes: int): string =
   # for checkpoint matching. Zero (the default) keeps the full auxiliary data.
   let limit = try: parseInt(getEnv("BYBY_FIR_PROBE_DATA_MAX", "0"))
               except ValueError: -1
-  if limit > 0 and bytes > limit: return
+  if limit > 0 and bytes > limit and not always: return
   if not state.captureOpen:
     if state.streaming:
       if state.dataFd < 0: return        # no data pipe: fingerprints only
@@ -622,8 +625,9 @@ proc probeTransfer*(kind, args: string) =
   probeEvent(kind & " t" & $state.nextTransfer & args & " op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
   inc state.nextTransfer
 
-proc probeUploaded*(raw, data: pointer; bytes: int) =
+proc probeUploaded*(raw, data: pointer; bytes: int; always = false) =
   ## Driver uploads also cover callers that bypass the semantic SessionHandle API.
+  ## `always`: see probeCapture (device-rewritten content read back for the recorder).
   if not firProbeOn or raw == nil or bytes <= 0: return
   probeLocked()
   let identity = probeNewIdentity()
@@ -634,7 +638,7 @@ proc probeUploaded*(raw, data: pointer; bytes: int) =
     var small = ""
     if data != nil and bytes mod 4 == 0 and bytes <= probeSmallLimit*4:
       small = probeSmallData(toOpenArray(cast[ptr UncheckedArray[uint32]](data), 0, bytes div 4-1))
-    probeTransfer("upload", " dst=" & id & "@0:" & $bytes & small & probeCapture(data, bytes))
+    probeTransfer("upload", " dst=" & id & "@0:" & $bytes & small & probeCapture(data, bytes, always))
 
 proc probeCpuView*(base: pointer; elements: int): string =
   ## CPU multi-buffer launches retain allocation identity and subrange aliases.

@@ -547,8 +547,8 @@ proc closeBlocks(st: var LowerState) =
 
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV]:
-    raise newException(ValueError, "Q4 Tensor Core and subgroup GEMV micro-kernels are Vulkan-only")
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM]:
+    raise newException(ValueError, "Q4/FP4 Tensor Core and subgroup GEMV micro-kernels are Vulkan-only")
   var st = LowerState(indent: 2)
   # A chain kernel (grid control buffer) reads data other threadgroups wrote during the same
   # dispatch; those loads go through relaxed atomics, which are served from the coherent level.
@@ -670,6 +670,48 @@ proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments 
     .replace("@BM@", $rowTile)
     .replace("@FRAGS@", $fragments)
 
+proc isFp4CoopProgram*(p: VmProgram): bool =
+  p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_FP4_COOP_GEMM
+
+proc fp4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+  ## Shape carried by an FP4-KM cooperative-matrix micro-kernel program (groupSize is always 32).
+  if not p.isFp4CoopProgram or p.words.len != 7 or p.words[6] != OP_HALT:
+    raise newException(ValueError, "FP4 cooperative micro-kernel must be one shape op followed by halt")
+  result = (int(p.words[1]), int(p.words[2]), int(p.words[3]), int(p.words[4]), int(p.words[5]))
+  if result.M == 0 or not fp4CoopSupported(result.K, result.N, result.groupSize, result.nGroups):
+    raise newException(ValueError, "unsupported FP4 cooperative micro-kernel shape")
+
+proc lowerFp4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
+  ## The FP4-KM cooperative-matrix shader built for one row tile (Q4CoopRowTiles, chosen per
+  ## dispatch with q4CoopRowTile like the Q4 shader). `fragments` as in lowerQ4CoopGlsl.
+  if rowTile notin Q4CoopRowTiles:
+    raise newException(ValueError, "FP4 cooperative micro-kernel row tile must be 16, 32 or 64")
+  if fragments notin [1, 2]:
+    raise newException(ValueError, "FP4 cooperative micro-kernel fragments must be 1 or 2")
+  let s = fp4CoopShape(p)
+  const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_fp4_coop_micro.glsl")
+  shaderTemplate
+    .replace("@KERNEL@", kernelName)
+    .replace("@M@", $s.M)
+    .replace("@K@", $s.K)
+    .replace("@N@", $s.N)
+    .replace("@N_GROUPS@", $s.nGroups)
+    .replace("@BM@", $rowTile)
+    .replace("@FRAGS@", $fragments)
+
+proc isCoopGemmProgram*(p: VmProgram): bool =
+  ## A cooperative-matrix GEMM shape op of either weight format (Q4 or FP4-KM).
+  p.isQ4CoopProgram or p.isFp4CoopProgram
+
+proc coopGemmShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+  if p.isFp4CoopProgram: fp4CoopShape(p) else: q4CoopShape(p)
+
+proc lowerCoopGemmGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
+  ## The cooperative-matrix shader of either weight format for one row tile; both formats share
+  ## the slot layout, the 128-invocation workgroup, the 64-column tiles and the row tile choice.
+  if p.isFp4CoopProgram: lowerFp4CoopGlsl(p, kernelName, rowTile, fragments)
+  else: lowerQ4CoopGlsl(p, kernelName, rowTile, fragments)
+
 proc isQ4GemvProgram*(p: VmProgram): bool =
   p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV
 
@@ -713,6 +755,9 @@ proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
     # Default tile for a device of unknown size; the FIR runtime builds its own per dispatch.
     let s = q4CoopShape(p)
     return lowerQ4CoopGlsl(p, kernelName, q4CoopRowTile(s.M, s.N))
+  if p.isFp4CoopProgram:
+    let s = fp4CoopShape(p)
+    return lowerFp4CoopGlsl(p, kernelName, q4CoopRowTile(s.M, s.N))
   if p.isQ4GemvProgram:
     # Portable default (shared-memory sum); the FIR runtime picks the subgroup sum where it can.
     return lowerQ4GemvGlsl(p, kernelName)
