@@ -918,6 +918,9 @@ proc probeValue*(be: GpuBackend): string =
   if name == "vulkan" and not probeDeviceKnown():
     # Lets the lifter target what this device runs (FIRLIFT_Q4_GEMM=auto: Tensor Core GEMMs).
     probeDevice(if vulkanCooperativeGemmEnabled(): "coopmatrix" else: "plain")
+  elif name == "metal" and not probeDeviceKnown():
+    # Apple GPUs run the same Tensor Core micro-kernels through MSL simdgroup_matrix.
+    probeDevice(if metalSimdgroupMatrixSupported(): "simdmatrix" else: "plain")
   name
 
 proc probeBackendValue*(be: GpuBackend) =
@@ -1079,6 +1082,11 @@ proc sessionCooperativeGemmJobs*(backend: GpuBackend):
 proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool {.probed.} =
   ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
   normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
+
+proc sessionSimdgroupMatrixEnabled*(backend: GpuBackend): bool =
+  ## True when the Metal GPU runs the Tensor Core micro-kernels lowered to MSL simdgroup_matrix
+  ## (Apple GPU family 7+; never on Intel/AMD Macs).
+  normalizeBackend(backend) == gbMetal and metalSimdgroupMatrixSupported()
 
 proc gpuComputeUnits*(backend: GpuBackend): int =
   ## SM/CU count of a Vulkan device (0: unknown or another backend).
@@ -2431,51 +2439,124 @@ proc sessionVulkanTarget(backend: GpuBackend): bool =
   if chosen == gbAuto: chosen = detectBackend()
   chosen == gbVulkan or chosen == gbCuda
 
+when defined(macosx):
+  proc metal_session_can_record(): cint {.importc, header: "metal_shim.h".}
+  proc metal_session_record_begin(): cint {.importc, header: "metal_shim.h".}
+  proc metal_session_last_recording(): cint {.importc, header: "metal_shim.h".}
+  proc metal_session_record_reason(): cstring {.importc, header: "metal_shim.h".}
+  proc metal_session_recording_uses_icb(rid: cint): cint {.importc, header: "metal_shim.h".}
+  proc metal_session_replay(rid: cint): cint {.importc, header: "metal_shim.h".}
+  proc metal_session_free_recording(rid: cint) {.importc, header: "metal_shim.h".}
+  proc metal_host_buffer(n: cint): MetalBufferHandle {.importc, header: "metal_shim.h".}
+  proc metal_host_write(h: MetalBufferHandle, data: ptr float32, n: cint): cint {.importc, header: "metal_shim.h".}
+  proc metal_host_read(h: MetalBufferHandle, data: ptr float32, n: cint): cint {.importc, header: "metal_shim.h".}
+  proc metal_jit_compile_c(source, kernelName: cstring): cint {.importc: "metal_jit_compile", header: "metal_shim.h".}
+
+proc sessionMetalTarget(backend: GpuBackend): bool =
+  when defined(macosx):
+    var chosen = backend
+    if chosen == gbAuto: chosen = detectBackend()
+    chosen == gbMetal
+  else:
+    false
+
+proc sessionMetalJitCompile*(name, source: string): bool =
+  ## Compiles an MSL kernel `name` once for the Metal encode API (sessionEncPipeline(false, name)).
+  when defined(macosx):
+    metal_jit_compile_c(source.cstring, name.cstring) != 0
+  else:
+    false
+
 proc sessionCanRecord*(backend: GpuBackend): bool =
   ## True when the backend can keep a finished session and submit it again
-  ## (sessionBeginRecording / sessionReplay). Vulkan only.
-  sessionVulkanTarget(backend)
+  ## (sessionBeginRecording / sessionReplay): Vulkan and Metal.
+  if sessionVulkanTarget(backend): return true
+  when defined(macosx):
+    if sessionMetalTarget(backend): return metal_session_can_record() != 0
+  false
 
 proc sessionBeginRecording*(backend: GpuBackend): bool =
-  ## Like sessionBegin, but the session's command buffer is kept by sessionEnd when
-  ## it is self-contained (no staging, deferred frees or internal buffers); see
+  ## Like sessionBegin, but the session's commands are kept by sessionEnd when it is
+  ## self-contained (no staging, deferred frees or internal buffers); see
   ## sessionLastRecording. Mid-session commits are skipped while recording.
-  if not sessionVulkanTarget(backend): return false
-  vulkanSessionBegin(reusable = true)
+  ## Metal records the dispatches as they are encoded and replays them from an indirect
+  ## command buffer (BYBY_METAL_REPLAY_ICB=0: re-issued on a plain encoder).
+  if sessionVulkanTarget(backend): return vulkanSessionBegin(reusable = true)
+  when defined(macosx):
+    if sessionMetalTarget(backend):
+      if not sessionBegin(gbMetal): return false
+      if metal_session_record_begin() == 0:
+        discard sessionEnd(gbMetal)
+        return false
+      return true
+  false
 
 proc sessionLastRecording*(backend: GpuBackend): int =
   ## The id the last sessionEnd kept, or -1 when the session could not be kept.
-  if not sessionVulkanTarget(backend): return -1
-  vulkanLastRecording()
+  if sessionVulkanTarget(backend): return vulkanLastRecording()
+  when defined(macosx):
+    if sessionMetalTarget(backend): return int(metal_session_last_recording())
+  -1
+
+proc sessionRecordingNote*(backend: GpuBackend, id: int): string =
+  ## Metal: why the last recording was not kept (id < 0), or how a kept one replays.
+  when defined(macosx):
+    if sessionMetalTarget(backend):
+      if id < 0: return $metal_session_record_reason()
+      return (if metal_session_recording_uses_icb(id.cint) != 0: "indirect command buffer" else: "plain encoder")
+  ""
 
 proc sessionReplay*(backend: GpuBackend, id: int): bool =
   ## Submits a kept recording again and waits for it (outside any session).
-  if not sessionVulkanTarget(backend): return false
-  vulkanReplay(id)
+  if sessionVulkanTarget(backend): return vulkanReplay(id)
+  when defined(macosx):
+    if sessionMetalTarget(backend): return metal_session_replay(id.cint) != 0
+  false
 
 proc sessionFreeRecording*(backend: GpuBackend, id: int) =
   if sessionVulkanTarget(backend): vulkanFreeRecording(id)
+  when defined(macosx):
+    if sessionMetalTarget(backend): metal_session_free_recording(id.cint)
 
 proc sessionHostBuffer*(backend: GpuBackend, n: int, readback = false): SessionHandle =
   ## A persistently mapped host-visible buffer of n floats that sessions can copy into
   ## or out of; the host writes it with sessionHostWrite and reads it with sessionHostRead.
-  ## Free it with sessionFree.
-  if not sessionVulkanTarget(backend): return
-  result.kind = gbVulkan
-  result.vulkanHandle = vulkanHostBuffer(n, readback)
+  ## Free it with sessionFree. Metal: a Shared buffer.
+  if sessionVulkanTarget(backend):
+    result.kind = gbVulkan
+    result.vulkanHandle = vulkanHostBuffer(n, readback)
+    return
+  when defined(macosx):
+    if sessionMetalTarget(backend):
+      result.kind = gbMetal
+      result.metalHandle = metal_host_buffer(n.cint)
 
 proc sessionHostWrite*(backend: GpuBackend, h: SessionHandle, data: openArray[float32]): bool =
-  if not sessionVulkanTarget(backend): return false
-  vulkanHostWrite(h.vulkanHandle, data)
+  if sessionVulkanTarget(backend): return vulkanHostWrite(h.vulkanHandle, data)
+  when defined(macosx):
+    if sessionMetalTarget(backend):
+      if h.metalHandle == nil: return false
+      if data.len == 0: return true
+      return metal_host_write(h.metalHandle, unsafeAddr data[0], data.len.cint) != 0
+  false
 
 proc sessionHostRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] =
-  if not sessionVulkanTarget(backend): return @[]
-  vulkanHostRead(h.vulkanHandle, n)
+  if sessionVulkanTarget(backend): return vulkanHostRead(h.vulkanHandle, n)
+  when defined(macosx):
+    if sessionMetalTarget(backend):
+      if h.metalHandle == nil or n <= 0: return @[]
+      result = newSeq[float32](n)
+      if metal_host_read(h.metalHandle, addr result[0], n.cint) == 0: return @[]
+      return
+  @[]
 
 proc sessionHostReadBarrier*(backend: GpuBackend): bool =
   ## Records a barrier making earlier copies into host buffers visible to the host.
-  if not sessionVulkanTarget(backend): return false
-  vulkanSessionHostReadBarrier()
+  ## Metal: Shared buffers are coherent once the command buffer completes; nothing to record.
+  if sessionVulkanTarget(backend): return vulkanSessionHostReadBarrier()
+  when defined(macosx):
+    if sessionMetalTarget(backend): return true
+  false
 
 proc sessionRecoverQueue*(backend: GpuBackend): bool {.probed.} =
   ## NEW: call right after sessionEnd() returns false - recreates the

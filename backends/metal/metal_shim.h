@@ -10,6 +10,11 @@ extern "C" {
 int metal_available(void);
 // 1 when the Metal GPU is an Apple GPU (Apple Silicon), 0 for Intel/AMD.
 int metal_is_apple_gpu(void);
+// 1 when the Metal GPU runs MSL simdgroup_matrix (Apple GPU family 7+: M1/A14 and newer), 0 otherwise.
+int metal_simdgroup_matrix_supported(void);
+// Compiles MSL source into a library (language version 2.3) without creating a pipeline.
+// Returns 1 on success; on failure *error_out (if not NULL) gets a strdup'ed message.
+int metal_library_compile_check(const char* source, char** error_out);
 
 // kernel_src: Metal Shading Language source (read from kernels/vecop_matmul.metal
 // at Nim compile time through staticRead, NO longer hardcoded in the .m file).
@@ -441,6 +446,25 @@ int metal_graph_run(int pos, int seq, int slotIn, int slotOut);
 
 int metal_device_max_tg_threads(void);
 int metal_device_max_tg_bytes(void);
+
+/* Session record / replay (see the notes at the end of metal_shim.m).
+   metal_session_record_begin: call right after metal_session_begin; the session runs normally and
+   its dispatches are also recorded. metal_session_end keeps the recording when it is replayable;
+   metal_session_last_recording then returns its id (-1: not kept, metal_session_record_reason says
+   why). metal_session_replay submits a recording again in its own command buffer and waits, outside
+   any session. BYBY_METAL_REPLAY_ICB=0 replays on a plain encoder instead of an indirect command
+   buffer. */
+int metal_session_can_record(void);
+int metal_session_record_begin(void);
+int metal_session_last_recording(void);
+const char *metal_session_record_reason(void);
+int metal_session_recording_uses_icb(int rid);
+int metal_session_replay(int rid);
+void metal_session_free_recording(int rid);
+/* Shared buffer of n floats written and read by the host (metal_buffer_free releases it). */
+MetalBufferHandle metal_host_buffer(int n);
+int metal_host_write(MetalBufferHandle h, const float *data, int n);
+int metal_host_read(MetalBufferHandle h, float *out, int n);
 
 #ifdef __cplusplus
 }

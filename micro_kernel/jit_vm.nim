@@ -545,10 +545,18 @@ proc closeBlocks(st: var LowerState) =
   st.body.add st.ind() & "}"
   st.closeBlocks()
 
+proc coopGemmShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int]
+proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string
+
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM]:
-    raise newException(ValueError, "Q4/FP4 Tensor Core and subgroup GEMV micro-kernels are Vulkan-only")
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM]:
+    # Tensor Core GEMM shape op -> simdgroup_matrix kernel (Apple GPUs). Default tile for a
+    # device of unknown size; the FIR runtime builds its own tiles per dispatch.
+    let s = coopGemmShape(p)
+    return lowerCoopGemmMetal(p, kernelName, q4CoopRowTile(s.M, s.N))
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV:
+    raise newException(ValueError, "the Q4 subgroup GEMV micro-kernel is Vulkan-only")
   var st = LowerState(indent: 2)
   # A chain kernel (grid control buffer) reads data other threadgroups wrote during the same
   # dispatch; those loads go through relaxed atomics, which are served from the coherent level.
@@ -711,6 +719,46 @@ proc lowerCoopGemmGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragment
   ## the slot layout, the 128-invocation workgroup, the 64-column tiles and the row tile choice.
   if p.isFp4CoopProgram: lowerFp4CoopGlsl(p, kernelName, rowTile, fragments)
   else: lowerQ4CoopGlsl(p, kernelName, rowTile, fragments)
+
+const SimdgroupMatrixRequired* = "needs MSL simdgroup_matrix (an Apple GPU, family 7+); this Metal device does not have it"
+  ## Shared wording of the error raised when a Tensor Core micro-kernel meets a Metal GPU without simdgroup_matrix.
+
+proc lowerQ4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+  ## Metal counterpart of lowerQ4CoopGlsl: the same shape op, slots, 128-thread threadgroup,
+  ## 64-column tiles and row tile choice, with MSL simdgroup_matrix (FP32 8x8 fragments)
+  ## instead of KHR cooperative matrices. Runs only on Apple GPUs (family 7+).
+  if rowTile notin Q4CoopRowTiles:
+    raise newException(ValueError, "Q4 cooperative micro-kernel row tile must be 16, 32 or 64")
+  let s = q4CoopShape(p)
+  const shaderTemplate = staticRead("../backends/metal/kernels/fir_q4_simd_micro.metal")
+  shaderTemplate
+    .replace("@KERNEL@", kernelName)
+    .replace("@M@", $s.M)
+    .replace("@K@", $s.K)
+    .replace("@N@", $s.N)
+    .replace("@GROUP_SIZE@", $s.groupSize)
+    .replace("@N_GROUPS@", $s.nGroups)
+    .replace("@BM@", $rowTile)
+
+proc lowerFp4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+  ## Metal counterpart of lowerFp4CoopGlsl (simdgroup_matrix, Apple GPUs only).
+  if rowTile notin Q4CoopRowTiles:
+    raise newException(ValueError, "FP4 cooperative micro-kernel row tile must be 16, 32 or 64")
+  let s = fp4CoopShape(p)
+  const shaderTemplate = staticRead("../backends/metal/kernels/fir_fp4_simd_micro.metal")
+  shaderTemplate
+    .replace("@KERNEL@", kernelName)
+    .replace("@M@", $s.M)
+    .replace("@K@", $s.K)
+    .replace("@N@", $s.N)
+    .replace("@N_GROUPS@", $s.nGroups)
+    .replace("@BM@", $rowTile)
+
+proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+  ## The simdgroup_matrix kernel of either weight format for one row tile. The grid is the
+  ## Vulkan one: ceil(rows / rowTile) * ceil(N / 64) threadgroups of 128 threads.
+  if p.isFp4CoopProgram: lowerFp4CoopMetal(p, kernelName, rowTile)
+  else: lowerQ4CoopMetal(p, kernelName, rowTile)
 
 proc isQ4GemvProgram*(p: VmProgram): bool =
   p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV

@@ -32,6 +32,18 @@ when defined(macosx):
   proc metal_available_c(): cint {.importc: "metal_available", header: "metal_shim.h".}
   proc metal_is_apple_gpu_c(): cint {.importc: "metal_is_apple_gpu", header: "metal_shim.h".}
   proc metalIsAppleGpu*(): bool = metal_is_apple_gpu_c() != 0
+  proc metal_simdgroup_matrix_supported_c(): cint {.importc: "metal_simdgroup_matrix_supported", header: "metal_shim.h".}
+  proc metalSimdgroupMatrixSupported*(): bool =
+    ## The GPU runs MSL simdgroup_matrix (Apple GPU family 7+). BYBY_METAL_SIMDGROUP_MATRIX=0 hides it.
+    getEnv("BYBY_METAL_SIMDGROUP_MATRIX", "1") != "0" and metal_simdgroup_matrix_supported_c() != 0
+  proc metal_library_compile_check_c(source: cstring; errorOut: ptr cstring): cint {.importc: "metal_library_compile_check", header: "metal_shim.h".}
+  proc metalLibraryCompileCheck*(source: string): tuple[ok: bool, error: string] =
+    ## Compiles MSL (language version 2.3) with the Metal framework compiler, no pipeline.
+    var err: cstring = nil
+    result.ok = metal_library_compile_check_c(source.cstring, addr err) != 0
+    if err != nil:
+      result.error = $err
+      c_free(err)
   proc metal_vecop_c(kernelSrc: cstring, op: cint, a, b: ptr float32, c: ptr float32, n: cint, error_out: ptr cstring): cint
     {.importc: "metal_vecop", header: "metal_shim.h".}
   proc metal_matmul_c(kernelSrc: cstring, a, b: ptr float32, c: ptr float32, m, k, n: cint, error_out: ptr cstring): cint
@@ -983,6 +995,8 @@ when not defined(macosx):
 
   proc metalAvailable*(): bool = false
   proc metalIsAppleGpu*(): bool = false
+  proc metalSimdgroupMatrixSupported*(): bool = false
+  proc metalLibraryCompileCheck*(source: string): tuple[ok: bool, error: string] = (false, "Metal is only available on macOS")
   proc metalVecOp*(op: string, a, b: seq[float32]): seq[float32] =
     raise newException(CatchableError, "The Metal backend is only available on macOS")
   proc metalMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =

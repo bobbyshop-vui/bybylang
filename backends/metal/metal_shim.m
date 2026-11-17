@@ -59,6 +59,14 @@ static void residencyAdd(id<MTLBuffer> buf);
 static void residencyCommit(void);
 static void residencyRemove(id<MTLBuffer> buf);
 static BOOL poolGive(id<MTLBuffer> buf);
+// Session recording (metal_session_record_begin, see "Session record / replay" at the end of
+// the file): anything that makes the recorded commands depend on per-session host work marks
+// the recording as not replayable.
+static BOOL gSessRecording = NO;
+static void bbSessRecFail(const char *why);
+static BOOL bbSessRecEndEncoder(void);
+static void bbSessRecFinish(BOOL executed);
+static void bbSessRecSplit(void);
 static id<MTLCommandQueue> gQueue = nil;
 static id<MTLLibrary> gLibrary = nil;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *gPipelineCache = nil;
@@ -194,6 +202,37 @@ int metal_is_apple_gpu(void) {
         if (!device) return 0;
         if (@available(macOS 10.15, *)) return [device supportsFamily:MTLGPUFamilyApple1] ? 1 : 0;
         return 0;
+    }
+}
+
+// 1 when the Metal GPU runs simdgroup_matrix kernels (the same Apple7 check as the native
+// simdgroup GEMMs), 0 for Intel/AMD GPUs and older Apple GPUs.
+int metal_simdgroup_matrix_supported(void) {
+    @autoreleasepool {
+        id<MTLDevice> device = gDevice ? gDevice : pickMetalDevice();
+        if (!device) return 0;
+        if (@available(macOS 10.15, *)) return [device supportsFamily:MTLGPUFamilyApple7] ? 1 : 0;
+        return 0;
+    }
+}
+
+int metal_library_compile_check(const char* source, char** error_out) {
+    @autoreleasepool {
+        if (error_out) *error_out = NULL;
+        id<MTLDevice> device = gDevice ? gDevice : pickMetalDevice();
+        if (!device || !source) {
+            if (error_out) *error_out = strdup("no Metal device");
+            return 0;
+        }
+        MTLCompileOptions* opts = [MTLCompileOptions new];
+        if (@available(macOS 11.0, *)) opts.languageVersion = MTLLanguageVersion2_3;
+        NSError* err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:source] options:opts error:&err];
+        if (!lib) {
+            if (error_out) *error_out = strdup(err ? err.description.UTF8String : "unknown error");
+            return 0;
+        }
+        return 1;
     }
 }
 
@@ -905,6 +944,7 @@ MetalBufferHandle metal_upload(const float* data, int n) {
         if (!gDevice) { NSLog(@"[metal_upload] gDevice not initialised - call metal_init() first"); return NULL; }
         size_t bytes = (size_t)n * sizeof(float);
         if (gGraphRecording) gGraphRecordFailed = YES;   // per-token data would be baked into the graph
+        if (gSessRecording) bbSessRecFail("a buffer was uploaded while recording");
         BOOL recycled = NO;
         id<MTLBuffer> buf = poolTake(bytes, &recycled);
         if (!buf) { NSLog(@"[metal_upload] tao buffer FAILED (n=%d)", n); return NULL; }
@@ -1073,6 +1113,7 @@ static BOOL poolGive(id<MTLBuffer> buf) {
 MetalBufferHandle metal_alloc_scratch(int n) {
     @autoreleasepool {
         size_t bytes = (size_t)n * sizeof(float);
+        if (gSessRecording) bbSessRecFail("a scratch buffer was allocated while recording");
         BOOL recycled = NO;
         id<MTLBuffer> buf = poolTake(bytes, &recycled);
         if (!buf) { NSLog(@"[metal_alloc_scratch] tao buffer FAILED (n=%d)", n); return NULL; }
@@ -2513,6 +2554,8 @@ int metal_kv_scatter_enc(MetalBufferHandle src, MetalBufferHandle dst, int T, in
 int metal_session_end(void) {
     @autoreleasepool {
         if (!gSessionEncoder || !gSessionCmdBuf) { return 0; }  // CHANGED: no NSLog spam - the safety logic stays (returns 0 so the caller knows no session is open)
+        const BOOL recording = gSessRecording;
+        if (recording && !bbSessRecEndEncoder()) bbSessRecFail("the session encoder was replaced (MPS)");
         [gSessionEncoder endEncoding];
         static int logSession = -1;
         if (logSession < 0) logSession = getenv("BYBY_SESSION_LOG") != NULL;
@@ -2539,6 +2582,7 @@ int metal_session_end(void) {
         }
         gSessionEncoder = nil;
         gSessionCmdBuf = nil;
+        if (recording) bbSessRecFinish(ok);
         return ok ? 1 : 0;
     }
 }
@@ -2577,6 +2621,9 @@ int metal_session_commit_continue(void) {
             NSLog(@"[metal_session_commit_continue] no session is open");
             return 0;
         }
+        // While recording, the commit point is kept as a split of the recording (the replay submits
+        // each part as its own command buffer without waiting) and the session goes on unsplit.
+        if (gSessRecording) { bbSessRecSplit(); return 1; }
         [gSessionEncoder endEncoding];
         // NON-BLOCKING (async) log if this buffer eventually fails - only for debugging,
         // no speed impact because nothing waits for the handler.
@@ -2608,7 +2655,13 @@ static NSMutableArray<id<MTLCommandBuffer>> *gInflight = nil;
 int metal_session_end_async(void) {
     @autoreleasepool {
         if (!gSessionEncoder || !gSessionCmdBuf) return 0;
+        const BOOL recording = gSessRecording;
+        if (recording) {
+            bbSessRecFail("the session was ended without waiting");
+            if (!bbSessRecEndEncoder()) bbSessRecFail("the session encoder was replaced (MPS)");
+        }
         [gSessionEncoder endEncoding];
+        if (recording) bbSessRecFinish(NO);
         if (!gInflight) gInflight = [NSMutableArray new];
         [gSessionCmdBuf commit];
         [gInflight addObject:gSessionCmdBuf];
@@ -2732,6 +2785,7 @@ void metal_buffer_free(MetalBufferHandle h) {
         // variable that releases it when leaving the scope - the counterpart of
         // the __bridge_retained used by metal_upload/metal_alloc_scratch to create the handle.
         id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)h;
+        if (gSessRecording) bbSessRecFail("a buffer was freed while recording");
         residencyRemove(buf);
         (void)poolGive(buf);   // kept by the pool, or released here by ARC
     }
@@ -3755,4 +3809,485 @@ int metal_device_max_tg_threads(void) {
 int metal_device_max_tg_bytes(void) {
     if (!gDevice) return 0;
     return (int)gDevice.maxThreadgroupMemoryLength;
+}
+
+/* ============================================================
+ * Session record / replay (sessionBeginRecording / sessionReplay in gpubackend.nim)
+ *
+ * metal_session_record_begin swaps the open session's encoder for BBSessRecorder, which forwards
+ * every call to the real encoder (the session still runs normally) and also writes down each
+ * dispatch with the pipeline, buffer bindings, setBytes data and threadgroup memory in effect.
+ * When metal_session_end completes the session and nothing unreplayable happened, the commands
+ * are kept as a recording that metal_session_replay submits again in a new command buffer:
+ *   (a) an MTLIndirectCommandBuffer built once from the commands and run with
+ *       executeCommandsInBuffer (needs pipelines created for indirect command buffers);
+ *   (b) otherwise, or with BYBY_METAL_REPLAY_ICB=0, the commands are re-issued on a plain encoder
+ *       in one tight loop that only sets what changed since the previous command.
+ * Either way the replay binds the same buffer objects, so host-visible (Shared) buffers the host
+ * rewrites between replays carry the per-step inputs and outputs.
+ * A recording is refused (metal_session_last_recording returns -1) when the session uploads,
+ * allocates or frees buffers, ends without waiting, or uses an encoder call the recorder does
+ * not know (an MPS kernel ends the encoder) - the same rule as the Vulkan recorder.
+ * ============================================================ */
+
+typedef struct {
+    uint32_t pso;                 // index into the recording's pipelines
+    uint32_t bindFirst, bindCount;
+    uint32_t tgLen[4];
+    MTLSize grid, tpt;
+    uint8_t exact;                // dispatchThreadgroups (1) or dispatchThreads (0)
+    uint8_t barrier;              // a buffer barrier was encoded before this dispatch
+} BBRecCmd;
+
+typedef struct {
+    uint32_t index;               // [[buffer(index)]]
+    uint32_t res;                 // index into the recording's buffers, UINT32_MAX for setBytes data
+    NSUInteger offset;            // buffer offset, or the data's offset in the bytes blob
+    uint32_t len;                 // setBytes length
+} BBRecBind;
+
+typedef struct {
+    uint8_t kind;                 // 0 unbound, 1 buffer, 2 bytes
+    uint32_t res;
+    NSUInteger offset;
+    uint32_t len;
+} BBRecSlot;
+
+#define BB_REC_BYTES_ALIGN 256    // setBytes data slots; also valid constant-buffer offsets in the ICB arena
+
+@interface BBSessionRecording : NSObject {
+@public
+    __unsafe_unretained id<MTLComputePipelineState> *_psoPtrs;
+    __unsafe_unretained id<MTLBuffer> *_resPtrs;
+    __unsafe_unretained id<MTLResource> *_useList;   // resources + arena, for useResources (ICB)
+    NSUInteger _useCount;
+}
+@property(nonatomic, strong) NSArray *psos;
+@property(nonatomic, strong) NSArray *resources;
+@property(nonatomic, strong) NSData *blob;
+@property(nonatomic, strong) NSData *cmds;
+@property(nonatomic, strong) NSData *binds;
+@property(nonatomic) NSUInteger count;
+@property(nonatomic, strong) NSArray<NSNumber *> *splits;   // command indices where a new command buffer starts
+@property(nonatomic, strong) id<MTLIndirectCommandBuffer> icb;
+@property(nonatomic, strong) id<MTLBuffer> arena;
+@end
+@implementation BBSessionRecording
+- (void)dealloc {
+    free(_psoPtrs);
+    free(_resPtrs);
+    free(_useList);
+}
+@end
+
+@interface BBSessionRecorder : NSObject
+@property(nonatomic, strong) id<MTLComputeCommandEncoder> real;
+@property(nonatomic, strong) NSMutableArray *psos;
+@property(nonatomic, strong) NSMutableArray *resources;
+@property(nonatomic, strong) NSMapTable *psoIndex;
+@property(nonatomic, strong) NSMapTable *resIndex;
+@property(nonatomic, strong) NSMutableData *blob;
+@property(nonatomic, strong) NSMutableData *cmds;
+@property(nonatomic, strong) NSMutableData *binds;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *splits;
+@property(nonatomic) BOOL failed;
+@property(nonatomic, copy) NSString *failReason;
+@end
+
+@implementation BBSessionRecorder {
+    int32_t _curPso;
+    BBRecSlot _slot[31];
+    uint32_t _tg[4];
+    BOOL _barrier;
+}
+- (instancetype)initWithEncoder:(id<MTLComputeCommandEncoder>)enc {
+    if ((self = [super init])) {
+        _real = enc;
+        _psos = [NSMutableArray array];
+        _resources = [NSMutableArray array];
+        NSPointerFunctionsOptions key = NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality;
+        _psoIndex = [NSMapTable mapTableWithKeyOptions:key valueOptions:NSPointerFunctionsStrongMemory];
+        _resIndex = [NSMapTable mapTableWithKeyOptions:key valueOptions:NSPointerFunctionsStrongMemory];
+        _blob = [NSMutableData data];
+        _cmds = [NSMutableData data];
+        _binds = [NSMutableData data];
+        _splits = [NSMutableArray array];
+        _curPso = -1;
+    }
+    return self;
+}
+- (void)fail:(NSString *)why {
+    if (_failed) return;
+    _failed = YES;
+    _failReason = why;
+}
+- (void)setComputePipelineState:(id<MTLComputePipelineState>)p {
+    [_real setComputePipelineState:p];
+    if (!p) { _curPso = -1; return; }
+    NSNumber *k = [_psoIndex objectForKey:p];
+    if (!k) {
+        k = @(_psos.count);
+        [_psos addObject:p];
+        [_psoIndex setObject:k forKey:p];
+    }
+    _curPso = k.intValue;
+}
+- (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {
+    [_real setBuffer:b offset:o atIndex:i];
+    if (i >= 31) { [self fail:@"buffer index above 30"]; return; }
+    if (!b) { _slot[i].kind = 0; return; }
+    NSNumber *k = [_resIndex objectForKey:b];
+    if (!k) {
+        k = @(_resources.count);
+        [_resources addObject:b];
+        [_resIndex setObject:k forKey:b];
+    }
+    _slot[i] = (BBRecSlot){1, k.unsignedIntValue, o, 0};
+}
+- (void)setBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {
+    [_real setBufferOffset:o atIndex:i];
+    if (i >= 31 || _slot[i].kind != 1) { [self fail:@"setBufferOffset without a bound buffer"]; return; }
+    _slot[i].offset = o;
+}
+- (void)setBytes:(const void *)bytes length:(NSUInteger)len atIndex:(NSUInteger)i {
+    [_real setBytes:bytes length:len atIndex:i];
+    if (i >= 31) { [self fail:@"bytes index above 30"]; return; }
+    const NSUInteger at = (_blob.length + BB_REC_BYTES_ALIGN - 1) & ~(NSUInteger)(BB_REC_BYTES_ALIGN - 1);
+    [_blob setLength:at + len];
+    memcpy((char *)_blob.mutableBytes + at, bytes, len);
+    _slot[i] = (BBRecSlot){2, UINT32_MAX, at, (uint32_t)len};
+}
+- (void)setThreadgroupMemoryLength:(NSUInteger)len atIndex:(NSUInteger)i {
+    [_real setThreadgroupMemoryLength:len atIndex:i];
+    if (i >= 4) { [self fail:@"threadgroup memory index above 3"]; return; }
+    _tg[i] = (uint32_t)len;
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
+    [_real memoryBarrierWithScope:scope];
+    _barrier = YES;
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count {
+    [_real memoryBarrierWithResources:resources count:count];
+    _barrier = YES;
+}
+- (void)record:(MTLSize)grid tpt:(MTLSize)tpt exact:(BOOL)exact {
+    if (_curPso < 0) { [self fail:@"dispatch without a pipeline"]; return; }
+    BBRecCmd c;
+    memset(&c, 0, sizeof(c));
+    c.pso = (uint32_t)_curPso;
+    c.bindFirst = (uint32_t)(_binds.length / sizeof(BBRecBind));
+    for (uint32_t i = 0; i < 31; ++i) {
+        if (_slot[i].kind == 0) continue;
+        BBRecBind b = {i, _slot[i].kind == 1 ? _slot[i].res : UINT32_MAX, _slot[i].offset, _slot[i].len};
+        [_binds appendBytes:&b length:sizeof(b)];
+        ++c.bindCount;
+    }
+    memcpy(c.tgLen, _tg, sizeof(_tg));
+    c.grid = grid;
+    c.tpt = tpt;
+    c.exact = exact ? 1 : 0;
+    c.barrier = _barrier ? 1 : 0;
+    _barrier = NO;
+    [_cmds appendBytes:&c length:sizeof(c)];
+}
+- (void)dispatchThreadgroups:(MTLSize)g threadsPerThreadgroup:(MTLSize)t {
+    [_real dispatchThreadgroups:g threadsPerThreadgroup:t];
+    [self record:g tpt:t exact:YES];
+}
+- (void)dispatchThreads:(MTLSize)g threadsPerThreadgroup:(MTLSize)t {
+    [_real dispatchThreads:g threadsPerThreadgroup:t];
+    [self record:g tpt:t exact:NO];
+}
+- (void)endEncoding {
+    [_real endEncoding];
+    [self fail:@"the encoder was ended inside the session (MPS)"];
+}
+// Any other encoder call runs on the real encoder, but the recording cannot reproduce it.
+- (id)forwardingTargetForSelector:(SEL)sel {
+    [self fail:[NSString stringWithFormat:@"unrecorded encoder call %@", NSStringFromSelector(sel)]];
+    return _real;
+}
+@end
+
+static BBSessionRecorder *gSessRec = nil;
+static NSMutableArray *gSessRecordings = nil;   // BBSessionRecording or NSNull, by id
+static int gSessLastRecording = -1;
+static NSString *gSessRecLastReason = nil;
+
+// Commit points of the recorded session (BYBY_FIR_DECODE_CB_NODES): the replay keeps them, which on
+// Intel GPUs runs the step faster than one long command buffer. BYBY_METAL_REPLAY_SPLIT=0 drops them.
+static void bbSessRecSplit(void) {
+    if (!gSessRec) return;
+    const char *e = getenv("BYBY_METAL_REPLAY_SPLIT");
+    if (e && e[0] == '0') return;
+    const NSUInteger at = gSessRec.cmds.length / sizeof(BBRecCmd);
+    if (at > 0 && (gSessRec.splits.count == 0 || gSessRec.splits.lastObject.unsignedIntegerValue < at))
+        [gSessRec.splits addObject:@(at)];
+}
+
+static void bbSessRecFail(const char *why) {
+    if (gSessRec) [gSessRec fail:[NSString stringWithUTF8String:why]];
+}
+
+// Puts the real encoder back in place. NO when the session's encoder was replaced meanwhile.
+static BOOL bbSessRecEndEncoder(void) {
+    gSessRecording = NO;
+    if (!gSessRec) return NO;
+    if ((id)gSessionEncoder == (id)gSessRec) {
+        gSessionEncoder = gSessRec.real;
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL bbReplayIcbWanted(void) {
+    const char *e = getenv("BYBY_METAL_REPLAY_ICB");
+    if (e && e[0] == '0') return NO;
+    if (!gDevice) return NO;
+    if (@available(macOS 10.15, *)) return [gDevice supportsFamily:MTLGPUFamilyMac2] || [gDevice supportsFamily:MTLGPUFamilyApple3];
+    return NO;
+}
+
+// The pipeline a recorded command uses inside an indirect command buffer: the same one when it was
+// created for indirect command buffers, else the JIT kernel's indirect variant (nil: none).
+static id<MTLComputePipelineState> bbIcbVariant(id<MTLComputePipelineState> p) {
+    if (p.supportIndirectCommandBuffers) return p;
+    for (NSString *name in gJitPipelines) {
+        if (gJitPipelines[name] == p) return bbJitIcbPipeline(name);
+    }
+    return nil;
+}
+
+// Builds the indirect command buffer of a finished recording; NO leaves it on the plain path.
+static BOOL bbBuildIcb(BBSessionRecording *g) {
+    @autoreleasepool {
+        NSMutableArray *psos = [NSMutableArray arrayWithCapacity:g.psos.count];
+        for (id<MTLComputePipelineState> p in g.psos) {
+            id<MTLComputePipelineState> v = bbIcbVariant(p);
+            if (!v) return NO;
+            [psos addObject:v];
+        }
+        MTLIndirectCommandBufferDescriptor *d = [MTLIndirectCommandBufferDescriptor new];
+        d.commandTypes = MTLIndirectCommandTypeConcurrentDispatch | MTLIndirectCommandTypeConcurrentDispatchThreads;
+        d.inheritPipelineState = NO;
+        d.inheritBuffers = NO;
+        d.maxKernelBufferBindCount = 31;
+        id<MTLIndirectCommandBuffer> icb = [gDevice newIndirectCommandBufferWithDescriptor:d
+            maxCommandCount:g.count options:0];
+        if (!icb) return NO;
+        id<MTLBuffer> arena = nil;
+        if (g.blob.length > 0) {
+            arena = [gDevice newBufferWithBytes:g.blob.bytes length:g.blob.length options:MTLResourceStorageModeShared];
+            if (!arena) return NO;
+        }
+        const BBRecCmd *cmds = (const BBRecCmd *)g.cmds.bytes;
+        const BBRecBind *binds = (const BBRecBind *)g.binds.bytes;
+        for (NSUInteger k = 0; k < g.count; ++k) {
+            const BBRecCmd *c = &cmds[k];
+            id<MTLIndirectComputeCommand> cmd = [icb indirectComputeCommandAtIndex:k];
+            [cmd setComputePipelineState:psos[c->pso]];
+            for (uint32_t j = 0; j < c->bindCount; ++j) {
+                const BBRecBind *b = &binds[c->bindFirst + j];
+                if (b->res == UINT32_MAX) [cmd setKernelBuffer:arena offset:b->offset atIndex:b->index];
+                else [cmd setKernelBuffer:g->_resPtrs[b->res] offset:b->offset atIndex:b->index];
+            }
+            for (NSUInteger i = 0; i < 4; ++i)
+                if (c->tgLen[i]) [cmd setThreadgroupMemoryLength:c->tgLen[i] atIndex:i];
+            if (k > 0) [cmd setBarrier];
+            if (c->exact) [cmd concurrentDispatchThreadgroups:c->grid threadsPerThreadgroup:c->tpt];
+            else [cmd concurrentDispatchThreads:c->grid threadsPerThreadgroup:c->tpt];
+        }
+        const NSUInteger n = g.resources.count + (arena ? 1 : 0);
+        g->_useList = (__unsafe_unretained id<MTLResource> *)calloc(n, sizeof(id));
+        for (NSUInteger i = 0; i < g.resources.count; ++i) g->_useList[i] = g->_resPtrs[i];
+        if (arena) g->_useList[g.resources.count] = arena;
+        g->_useCount = n;
+        g.psos = psos;   // keeps the indirect variants alive
+        g.icb = icb;
+        g.arena = arena;
+        return YES;
+    }
+}
+
+static void bbSessRecFinish(BOOL executed) {
+    BBSessionRecorder *r = gSessRec;
+    gSessRec = nil;
+    gSessRecording = NO;
+    gSessLastRecording = -1;
+    if (!r) return;
+    if (!executed) [r fail:@"the session did not complete"];
+    const NSUInteger count = r.cmds.length / sizeof(BBRecCmd);
+    if (!r.failed && count == 0) [r fail:@"no dispatch was recorded"];
+    gSessRecLastReason = r.failed ? r.failReason : nil;
+    if (getenv("BYBY_METAL_REPLAY_LOG"))
+        NSLog(@"[metal_replay] recorded %lu commands in %lu command buffers, %lu pipelines, %lu buffers, %lu bytes of constants%@",
+              (unsigned long)count, (unsigned long)r.splits.count + 1, (unsigned long)r.psos.count, (unsigned long)r.resources.count,
+              (unsigned long)r.blob.length, r.failed ? [@" - not kept: " stringByAppendingString:r.failReason] : @"");
+    if (r.failed) return;
+    BBSessionRecording *g = [BBSessionRecording new];
+    g.psos = [r.psos copy];
+    g.resources = [r.resources copy];
+    g.blob = [r.blob copy];
+    g.cmds = [r.cmds copy];
+    g.binds = [r.binds copy];
+    g.count = count;
+    NSMutableArray *splits = [NSMutableArray array];
+    for (NSNumber *v in r.splits) if (v.unsignedIntegerValue < count) [splits addObject:v];
+    g.splits = splits;
+    g->_psoPtrs = (__unsafe_unretained id<MTLComputePipelineState> *)calloc(g.psos.count ? g.psos.count : 1, sizeof(id));
+    for (NSUInteger i = 0; i < g.psos.count; ++i) g->_psoPtrs[i] = g.psos[i];
+    g->_resPtrs = (__unsafe_unretained id<MTLBuffer> *)calloc(g.resources.count ? g.resources.count : 1, sizeof(id));
+    for (NSUInteger i = 0; i < g.resources.count; ++i) g->_resPtrs[i] = g.resources[i];
+    if (bbReplayIcbWanted() && !bbBuildIcb(g) && getenv("BYBY_METAL_REPLAY_LOG"))
+        NSLog(@"[metal_replay] indirect command buffer unavailable for this recording, replaying on a plain encoder");
+    if (g.icb) {
+        // The plain path's pipeline table now points at the indirect variants; it is not used.
+        for (NSUInteger i = 0; i < g.psos.count; ++i) g->_psoPtrs[i] = g.psos[i];
+    }
+    if (!gSessRecordings) gSessRecordings = [NSMutableArray array];
+    [gSessRecordings addObject:g];
+    gSessLastRecording = (int)gSessRecordings.count - 1;
+}
+
+int metal_session_can_record(void) {
+    return gDevice != nil ? 1 : 0;
+}
+
+int metal_session_record_begin(void) {
+    @autoreleasepool {
+        if (!gSessionEncoder || !gSessionCmdBuf || gSessRec || gGraphRec) return 0;
+        gSessLastRecording = -1;
+        BBSessionRecorder *r = [[BBSessionRecorder alloc] initWithEncoder:gSessionEncoder];
+        gSessRec = r;
+        gSessRecording = YES;
+        gSessionEncoder = (id<MTLComputeCommandEncoder>)(id)r;
+        return 1;
+    }
+}
+
+int metal_session_last_recording(void) { return gSessLastRecording; }
+
+const char *metal_session_record_reason(void) {
+    return gSessRecLastReason ? gSessRecLastReason.UTF8String : "";
+}
+
+int metal_session_recording_uses_icb(int rid) {
+    if (!gSessRecordings || rid < 0 || rid >= (int)gSessRecordings.count) return 0;
+    BBSessionRecording *g = gSessRecordings[rid];
+    return ([g isKindOfClass:[BBSessionRecording class]] && g.icb) ? 1 : 0;
+}
+
+static void bbReplayPlain(BBSessionRecording *g, id<MTLComputeCommandEncoder> enc, NSUInteger first, NSUInteger last) {
+    const BBRecCmd *cmds = (const BBRecCmd *)g.cmds.bytes;
+    const BBRecBind *binds = (const BBRecBind *)g.binds.bytes;
+    const char *blob = (const char *)g.blob.bytes;
+    BBRecSlot cur[31];
+    memset(cur, 0, sizeof(cur));
+    NSUInteger tg[4] = {0, 0, 0, 0};
+    uint32_t lastPso = UINT32_MAX;
+    for (NSUInteger k = first; k < last; ++k) {
+        const BBRecCmd *c = &cmds[k];
+        if (c->barrier && k > first) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (c->pso != lastPso) {
+            [enc setComputePipelineState:g->_psoPtrs[c->pso]];
+            lastPso = c->pso;
+        }
+        for (uint32_t j = 0; j < c->bindCount; ++j) {
+            const BBRecBind *b = &binds[c->bindFirst + j];
+            BBRecSlot *s = &cur[b->index];
+            if (b->res == UINT32_MAX) {
+                if (s->kind == 2 && s->offset == b->offset) continue;
+                [enc setBytes:blob + b->offset length:b->len atIndex:b->index];
+                *s = (BBRecSlot){2, UINT32_MAX, b->offset, b->len};
+            } else {
+                if (s->kind == 1 && s->res == b->res && s->offset == b->offset) continue;
+                [enc setBuffer:g->_resPtrs[b->res] offset:b->offset atIndex:b->index];
+                *s = (BBRecSlot){1, b->res, b->offset, 0};
+            }
+        }
+        for (NSUInteger i = 0; i < 4; ++i) {
+            if (c->tgLen[i] && c->tgLen[i] != tg[i]) {
+                [enc setThreadgroupMemoryLength:c->tgLen[i] atIndex:i];
+                tg[i] = c->tgLen[i];
+            }
+        }
+        if (c->exact) [enc dispatchThreadgroups:c->grid threadsPerThreadgroup:c->tpt];
+        else [enc dispatchThreads:c->grid threadsPerThreadgroup:c->tpt];
+    }
+}
+
+// Submits a kept recording in a new command buffer and waits for it. Outside any session.
+int metal_session_replay(int rid) {
+    @autoreleasepool {
+        if (gSessionCmdBuf || !gSessRecordings || rid < 0 || rid >= (int)gSessRecordings.count) return 0;
+        BBSessionRecording *g = gSessRecordings[rid];
+        if (![g isKindOfClass:[BBSessionRecording class]]) return 0;
+        residencyCommit();
+        // One command buffer per recorded part, committed without waiting; the queue runs them in
+        // order and only the last one is waited for.
+        const NSUInteger parts = g.splits.count + 1;
+        BOOL ok = YES;
+        id<MTLCommandBuffer> last = nil;
+        NSMutableArray<id<MTLCommandBuffer>> *sent = [NSMutableArray arrayWithCapacity:parts];
+        for (NSUInteger p = 0; p < parts; ++p) {
+            const NSUInteger first = p == 0 ? 0 : g.splits[p - 1].unsignedIntegerValue;
+            const NSUInteger end = p + 1 < parts ? g.splits[p].unsignedIntegerValue : g.count;
+            id<MTLCommandBuffer> cb = [gQueue commandBufferWithUnretainedReferences];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            if (!cb || !enc) { ok = NO; break; }
+            if (g.icb) {
+                [enc useResources:g->_useList count:g->_useCount usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                [enc executeCommandsInBuffer:g.icb withRange:NSMakeRange(first, end - first)];
+            } else {
+                bbReplayPlain(g, enc, first, end);
+            }
+            [enc endEncoding];
+            [cb commit];
+            [sent addObject:cb];
+            last = cb;
+        }
+        if (last) [last waitUntilCompleted];
+        for (id<MTLCommandBuffer> cb in sent) {
+            [cb waitUntilCompleted];
+            addGpuTime(cb);
+            if (cb.status != MTLCommandBufferStatusCompleted) {
+                ok = NO;
+                NSLog(@"[metal_session_replay] command buffer FAILED, status=%ld, error=%@", (long)cb.status, cb.error);
+                gLastSessionEndError = [NSString stringWithFormat:@"status=%ld %@", (long)cb.status,
+                    cb.error ? [cb.error description] : @"(no error)"];
+            }
+        }
+        return ok ? 1 : 0;
+    }
+}
+
+void metal_session_free_recording(int rid) {
+    if (!gSessRecordings || rid < 0 || rid >= (int)gSessRecordings.count) return;
+    gSessRecordings[rid] = [NSNull null];
+}
+
+// A Shared buffer of n floats the host reads and writes directly (never pooled); free it with
+// metal_buffer_free.
+MetalBufferHandle metal_host_buffer(int n) {
+    @autoreleasepool {
+        if (!gDevice || n <= 0) return NULL;
+        id<MTLBuffer> buf = [gDevice newBufferWithLength:(NSUInteger)n * sizeof(float) options:MTLResourceStorageModeShared];
+        return buf ? (__bridge_retained MetalBufferHandle)buf : NULL;
+    }
+}
+
+int metal_host_write(MetalBufferHandle h, const float *data, int n) {
+    if (!h || n < 0) return 0;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)h;
+    if ((NSUInteger)n * sizeof(float) > buf.length) return 0;
+    memcpy(buf.contents, data, (size_t)n * sizeof(float));
+    return 1;
+}
+
+int metal_host_read(MetalBufferHandle h, float *out, int n) {
+    if (!h || n < 0) return 0;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)h;
+    if ((NSUInteger)n * sizeof(float) > buf.length) return 0;
+    memcpy(out, buf.contents, (size_t)n * sizeof(float));
+    return 1;
 }
