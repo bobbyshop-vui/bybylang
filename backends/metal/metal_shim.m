@@ -4040,11 +4040,19 @@ static BOOL bbSessRecEndEncoder(void) {
     return NO;
 }
 
+// BYBY_METAL_REPLAY_ICB: 0 never, 1 whenever the device supports it, unset: Apple GPUs only. On an
+// Intel GPU (Iris Plus 640) the indirect command buffer ran the Codestral decode step ~25% slower
+// than replaying the same commands into a plain encoder (488 vs 390 ms/token), so Mac2-family
+// devices without Apple-family support replay on the plain encoder unless asked.
 static BOOL bbReplayIcbWanted(void) {
     const char *e = getenv("BYBY_METAL_REPLAY_ICB");
     if (e && e[0] == '0') return NO;
     if (!gDevice) return NO;
-    if (@available(macOS 10.15, *)) return [gDevice supportsFamily:MTLGPUFamilyMac2] || [gDevice supportsFamily:MTLGPUFamilyApple3];
+    const BOOL forced = e && e[0] == '1';
+    if (@available(macOS 10.15, *)) {
+        if ([gDevice supportsFamily:MTLGPUFamilyApple3]) return YES;
+        return forced && [gDevice supportsFamily:MTLGPUFamilyMac2];
+    }
     return NO;
 }
 
