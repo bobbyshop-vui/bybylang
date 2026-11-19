@@ -430,6 +430,8 @@ int metal_enc_max_tg_threads(void);
 
 /* JIT: compile Metal source luc runtime (bytecode lower -> kernel moi). */
 int metal_jit_compile(const char* source, const char* kernelName);
+/* Total wall seconds spent compiling libraries and creating pipeline states so far (cache misses). */
+double metal_compile_seconds(void);
 
 
 /* Decode graph: record one token's dispatches into an indirect command buffer, replay it per token. */

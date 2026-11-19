@@ -624,6 +624,10 @@ when defined(macosx):
     metal_matmul_mps_nt_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(stride), cint(offset)) != 0
 
   proc metal_jit_compile_c(source, kernelName: cstring): cint {.importc: "metal_jit_compile", header: "metal_shim.h".}
+  proc metal_compile_seconds_c(): cdouble {.importc: "metal_compile_seconds", header: "metal_shim.h".}
+  proc metalCompileSeconds*(): float =
+    ## Wall seconds spent so far compiling MSL and creating pipeline states (cache misses only).
+    float(metal_compile_seconds_c())
   proc metal_enc_pipeline_c(kernelName: cstring): cint {.importc: "metal_enc_pipeline", header: "metal_shim.h".}
   proc metal_enc_bind_buffer_c(index: cint; buf: MetalBufferHandle; offsetBytes: cint): cint {.importc: "metal_enc_bind_buffer", header: "metal_shim.h".}
   proc metal_enc_bind_int_c(index, v: cint): cint {.importc: "metal_enc_bind_int", header: "metal_shim.h".}

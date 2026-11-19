@@ -50,6 +50,13 @@ type
   GpuBackend* = enum
     gbAuto, gbCpu, gbCuda, gbMetal, gbVulkan
 
+proc sessionCompileSeconds*(): float =
+  ## Wall seconds spent so far compiling shaders and creating pipeline states on every GPU
+  ## backend (cache misses only). Take the difference around a phase to report its
+  ## throughput without the one-time JIT cost.
+  result = vulkanCompileSeconds()
+  when defined(macosx): result += metalCompileSeconds()
+
 # ─────────────────────────────────────────────────────────────
 # GPU FAILURE HANDLING: when a GPU kernel fails (OOM, driver error, etc.),
 # the framework will automatically fall back to CPU for that operation,

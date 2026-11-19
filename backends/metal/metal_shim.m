@@ -71,6 +71,10 @@ static id<MTLCommandQueue> gQueue = nil;
 static id<MTLLibrary> gLibrary = nil;
 static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *gPipelineCache = nil;
 static dispatch_once_t gInitOnce;
+// Wall seconds spent compiling MSL libraries and creating pipeline states (cache misses only),
+// so callers can report throughput without the one-time shader compile cost.
+static double gMetalCompileSeconds = 0.0;
+double metal_compile_seconds(void) { return gMetalCompileSeconds; }
 
 // MTLCreateSystemDefaultDevice() returns EXACTLY ONE "default" GPU chosen
 // by the system. Apple Silicon Macs have one GPU so that is fine, but
@@ -125,7 +129,9 @@ static BOOL ensureMetalInit(const char* kernel_src) {
 
         NSString *source = [NSString stringWithUTF8String:kernel_src];
         NSError *error = nil;
+        CFAbsoluteTime compileStart = CFAbsoluteTimeGetCurrent();
         gLibrary = [gDevice newLibraryWithSource:source options:nil error:&error];
+        gMetalCompileSeconds += CFAbsoluteTimeGetCurrent() - compileStart;
         if (!gLibrary) { NSLog(@"[metal] newLibraryWithSource FAILED (compile 1 lan luc khoi dong): %@", error); ok = NO; return; }
 
         gPipelineCache = [NSMutableDictionary dictionary];
@@ -146,6 +152,7 @@ static id<MTLComputePipelineState> getPipeline(NSString *fname) {
     id<MTLComputePipelineState> cached = gPipelineCache[fname];
     if (cached) return cached;
 
+    CFAbsoluteTime compileStart = CFAbsoluteTimeGetCurrent();
     id<MTLFunction> fn = [gLibrary newFunctionWithName:fname];
     if (!fn) { NSLog(@"[metal] newFunctionWithName:%@ returned nil", fname); return nil; }
 
@@ -160,6 +167,7 @@ static id<MTLComputePipelineState> getPipeline(NSString *fname) {
                                                options:MTLPipelineOptionNone
                                             reflection:nil
                                                  error:&error];
+    gMetalCompileSeconds += CFAbsoluteTimeGetCurrent() - compileStart;
     if (!pipeline) { NSLog(@"[metal] newComputePipelineStateWithFunction FAILED cho %@: %@", fname, error); return nil; }
 
     gPipelineCache[fname] = pipeline;
@@ -3406,6 +3414,7 @@ static id<MTLComputePipelineState> bbJitIcbPipeline(NSString *name) {
     NSError *err = nil;
     id<MTLComputePipelineState> pso = [gDevice newComputePipelineStateWithDescriptor:d
         options:MTLPipelineOptionNone reflection:nil error:&err];
+    gMetalCompileSeconds += CFAbsoluteTimeGetCurrent() - t0;
     if (!pso) {
         NSLog(@"[metal_enc_pipeline] cannot build the indirect-command pipeline for %@ (%@)", name, err);
         return nil;
@@ -3677,6 +3686,8 @@ static void metal_jit_archive_init(void) {
     }
 }
 
+static int metal_jit_build(const char* source, NSString* name);
+
 int metal_jit_compile(const char* source, const char* kernelName) {
     if (!source || !kernelName) return 0;
     @autoreleasepool {
@@ -3692,6 +3703,16 @@ int metal_jit_compile(const char* source, const char* kernelName) {
         if (gJitPipelines[name]) {
             return 1; /* already cached */
         }
+        CFAbsoluteTime compileStart = CFAbsoluteTimeGetCurrent();
+        int ok = metal_jit_build(source, name);
+        gMetalCompileSeconds += CFAbsoluteTimeGetCurrent() - compileStart;
+        return ok;
+    }
+}
+
+/* Compiles one JIT kernel and caches its pipeline (metal_jit_compile has checked the cache). */
+static int metal_jit_build(const char* source, NSString* name) {
+    @autoreleasepool {
         NSError* err = nil;
         MTLCompileOptions* opts = [MTLCompileOptions new];
         NSString* src = [NSString stringWithUTF8String:source];

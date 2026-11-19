@@ -1471,6 +1471,13 @@ proc stagedRead(src: VulkanBufferHandle; data: pointer; bytes: uint64) =
   finally:
     releaseBuffer(rb)
 
+var gVkCompileSeconds = 0.0
+  ## Wall seconds spent in glslc and pipeline creation (cache misses only).
+
+proc vulkanCompileSeconds*(): float =
+  ## Total shader compile time so far, so throughput can be reported without it.
+  gVkCompileSeconds
+
 proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: uint32,
                          localSizeX = 0, spirvPathOverride = "", sharedFloats = 0): PipelineEntry =
   ## Pipeline cache keyed by shader name + numBindings + localSizeX.
@@ -1481,6 +1488,8 @@ proc getOrCreatePipeline(shaderName: string, numBindings: int, pushConstSize: ui
     (if localSizeX > 0: "_local" & $localSizeX else: "") & "_sm" & $sharedFloats
   if gPipelineCache.hasKey(cacheKey):
     return gPipelineCache[cacheKey]
+  let compileStart = getMonoTime()
+  defer: gVkCompileSeconds += float((getMonoTime() - compileStart).inNanoseconds) / 1e9
 
   let spirvPath = if spirvPathOverride.len > 0: spirvPathOverride
                   else: currentSourcePath().parentDir() / "kernels" / (shaderName & ".spv")
@@ -2209,6 +2218,8 @@ proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
   ## cost that does not shrink on a faster GPU.
   if getEnv("BYBY_VULKAN_DISPATCH_CACHE", "1") == "0": return
   if jobs.len == 0: return
+  let compileStart = getMonoTime()
+  defer: gVkCompileSeconds += float((getMonoTime() - compileStart).inNanoseconds) / 1e9
   let compiler = findExe("glslc")
   if compiler.len == 0:
     raise newException(CatchableError,
@@ -2273,6 +2284,8 @@ proc compileVulkanJitShader(kernelName, source: string): string =
       inc gJitPathHits
       return cached.path
   inc gJitPathMisses
+  let compileStart = getMonoTime()
+  defer: gVkCompileSeconds += float((getMonoTime() - compileStart).inNanoseconds) / 1e9
   let compiler = findExe("glslc")
   if compiler.len == 0:
     raise newException(CatchableError,
