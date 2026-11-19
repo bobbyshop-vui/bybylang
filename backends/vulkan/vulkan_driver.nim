@@ -2548,41 +2548,59 @@ proc vulkanSessionMatmulNTTiledEnc*(a, w: VulkanBufferHandle;
 var gFp4TileLogged = false
 var gFp4TileFailed = initHashSet[string]()
 
-proc tryFp4TileGemm(a, w, c, lut: VulkanBufferHandle; M, K, N: int; coop: bool): bool =
-  ## Packed FP4-KM GEMM c[M, N] = a[M, K] * W^T through the tile GEMM micro-kernel
-  ## (session_vm.buildFp4TileGemmProgram, lowered by tile_gemm.nim): cooperative matrices
-  ## (FP16 fragments, FP32 accumulation) or register tiles. W is the packed nibble bytes then
-  ## the scale bytes; lut holds the 272-float decode table. The row count is a push constant, so
-  ## one pipeline per (K, N, row tile) serves every prompt length.
+var gF16TileLogged = false
+
+proc tryTileGemm(a, w, c, lut: VulkanBufferHandle; M, K, N: int; coop: bool;
+                 format = TileFormatFp4Km; rowTile = 0): bool =
+  ## GEMM c[M, N] = a[M, K] * W^T through the tile GEMM micro-kernel (session_vm.build*TileGemmProgram,
+  ## lowered by tile_gemm.nim): cooperative matrices (FP16 fragments, FP32 accumulation) or
+  ## register tiles. Format 0: W is the packed FP4-KM nibble bytes then the scale bytes, lut holds
+  ## the 272-float decode table. Format 1: W is IEEE halves [N, K] and lut is unused (any buffer).
+  ## The row count is a push constant, so one pipeline per (K, N, row tile) serves every prompt
+  ## length. rowTile = 0 picks the tile from the shape and the device.
   if not gSessionActive or M <= 0 or N <= 0 or K <= 0: return false
   if a.buf == nil or w.buf == nil or c.buf == nil or lut.buf == nil: return false
   if coop and not tiledCoopSupported(): return false
   let target = if coop: ttVulkanCoop else: ttVulkanTiled
-  let program = buildFp4TileGemmProgram(0, K, N, N * (K div 2), 0)
+  let f16 = format == TileFormatF16
+  let program = if f16: buildF16TileGemmProgram(0, K, N)
+                else: buildFp4TileGemmProgram(0, K, N, N * (K div 2), 0)
   let shape = tileGemmShape(program)
   if not tileGemmSupported(shape, target): return false
-  if w.sizeBytes < uint64(N * (K div 2) + N * (K div 32)) or a.sizeBytes < uint64(M * K * 4) or
-      c.sizeBytes < uint64(M * N * 4) or lut.sizeBytes < 272'u64 * 4: return false
-  let tile = if coop: q4CoopRowTile(M, N, gDeviceCaps.computeUnits) else: tileGemmRowTile(M)
+  let weightBytes = if f16: uint64(N) * uint64(K) * 2 else: uint64(N * (K div 2) + N * (K div 32))
+  if w.sizeBytes < weightBytes or a.sizeBytes < uint64(M * K * 4) or
+      c.sizeBytes < uint64(M * N * 4) or (not f16 and lut.sizeBytes < 272'u64 * 4): return false
+  let tile = if rowTile in TileGemmRowTiles: rowTile
+             elif coop: q4CoopRowTile(M, N, gDeviceCaps.computeUnits)
+             else: tileGemmRowTile(M)
   let groups = tileGemmGroups(M, N, tile)
   if groups > 65535: return false
   let frags = if vulkanFixedSubgroupWidth() == 32: 1 else: 2
-  let kn = "fp4_tile_" & $target & "_k" & $K & "_n" & $N & "_r" & $tile & (if coop: "_f" & $frags else: "")
+  let kn = (if f16: "f16_tile_" else: "fp4_tile_") & $target & "_k" & $K & "_n" & $N & "_r" & $tile &
+    (if coop: "_f" & $frags else: "")
   if kn in gFp4TileFailed: return false
   var spv: string
   try:
     spv = compileVulkanJitShader(kn, lowerTileGemm(program, target, kn, tile, frags))
   except CatchableError as e:
     gFp4TileFailed.incl kn
-    stderr.writeLine "[vulkan] FP4-KM tile GEMM micro-kernel " & kn & " unavailable: " & e.msg
+    stderr.writeLine "[vulkan] " & (if f16: "FP16" else: "FP4-KM") & " tile GEMM micro-kernel " & kn &
+      " unavailable: " & e.msg
     return false
   var pc = [uint32(M)]
   result = dispatchGeneric(kn, [c, w, lut, a], addr pc[0], 4, uint32(groups), 1, 1,
     TileGemmThreads, spv)
-  if result and not gFp4TileLogged:
+  if result and not f16 and not gFp4TileLogged:
     gFp4TileLogged = true
     stderr.writeLine "[vulkan] FP4-KM prefill route=tile GEMM micro-kernel (" &
       (if coop: "cooperative matrix FP16" else: "register tiles FP32") & " + FP32 accumulation)"
+  if result and f16 and not gF16TileLogged:
+    gF16TileLogged = true
+    stderr.writeLine "[vulkan] FP16 prefill route=tile GEMM micro-kernel (" &
+      (if coop: "cooperative matrix FP16" else: "register tiles FP32") & " + FP32 accumulation)"
+
+proc tryFp4TileGemm(a, w, c, lut: VulkanBufferHandle; M, K, N: int; coop: bool): bool =
+  tryTileGemm(a, w, c, lut, M, K, N, coop, TileFormatFp4Km)
 
 proc vulkanSessionFp4GemmEnc*(a, w, lut: VulkanBufferHandle;
                               c: var VulkanBufferHandle; M, K, N: int): bool =
@@ -2595,6 +2613,107 @@ proc vulkanSessionFp4GemmTiledEnc*(a, w, lut: VulkanBufferHandle;
   ## Register-tiled route of the same micro-kernel (any Vulkan device).
   if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
   tryFp4TileGemm(a, w, c, lut, M, K, N, false)
+
+proc vulkanSessionF16GemmEnc*(a, w: VulkanBufferHandle; c: var VulkanBufferHandle;
+                              M, K, N: int; coop: bool): bool =
+  ## FP16-weight GEMM c[M, N] = a[M, K] * W^T (W halves [N, K]) through the tile GEMM
+  ## micro-kernel: tensor cores when coop, register tiles otherwise.
+  if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
+  tryTileGemm(a, w, c, w, M, K, N, coop, TileFormatF16)
+
+proc halfBitsExact(v: float32): uint16 =
+  ## Half bits of a value that FP16 represents exactly (the parity data below), zero included.
+  let bits = cast[uint32](v)
+  let sign = uint16((bits shr 16) and 0x8000'u32)
+  if (bits and 0x7FFFFFFF'u32) == 0: return sign
+  let e = int((bits shr 23) and 0xFF'u32) - 127 + 15
+  doAssert e > 0 and e < 31, "halfBitsExact: value outside the normal FP16 range"
+  sign or uint16(e shl 10) or uint16((bits shr 13) and 0x3FF'u32)
+
+var gTileGemmCheck: seq[tuple[key: string, ok: bool]]
+
+proc vulkanTileGemmReady*(f16, coop: bool): bool =
+  ## Parity of the tile GEMM micro-kernel for one weight format and target on this device,
+  ## checked once per process outside any session (it opens its own): every row tile on a
+  ## shape with partial row and column tiles, on data whose products and sums are exact in FP16
+  ## inputs and FP32 accumulation, against a host reference. False also when the device has no
+  ## such route; callers keep their previous kernel then.
+  ensureInit()
+  let format = if f16: TileFormatF16 else: TileFormatFp4Km
+  let key = $format & (if coop: "_coop" else: "_tiled")
+  for entry in gTileGemmCheck:
+    if entry.key == key: return entry.ok
+  if gSessionActive: return false              # not checked yet, and a session is open
+  result = false
+  if coop and not tiledCoopSupported():
+    gTileGemmCheck.add (key, false)
+    return false
+  const M = 37
+  const K = 128
+  const N = 80
+  var x = newSeq[float32](M * K)
+  for i in 0 ..< x.len: x[i] = float32((i * 7 + 3) mod 33 - 16) / 64'f32
+  var weights: seq[float32]      # W packed bytes, carried as float32 words (bit copies)
+  var table = newSeq[float32](272)
+  var expected = newSeq[float32](M * N)
+  if format == TileFormatF16:
+    var wv = newSeq[float32](N * K)
+    for i in 0 ..< wv.len: wv[i] = float32((i * 5 + 1) mod 29 - 14) / 16'f32
+    weights = newSeq[float32](N * K div 2)
+    for i in 0 ..< weights.len:
+      let word = uint32(halfBitsExact(wv[2 * i])) or (uint32(halfBitsExact(wv[2 * i + 1])) shl 16)
+      weights[i] = cast[float32](word)
+    for r in 0 ..< M:
+      for c in 0 ..< N:
+        var s = 0.0
+        for k in 0 ..< K: s += float(x[r * K + k]) * float(wv[c * K + k])
+        expected[r * N + c] = float32(s)
+  else:
+    # FP4-KM: the 16 FP4 values and powers-of-two scales keep every product exact.
+    const fp4 = [0'f32, 0.5, 1, 1.5, 2, 3, 4, 6, -0'f32, -0.5, -1, -1.5, -2, -3, -4, -6]
+    for i in 0 ..< 16: table[i] = fp4[i]
+    for i in 0 ..< 256: table[16 + i] = pow(2'f32, float32(i mod 5) - 3'f32)
+    let groups = K div 32
+    var packed = newSeq[uint8](N * (K div 2) + N * groups)
+    for i in 0 ..< N * (K div 2): packed[i] = uint8((i * 37 + 11) mod 256)
+    for i in 0 ..< N * groups: packed[N * (K div 2) + i] = uint8((i * 13 + 5) mod 256)
+    expected = tileGemmReference(x, packed, table, M, K, N, N * (K div 2), 0)
+    weights = newSeq[float32]((packed.len + 3) div 4)
+    copyMem(addr weights[0], addr packed[0], packed.len)
+  if not vulkanSessionBegin():
+    gTileGemmCheck.add (key, false)
+    return false
+  var ha = vulkanSessionUpload(x)
+  var hw = vulkanSessionUpload(weights)
+  var hl = vulkanSessionUpload(table)
+  var outs: seq[VulkanBufferHandle]
+  var dispatched = true
+  try:
+    for tile in TileGemmRowTiles:
+      var hc = vulkanSessionAllocScratch(M * N)
+      outs.add hc
+      dispatched = dispatched and tryTileGemm(ha, hw, hc, hl, M, K, N, coop, format, tile)
+  except CatchableError as e:
+    dispatched = false
+    stderr.writeLine "[vulkan] tile GEMM check " & key & " failed: " & e.msg.splitLines()[0]
+  let ended = vulkanSessionEnd()
+  var worst = Inf
+  if dispatched and ended:
+    worst = 0.0
+    for hc in outs:
+      let got = vulkanSessionRead(hc, M * N)
+      for i in 0 ..< got.len:
+        let err = abs(float(got[i]) - float(expected[i])) / max(1.0, abs(float(expected[i])))
+        if err != err: worst = Inf
+        elif err > worst: worst = err
+    result = worst <= 1e-3
+  for i in 0 ..< outs.len: vulkanSessionFree(outs[i])
+  vulkanSessionFree(ha); vulkanSessionFree(hw); vulkanSessionFree(hl)
+  gTileGemmCheck.add (key, result)
+  stderr.writeLine "[vulkan] tile GEMM micro-kernel check " &
+    (if format == TileFormatF16: "FP16" else: "FP4-KM") & " " &
+    (if coop: "cooperative matrix" else: "register tiles") & ": " &
+    (if result: "ok" else: "FAILED") & " (max rel err " & formatFloat(worst, ffScientific, 2) & ")"
 
 proc vulkanSessionMatmulNTAcceleratedEnc*(a, w: VulkanBufferHandle;
     c: var VulkanBufferHandle; M, K, N: int): bool =

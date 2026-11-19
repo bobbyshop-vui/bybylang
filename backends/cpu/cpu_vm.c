@@ -45,7 +45,8 @@ enum {
     OP_Q4_COOP_GEMM = 0xAA, OP_Q4_GEMV = 0xAB, OP_FP4_COOP_GEMM = 0xAC,
     OP_U_LOAD_F16 = 0xAD, OP_U_LOAD_F16X4 = 0xAE,
     OP_TILE_GEMM = 0xB0, OP_TILE_ZERO = 0xB1, OP_TILE_K_BEGIN = 0xB2, OP_TILE_K_END = 0xB3,
-    OP_TILE_LOAD_A = 0xB4, OP_TILE_DECODE_FP4 = 0xB5, OP_TILE_MMA = 0xB6, OP_TILE_STORE = 0xB7
+    OP_TILE_LOAD_A = 0xB4, OP_TILE_DECODE_FP4 = 0xB5, OP_TILE_MMA = 0xB6, OP_TILE_STORE = 0xB7,
+    OP_TILE_LOAD_B_F16 = 0xB8
 };
 
 /* IEEE 754 binary16 -> float (the FP16 weight loads). */
@@ -543,8 +544,41 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 }
                 uint32_t M = code[npc++], K = code[npc++], N = code[npc++];
                 const uint64_t scale_base = code[npc++], lut_base = code[npc++];
-                if (a != 0u || !K || K % 32u || !N) {
+                if (a > 1u || !K || K % 32u || !N) {
                     result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported tile GEMM (format %u K %u N %u)", a, K, N); goto done;
+                }
+                if (a == 1u) {
+                    /* FP16 tile GEMM: IEEE halves [N, K] from byte 0 of the u8 slot; no table. */
+                    if (tgid == 0 && lid == 0) {
+                        const float* x = (in_f32 ? in_f32 : mem) + t->base_in;
+                        const int64_t x_len = (int64_t)(in_f32 ? in_len : mem_len) - (int64_t)t->base_in;
+                        if (!packed || x_len < 0 || (int64_t)t->base_u8 > (int64_t)packed_len) {
+                            result = -1; snprintf(err, (size_t)err_len, "CPU VM tile GEMM slot is missing"); goto done;
+                        }
+                        if (M == 0) M = (uint32_t)(x_len / (int64_t)K);
+                        const uint8_t* wdata = packed + t->base_u8;
+                        const int64_t w_len = (int64_t)packed_len - (int64_t)t->base_u8;
+                        if ((int64_t)N * (int64_t)K * 2 > w_len || (int64_t)M * (int64_t)K > x_len) {
+                            result = -1; snprintf(err, (size_t)err_len, "CPU VM tile GEMM input out of range"); goto done;
+                        }
+                        for (uint32_t row = 0; row < M; ++row) {
+                            for (uint32_t col = 0; col < N; ++col) {
+                                float sum = 0.0f;
+                                const uint8_t* w = wdata + ((uint64_t)col * K) * 2u;
+                                const float* xr = x + (uint64_t)row * K;
+                                for (uint32_t k = 0; k < K; ++k) {
+                                    const uint16_t h = (uint16_t)(w[2u * k] | ((uint16_t)w[2u * k + 1u] << 8));
+                                    sum = fmaf(xr[k], half_to_float(h), sum);
+                                }
+                                const int64_t out_idx = (int64_t)t->base_f32 + (int64_t)row * N + col;
+                                if (!check_idx(out_idx, mem_len, "tile_gemm_store", err, err_len)) {
+                                    result = -1; goto done;
+                                }
+                                mem[out_idx] = sum;
+                            }
+                        }
+                    }
+                    break;
                 }
                 /* FP4-KM tile GEMM micro-kernel (see tile_gemm.nim): nibble bytes [N, K/2] from byte 0
                    of the u8 slot, scale bytes [N, K/32] from scale_base, the 272-float decode table at
@@ -593,7 +627,7 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 break;
             }
             case OP_TILE_ZERO: case OP_TILE_K_BEGIN: case OP_TILE_K_END: case OP_TILE_LOAD_A:
-            case OP_TILE_DECODE_FP4: case OP_TILE_MMA: case OP_TILE_STORE:
+            case OP_TILE_DECODE_FP4: case OP_TILE_MMA: case OP_TILE_STORE: case OP_TILE_LOAD_B_F16:
                 break;
             case OP_SIMD_W: t->u[a] = 32u; break;
             case OP_SIMD_GID: t->u[a] = (uint32_t)tid / 32u; break;

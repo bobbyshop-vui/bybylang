@@ -106,7 +106,7 @@ const
   # The lowering turns each op into code for the device: KHR cooperative matrices (Vulkan),
   # simdgroup_matrix (Apple GPU family 7+) or a register-tiled loop (any GPU); the CPU VM runs the
   # header as a reference product. See tile_gemm.nim.
-  OP_TILE_GEMM*       = 0xB0'u32  # a = weight format (0 = FP4-KM); next 5 words M, K, N, scaleBase (byte in slot u8), lutBase (float in slot lut); M = 0: rows per dispatch
+  OP_TILE_GEMM*       = 0xB0'u32  # a = weight format (0 = FP4-KM, 1 = FP16 [N, K] halves); next 5 words M, K, N, scaleBase (byte in slot u8), lutBase (float in slot lut); M = 0: rows per dispatch
   OP_TILE_ZERO*       = 0xB1'u32  # clear the accumulator tile (also publishes the staged decode table)
   OP_TILE_K_BEGIN*    = 0xB2'u32  # for each K slice of the target's depth
   OP_TILE_K_END*      = 0xB3'u32
@@ -114,6 +114,11 @@ const
   OP_TILE_DECODE_FP4* = 0xB5'u32  # stage the decoded FP4-KM weight slice [64 columns, slice] (buffers 2, 3)
   OP_TILE_MMA*        = 0xB6'u32  # accumulator += staged activations x staged weights
   OP_TILE_STORE*      = 0xB7'u32  # write the in-bounds accumulator elements to buffer 1
+  OP_TILE_LOAD_B_F16* = 0xB8'u32  # stage the FP16 weight slice [64 columns, slice] (buffer 2, halves [N, K])
+
+const
+  TileFormatFp4Km* = 0'u32   ## OP_TILE_GEMM weight format: FP4-KM nibbles + scale bytes + decode table
+  TileFormatF16* = 1'u32     ## OP_TILE_GEMM weight format: IEEE halves, row-major [N, K]
 
 type
   VmProgram* = object
@@ -316,6 +321,23 @@ proc buildFp4TileGemmProgram*(M, K, N, scaleBase, lutBase: int): VmProgram =
   result.emit OP_TILE_K_BEGIN
   result.emit OP_TILE_LOAD_A
   result.emit OP_TILE_DECODE_FP4
+  result.emit OP_BARRIER_TG
+  result.emit OP_TILE_MMA
+  result.emit OP_BARRIER_TG
+  result.emit OP_TILE_K_END
+  result.emit OP_TILE_STORE
+  result.emit OP_HALT
+
+proc buildF16TileGemmProgram*(M, K, N: int): VmProgram =
+  ## The FP16 tile GEMM micro-kernel: out[M, N] = x[M, K] * W[N, K]^T with W IEEE halves,
+  ## row-major [N, K], from byte 0 of slot u8 (slot lut is unused). FP32 accumulation; on the
+  ## cooperative-matrix target the activations are rounded to FP16 like the FP4-KM kernel.
+  ## M = 0 leaves the row count to each dispatch.
+  result.emitTileGemm(TileFormatF16, uint32(M), uint32(K), uint32(N), 0, 0)
+  result.emit OP_TILE_ZERO
+  result.emit OP_TILE_K_BEGIN
+  result.emit OP_TILE_LOAD_A
+  result.emit OP_TILE_LOAD_B_F16
   result.emit OP_BARRIER_TG
   result.emit OP_TILE_MMA
   result.emit OP_BARRIER_TG

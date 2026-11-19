@@ -1460,6 +1460,22 @@ proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
   vulkanSessionFp4GemmTiledEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
     c.vulkanHandle, M, K, N)
 
+proc sessionF16GemmTile*(backend: GpuBackend, a, w: SessionHandle,
+    c: var SessionHandle; M, K, N: int; tensorCore: bool): bool {.probed.} =
+  ## FP16-weight GEMM (W IEEE halves [N, K]) through the tile GEMM micro-kernel on Vulkan:
+  ## cooperative matrices when tensorCore, register tiles otherwise. False means unavailable;
+  ## the caller keeps its FP16 micro-VM GEMM.
+  if normalizeBackend(backend) != gbVulkan: return false
+  if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
+  vulkanSessionF16GemmEnc(a.vulkanHandle, w.vulkanHandle, c.vulkanHandle, M, K, N, tensorCore)
+
+proc sessionTileGemmReady*(backend: GpuBackend; f16, tensorCore: bool): bool {.probed.} =
+  ## Whether the tile GEMM micro-kernel (FP16 or FP4-KM weights, cooperative matrices or register
+  ## tiles) passed its parity check on this Vulkan device. Call it outside a session the first
+  ## time: the check runs once per process in a session of its own.
+  if normalizeBackend(backend) != gbVulkan: return false
+  vulkanTileGemmReady(f16, tensorCore)
+
 proc sessionMatmulNTTiledEnc*(backend: GpuBackend, a, w: SessionHandle,
     c: var SessionHandle; M, K, N: int): bool {.probed.} =
   ## Only the tiled FP32-weight cooperative kernel (for parity checks).
