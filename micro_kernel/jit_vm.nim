@@ -17,7 +17,9 @@
 
 import std/[tables, sets, strutils, strformat, times, os, pegs, hashes]
 import ./session_vm
+import ./tile_gemm
 import ../probe
+export tile_gemm
 when defined(macosx):
   import ./session_vm_dispatch
   # the GPU backend lives in vendor/bybylang/gpubackend (same bybylang package)
@@ -138,8 +140,9 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
   let b = vmRegB(w)
   let c = vmRegC(w)
   st.maxReg = max(st.maxReg, max(a, max(b, c)))
-  if op == OP_U_LOAD_IN4: st.maxReg = max(st.maxReg, a + 3)
+  if op == OP_U_LOAD_IN4 or op == OP_U_LOAD_F16X4: st.maxReg = max(st.maxReg, a + 3)
   if op >= OP_U_TGID and op <= OP_U_ATOMIC_ADD: st.usesU = true
+  if op == OP_U_LOAD_F16 or op == OP_U_LOAD_F16X4: st.usesU = true
   if op == OP_U_LOAD_IN or op == OP_U_LOAD_IN4: st.usesIn = true
   if op == OP_SIMD_SUM or op == OP_SIMD_LANE or op == OP_SIMD_ID: st.usesSimd = true
   if op in [OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID]: st.usesU = true
@@ -390,6 +393,20 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     else:
       st.body.add st.ind() & &"{{ float4 v4 = *(device const float4*)(inF32 + U[{b}] + {k}u);" &
         &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
+  of OP_U_LOAD_F16:
+    let k = st.imm(p)
+    if st.glsl:
+      st.body.add st.ind() & &"{{ const uint hI = U[{b}] + {k}u; R[{a}] = unpackHalf2x16(memU8[hI >> 1u] >> ((hI & 1u) * 16u)).x; }}"
+    else:
+      st.body.add st.ind() & &"R[{a}] = (float)((device const half*)memU8)[U[{b}] + {k}u];"
+  of OP_U_LOAD_F16X4:
+    let k = st.imm(p)
+    if st.glsl:
+      st.body.add st.ind() & &"{{ const uint hI = (U[{b}] + {k}u) >> 1u; const vec2 h0 = unpackHalf2x16(memU8[hI]);" &
+        &" const vec2 h1 = unpackHalf2x16(memU8[hI + 1u]); R[{a}] = h0.x; R[{a+1}] = h0.y; R[{a+2}] = h1.x; R[{a+3}] = h1.y; }}"
+    else:
+      st.body.add st.ind() & &"{{ const float4 h4 = float4(*((device const half4*)memU8 + ((U[{b}] + {k}u) >> 2u)));" &
+        &" R[{a}] = h4.x; R[{a+1}] = h4.y; R[{a+2}] = h4.z; R[{a+3}] = h4.w; }}"
   of OP_U_STORE_F32:
     let k = st.imm(p)
     st.body.add st.ind() & &"memF32[U[{b}] + {k}u] = R[{a}];"
@@ -547,14 +564,26 @@ proc closeBlocks(st: var LowerState) =
 
 proc coopGemmShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int]
 proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string
+proc isFp4CoopProgram*(p: VmProgram): bool
+proc lowerFp4TiledMetal*(p: VmProgram; kernelName: string; rowTile: int): string
+
+proc metalTileGemmSimdgroup(): bool =
+  ## The Metal device runs simdgroup_matrix (Apple GPU family 7+).
+  when defined(macosx): byby.sessionSimdgroupMatrixEnabled(byby.gbMetal)
+  else: false
+
 
 proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM]:
-    # Tensor Core GEMM shape op -> simdgroup_matrix kernel (Apple GPUs). Default tile for a
-    # device of unknown size; the FIR runtime builds its own tiles per dispatch.
+  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM, OP_TILE_GEMM]:
+    # Tile GEMM micro-kernel: simdgroup_matrix on an Apple GPU (family 7+), register tiles on
+    # any other Metal GPU (FP4-KM only; the Q4 shape op needs simdgroup_matrix). Default tile for
+    # a device of unknown size; the FIR runtime builds its own tiles per dispatch.
     let s = coopGemmShape(p)
-    return lowerCoopGemmMetal(p, kernelName, q4CoopRowTile(s.M, s.N))
+    let tile = q4CoopRowTile(max(1, s.M), s.N)
+    if isFp4CoopProgram(p) and not metalTileGemmSimdgroup():
+      return lowerFp4TiledMetal(p, kernelName, tile)
+    return lowerCoopGemmMetal(p, kernelName, tile)
   if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV:
     raise newException(ValueError, "the Q4 subgroup GEMV micro-kernel is Vulkan-only")
   var st = LowerState(indent: 2)
@@ -679,33 +708,28 @@ proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments 
     .replace("@FRAGS@", $fragments)
 
 proc isFp4CoopProgram*(p: VmProgram): bool =
-  p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_FP4_COOP_GEMM
+  ## An FP4-KM tile GEMM micro-kernel: the legacy cooperative shape op or an OP_TILE_GEMM program.
+  p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_FP4_COOP_GEMM, OP_TILE_GEMM]
 
 proc fp4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
-  ## Shape carried by an FP4-KM cooperative-matrix micro-kernel program (groupSize is always 32).
-  if not p.isFp4CoopProgram or p.words.len != 7 or p.words[6] != OP_HALT:
+  ## Shape carried by an FP4-KM tile GEMM micro-kernel (groupSize is always 32).
+  if not p.isFp4CoopProgram:
+    raise newException(ValueError, "not an FP4-KM tile GEMM micro-kernel")
+  if (p.words[0] and 0xFF'u32) == OP_FP4_COOP_GEMM and (p.words.len != 7 or p.words[6] != OP_HALT):
     raise newException(ValueError, "FP4 cooperative micro-kernel must be one shape op followed by halt")
-  result = (int(p.words[1]), int(p.words[2]), int(p.words[3]), int(p.words[4]), int(p.words[5]))
-  if result.M == 0 or not fp4CoopSupported(result.K, result.N, result.groupSize, result.nGroups):
-    raise newException(ValueError, "unsupported FP4 cooperative micro-kernel shape")
+  let s = tileGemmShape(p)
+  result = (s.M, s.K, s.N, 32, s.K div 32)
+  if result.M == 0 or result.N == 0:
+    raise newException(ValueError, "unsupported FP4 tile GEMM micro-kernel shape")
 
 proc lowerFp4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
-  ## The FP4-KM cooperative-matrix shader built for one row tile (Q4CoopRowTiles, chosen per
-  ## dispatch with q4CoopRowTile like the Q4 shader). `fragments` as in lowerQ4CoopGlsl.
-  if rowTile notin Q4CoopRowTiles:
-    raise newException(ValueError, "FP4 cooperative micro-kernel row tile must be 16, 32 or 64")
-  if fragments notin [1, 2]:
-    raise newException(ValueError, "FP4 cooperative micro-kernel fragments must be 1 or 2")
-  let s = fp4CoopShape(p)
-  const shaderTemplate = staticRead("../backends/vulkan/kernels/fir_fp4_coop_micro.glsl")
-  shaderTemplate
-    .replace("@KERNEL@", kernelName)
-    .replace("@M@", $s.M)
-    .replace("@K@", $s.K)
-    .replace("@N@", $s.N)
-    .replace("@N_GROUPS@", $s.nGroups)
-    .replace("@BM@", $rowTile)
-    .replace("@FRAGS@", $fragments)
+  ## Vulkan KHR cooperative-matrix lowering of the FP4-KM tile GEMM micro-kernel for one row
+  ## tile (Q4CoopRowTiles, chosen per dispatch with q4CoopRowTile like the Q4 shader).
+  lowerTileGemm(p, ttVulkanCoop, kernelName, rowTile, fragments)
+
+proc lowerFp4TiledGlsl*(p: VmProgram; kernelName: string; rowTile: int): string =
+  ## Register-tiled Vulkan lowering (devices without cooperative matrices); same grid.
+  lowerTileGemm(p, ttVulkanTiled, kernelName, rowTile)
 
 proc isCoopGemmProgram*(p: VmProgram): bool =
   ## A cooperative-matrix GEMM shape op of either weight format (Q4 or FP4-KM).
@@ -741,18 +765,12 @@ proc lowerQ4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
     .replace("@BM@", $rowTile)
 
 proc lowerFp4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
-  ## Metal counterpart of lowerFp4CoopGlsl (simdgroup_matrix, Apple GPUs only).
-  if rowTile notin Q4CoopRowTiles:
-    raise newException(ValueError, "FP4 cooperative micro-kernel row tile must be 16, 32 or 64")
-  let s = fp4CoopShape(p)
-  const shaderTemplate = staticRead("../backends/metal/kernels/fir_fp4_simd_micro.metal")
-  shaderTemplate
-    .replace("@KERNEL@", kernelName)
-    .replace("@M@", $s.M)
-    .replace("@K@", $s.K)
-    .replace("@N@", $s.N)
-    .replace("@N_GROUPS@", $s.nGroups)
-    .replace("@BM@", $rowTile)
+  ## simdgroup_matrix lowering of the FP4-KM tile GEMM micro-kernel (Apple GPUs only).
+  lowerTileGemm(p, ttMetalSimd, kernelName, rowTile)
+
+proc lowerFp4TiledMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+  ## Register-tiled Metal lowering (any Metal GPU); same grid as the simdgroup_matrix one.
+  lowerTileGemm(p, ttMetalTiled, kernelName, rowTile)
 
 proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
   ## The simdgroup_matrix kernel of either weight format for one row tile. The grid is the

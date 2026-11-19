@@ -4,9 +4,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_memory_scope_semantics : require
 
-// FP32, FP4-KM group32 and asymmetric Q4 share one tiled MMA implementation.
+// FP32 (WEIGHT_FORMAT 0) and asymmetric Q4 (2) share one tiled MMA implementation.
 // Converted/dequantized FP16 tiles live in shared memory only; weights remain
-// packed/resident and accumulators/output remain FP32.
+// packed/resident and accumulators/output remain FP32. FP4-KM weights use the
+// tile GEMM micro-kernel (micro_kernel/tile_gemm.nim) instead.
 layout(local_size_x_id = 0) in;
 layout(std430, binding = 0) readonly buffer Input { float x[]; };
 #if WEIGHT_FORMAT == 0
@@ -30,12 +31,6 @@ float weightAt(uint col, uint k) {
     if (col >= p.N || k >= p.K) return 0;
 #if WEIGHT_FORMAT == 0
     return w[col * p.K + k];
-#elif WEIGHT_FORMAT == 1
-    uint g = k / 32;
-    uint b = loadByte(col * (p.K / 2) + g * 16 + (k & 15));
-    uint q = (b >> ((k & 31) >= 16 ? 4 : 0)) & 15;
-    uint s = loadByte(p.N * (p.K / 2) + col * (p.K / 32) + g);
-    return lut[q] * lut[16 + s];
 #else
     uint b = loadByte(p.wOffset + col * ((p.K + 1) / 2) + k / 2);
     uint q = (b >> ((k & 1) * 4)) & 15;

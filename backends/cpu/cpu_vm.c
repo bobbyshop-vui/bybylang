@@ -42,8 +42,30 @@ enum {
     OP_SIMD_SUM = 0xA0, OP_SIMD_LANE = 0xA1, OP_SIMD_ID = 0xA2,
     OP_SIMD_W = 0xA3, OP_SIMD_GID = 0xA4,
     OP_MM_ZERO = 0xA5, OP_MM_LOAD = 0xA6, OP_MM_MAC = 0xA7, OP_MM_STORE_TG = 0xA8, OP_MM_STORE_MEM = 0xA9,
-    OP_Q4_COOP_GEMM = 0xAA, OP_Q4_GEMV = 0xAB, OP_FP4_COOP_GEMM = 0xAC
+    OP_Q4_COOP_GEMM = 0xAA, OP_Q4_GEMV = 0xAB, OP_FP4_COOP_GEMM = 0xAC,
+    OP_U_LOAD_F16 = 0xAD, OP_U_LOAD_F16X4 = 0xAE,
+    OP_TILE_GEMM = 0xB0, OP_TILE_ZERO = 0xB1, OP_TILE_K_BEGIN = 0xB2, OP_TILE_K_END = 0xB3,
+    OP_TILE_LOAD_A = 0xB4, OP_TILE_DECODE_FP4 = 0xB5, OP_TILE_MMA = 0xB6, OP_TILE_STORE = 0xB7
 };
+
+/* IEEE 754 binary16 -> float (the FP16 weight loads). */
+static float half_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) bits = sign;
+        else {
+            exp = 127 - 15 + 1;
+            while (!(mant & 0x400u)) { mant <<= 1; --exp; }
+            bits = sign | (exp << 23) | ((mant & 0x3FFu) << 13);
+        }
+    } else if (exp == 31) bits = sign | 0x7F800000u | (mant << 13);
+    else bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    float f; memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 typedef struct {
     int back_pc;
@@ -82,10 +104,11 @@ static int extra_words(uint32_t op) {
     case OP_U_LOAD_F32: case OP_U_ATOMIC_ADD: case OP_U_LOAD_META:
     case OP_MM_LOAD: case OP_MM_STORE_TG: case OP_MM_STORE_MEM:
     case OP_GRID_BARRIER: case OP_GRID_EPILOGUE:
+    case OP_U_LOAD_F16: case OP_U_LOAD_F16X4:
         return 1;
     case OP_VTG_BEGIN:
         return 2;
-    case OP_Q4_COOP_GEMM: case OP_Q4_GEMV: case OP_FP4_COOP_GEMM:
+    case OP_Q4_COOP_GEMM: case OP_Q4_GEMV: case OP_FP4_COOP_GEMM: case OP_TILE_GEMM:
         return 5;
     default:
         return 0;
@@ -106,7 +129,7 @@ static int vm_register_count(const uint32_t* code, int n) {
         uint32_t w = code[pc];
         uint32_t op = op_of(w);
         uint32_t a = a_of(w), b = b_of(w), c = c_of(w);
-        if (op == OP_U_LOAD_IN4) a += 3;
+        if (op == OP_U_LOAD_IN4 || op == OP_U_LOAD_F16X4) a += 3;
         if (a > top) top = a;
         if (b > top) top = b;
         if (c > top) top = c;
@@ -514,6 +537,64 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 }
                 break;
             }
+            case OP_TILE_GEMM: {
+                if (npc + 5 > n_words) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated tile GEMM header"); goto done;
+                }
+                uint32_t M = code[npc++], K = code[npc++], N = code[npc++];
+                const uint64_t scale_base = code[npc++], lut_base = code[npc++];
+                if (a != 0u || !K || K % 32u || !N) {
+                    result = -1; snprintf(err, (size_t)err_len, "CPU VM unsupported tile GEMM (format %u K %u N %u)", a, K, N); goto done;
+                }
+                /* FP4-KM tile GEMM micro-kernel (see tile_gemm.nim): nibble bytes [N, K/2] from byte 0
+                   of the u8 slot, scale bytes [N, K/32] from scale_base, the 272-float decode table at
+                   float lut_base of the lut slot. The GPU lowerings split the product into
+                   threadgroup tiles; here lane zero of the first workgroup computes all of it, and the
+                   tile ops that follow are no-ops. M = 0: as many rows as the input holds. */
+                if (tgid == 0 && lid == 0) {
+                    const float* x = (in_f32 ? in_f32 : mem) + t->base_in;
+                    const int64_t x_len = (int64_t)(in_f32 ? in_len : mem_len) - (int64_t)t->base_in;
+                    if (!packed || !lut || x_len < 0 || (int64_t)t->base_u8 > (int64_t)packed_len ||
+                        (int64_t)t->base_lut > (int64_t)lut_len) {
+                        result = -1; snprintf(err, (size_t)err_len, "CPU VM tile GEMM slot is missing"); goto done;
+                    }
+                    if (M == 0) M = (uint32_t)(x_len / (int64_t)K);
+                    const uint8_t* qdata = packed + t->base_u8;
+                    const int64_t q_len = (int64_t)packed_len - (int64_t)t->base_u8;
+                    const float* params = lut + t->base_lut;
+                    const int64_t params_len = (int64_t)lut_len - (int64_t)t->base_lut;
+                    const uint64_t row_bytes = K / 2u, n_groups = K / 32u;
+                    if ((int64_t)(N * row_bytes) > q_len || (int64_t)(scale_base + (uint64_t)N * n_groups) > q_len ||
+                        (int64_t)(lut_base + 272u) > params_len || (int64_t)M * (int64_t)K > x_len) {
+                        result = -1; snprintf(err, (size_t)err_len, "CPU VM tile GEMM input out of range"); goto done;
+                    }
+                    const float* fp4 = params + lut_base;
+                    const float* scales = fp4 + 16;
+                    for (uint32_t row = 0; row < M; ++row) {
+                        for (uint32_t col = 0; col < N; ++col) {
+                            float sum = 0.0f;
+                            for (uint32_t g = 0; g < n_groups; ++g) {
+                                const float scale = scales[qdata[scale_base + (uint64_t)col * n_groups + g]];
+                                const uint8_t* bytes = qdata + (uint64_t)col * row_bytes + (uint64_t)g * 16u;
+                                const float* xg = x + (uint64_t)row * K + (uint64_t)g * 32u;
+                                for (uint32_t j = 0; j < 16u; ++j)
+                                    sum = fmaf(xg[j], fp4[bytes[j] & 15u] * scale, sum);
+                                for (uint32_t j = 0; j < 16u; ++j)
+                                    sum = fmaf(xg[16u + j], fp4[bytes[j] >> 4] * scale, sum);
+                            }
+                            const int64_t out_idx = (int64_t)t->base_f32 + (int64_t)row * N + col;
+                            if (!check_idx(out_idx, mem_len, "tile_gemm_store", err, err_len)) {
+                                result = -1; goto done;
+                            }
+                            mem[out_idx] = sum;
+                        }
+                    }
+                }
+                break;
+            }
+            case OP_TILE_ZERO: case OP_TILE_K_BEGIN: case OP_TILE_K_END: case OP_TILE_LOAD_A:
+            case OP_TILE_DECODE_FP4: case OP_TILE_MMA: case OP_TILE_STORE:
+                break;
             case OP_SIMD_W: t->u[a] = 32u; break;
             case OP_SIMD_GID: t->u[a] = (uint32_t)tid / 32u; break;
             case OP_SIMD_ID: t->u[a] = (uint32_t)lid / 32u; break;
@@ -561,6 +642,18 @@ int nimf_cpu_vm_run_slots(uint32_t* code, int n_words, float* mem, int mem_len,
                 int64_t idx = (int64_t)t->u[b] + (int64_t)off + (int64_t)t->base_u8;
                 if (!check_idx(idx, packed_len - 3, "u_load_u32", err, err_len)) { result = -1; goto done; }
                 uint32_t v; memcpy(&v, packed + idx, sizeof(v)); t->u[a] = v;
+                break;
+            }
+            case OP_U_LOAD_F16: case OP_U_LOAD_F16X4: {
+                const int width = op == OP_U_LOAD_F16X4 ? 4 : 1;
+                if (npc >= n_words) { result = -1; snprintf(err, (size_t)err_len, "CPU VM truncated instruction"); goto done; }
+                uint32_t off = code[npc++];
+                int64_t byte = ((int64_t)t->u[b] + (int64_t)off) * 2 + (int64_t)t->base_u8;
+                if (!check_idx(byte, packed_len - 2 * width + 1, "u_load_f16", err, err_len)) { result = -1; goto done; }
+                for (int j = 0; j < width; ++j) {
+                    uint16_t h; memcpy(&h, packed + byte + 2 * j, sizeof(h));
+                    t->r[a + j] = half_to_float(h);
+                }
                 break;
             }
             case OP_U_LOAD_CONSTF: {

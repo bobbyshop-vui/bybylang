@@ -8,7 +8,7 @@
 // FIR custom micro-kernel for asymmetric Q4 prefill. This is compiled by the
 // micro-VM JIT and dispatched as a normal FIR micro node. It does not call the
 // native Q4/session GEMM path; its body follows the native tiled kernel
-// (matmul_fp4km_tiled.glsl, format 2).
+// (matmul_coop_tiled.glsl, format 2).
 // One 128-invocation workgroup computes BM rows x 64 columns (BM =
 // q4CoopRowTile(rows, N): 16, 32 or 64, chosen per dispatch). Each 64-deep K
 // step dequantizes the 64-column Q4 weight tile once into shared FP16 (one

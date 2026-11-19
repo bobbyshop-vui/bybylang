@@ -6,15 +6,15 @@
 #extension GL_EXT_control_flow_attributes : require
 
 // Prefill GEMM y[M,N] = x[M,K] * W[N,K]^T, FP16 MMA, FP32 accumulate.
-// WEIGHT_FORMAT 1 = packed FP4-KM group32, 0 = FP32 rows (Linear++ sidecar),
-// 2 = asymmetric Q4 (DeepSeek/Llama): byte i of a row holds k=2i (low nibble)
+// WEIGHT_FORMAT 0 = FP32 rows (Linear++ sidecar), 2 = asymmetric Q4 (DeepSeek/Llama): byte i of a row holds k=2i (low nibble)
 // and k=2i+1 (high), value = (q - zero[g]) * scale[g] with
 // g = col * groupsPerRow + k / groupSize (groupSize 0: one group per row).
 // One workgroup = 4 subgroups = 64 output columns x 64 rows. Each 64-deep
 // K step decodes the packed weights once into shared FP16 (one thread per
 // column/group: one uvec4 + one scale) and reuses them for every active 16-row
 // tile. matmul_coop.glsl instead re-decodes per 16x16 tile and per 16-deep K
-// step, so a 17-token prompt decoded every weight twice. Row tiles at or past M
+// step, so a 17-token prompt decoded every weight twice. FP4-KM weights use
+// the tile GEMM micro-kernel (micro_kernel/tile_gemm.nim) instead. Row tiles at or past M
 // skip both their activation loads and their MMAs.
 // Split-K: workgroup z covers k in [z * kPerSlice, (z + 1) * kPerSlice) and
 // writes its partial sums to y + z * M * N (the host sums the slices); with
@@ -27,13 +27,12 @@
 layout(local_size_x_id = 0) in;
 layout(std430, binding = 0) readonly buffer Input { vec4 x4[]; };
 #ifndef WEIGHT_FORMAT
-#define WEIGHT_FORMAT 1
+#define WEIGHT_FORMAT 0
 #endif
 #if WEIGHT_FORMAT == 0
 layout(std430, binding = 1) readonly buffer Weight { vec4 wf4[]; };
 #else
 layout(std430, binding = 1) readonly buffer Weight { uvec4 w4[]; };
-layout(std430, binding = 1) readonly buffer WeightWords { uint w[]; };
 #endif
 layout(std430, binding = 2) writeonly buffer Output { float y[]; };
 layout(std430, binding = 3) readonly buffer Lut { float lut[]; };
@@ -56,7 +55,6 @@ const uint THREADS = WG_THREADS;
 shared float16_t aTile[BM * LDS];
 shared float16_t bTile[BN * LDS];
 shared float cStage[4 * 256];
-shared float lutS[16];
 
 void main() {
     uint lid = gl_LocalInvocationID.x;
@@ -72,9 +70,6 @@ void main() {
     uint bHalf = lid & 1u;
     uint gCol = col0 + bCol;
 
-#if WEIGHT_FORMAT == 1
-    if (lid < 16u) lutS[lid] = lut[lid];
-#endif
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[4];
     [[unroll]] for (uint r = 0; r < 4u; ++r)
         acc[r] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
@@ -134,27 +129,6 @@ void main() {
                 uint byteV = (word >> (8u * b)) & 255u;
                 bTile[ob + 8u * j + 2u * b] = float16_t((float(byteV & 15u) - zr) * sc);
                 bTile[ob + 8u * j + 2u * b + 1u] = float16_t((float(byteV >> 4) - zr) * sc);
-            }
-        }
-        }
-#else
-        // Weights: byte i of a 32-value group holds k=i (low) and k=16+i (high).
-        if (lid < 2u * BN) {
-        uint g = (base >> 5) + bHalf;
-        uvec4 packed = uvec4(0u);
-        float scale = 0.0;
-        if (gCol < p.N) {
-            packed = w4[gCol * groups + g];
-            uint sb = scaleBase + gCol * groups + g;
-            scale = lut[16u + ((w[sb >> 2] >> ((sb & 3u) * 8u)) & 255u)];
-        }
-        uint ob = bCol * LDS + bHalf * 32u;
-        [[unroll]] for (uint j = 0; j < 4u; ++j) {
-            uint word = packed[j];
-            [[unroll]] for (uint b = 0; b < 4u; ++b) {
-                uint byteV = (word >> (8u * b)) & 255u;
-                bTile[ob + 4u * j + b] = float16_t(lutS[byteV & 15u] * scale);
-                bTile[ob + 16u + 4u * j + b] = float16_t(lutS[byteV >> 4] * scale);
             }
         }
         }

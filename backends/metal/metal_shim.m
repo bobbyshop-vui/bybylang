@@ -1228,68 +1228,6 @@ static int encode_gemm_rb(int transposeB, MetalBufferHandle a, MetalBufferHandle
     return 1;
 }
 
-// ---- FP4-KM GEMM for prefill (kernels/gemm_fp4km.metal, gemm_fp4km_sg.metal) -------------------
-// The simdgroup_matrix kernel lives in its own library that is compiled only on an Apple GPU, so a
-// source an Intel/AMD driver cannot build never touches the main library.
-static id<MTLLibrary> gSgLibrary = nil;
-static int gSgState = 0;   // 0 untried, 1 ready, -1 unavailable
-static id<MTLComputePipelineState> gSgPipeline = nil;
-
-static id<MTLComputePipelineState> fp4kmSgPipeline(const char* source) {
-    if (gSgState < 0) return nil;
-    if (gSgState > 0) return gSgPipeline;
-    gSgState = -1;
-    if (!source || !gDevice) return nil;
-    BOOL apple = NO;
-    if (@available(macOS 10.15, *)) apple = [gDevice supportsFamily:MTLGPUFamilyApple7];
-    // BYBY_FP4_SG_COMPILE_CHECK=1 compiles the source on any GPU to catch syntax errors, but a
-    // non-Apple GPU never gets a pipeline from it.
-    BOOL compileOnly = !apple && getenv("BYBY_FP4_SG_COMPILE_CHECK") != NULL;
-    if (!apple && !compileOnly) return nil;
-    NSError *error = nil;
-    gSgLibrary = [gDevice newLibraryWithSource:[NSString stringWithUTF8String:source] options:nil error:&error];
-    if (!gSgLibrary) { NSLog(@"[fp4km-sg] library compile failed: %@", error); return nil; }
-    if (compileOnly) { NSLog(@"[fp4km-sg] library compiled (compile check only, no pipeline on this GPU)"); return nil; }
-    id<MTLFunction> fn = [gSgLibrary newFunctionWithName:@"gemm_fp4km_sg"];
-    if (!fn) return nil;
-    gSgPipeline = [gDevice newComputePipelineStateWithFunction:fn error:&error];
-    if (!gSgPipeline || gSgPipeline.maxTotalThreadsPerThreadgroup < 128) { gSgPipeline = nil; return nil; }
-    gSgState = 1;
-    return gSgPipeline;
-}
-
-// mode: 0 = register-blocked (any GPU), 1 = simdgroup_matrix (Apple GPU only). Returns 0 when the
-// requested kernel is not available so the caller can fall back to the packed micro-VM tiles.
-int metal_fp4km_gemm_enc(MetalBufferHandle a, MetalBufferHandle w, MetalBufferHandle lut,
-                         MetalBufferHandle c, int m, int k, int n, int mode, const char* sgSource) {
-    @autoreleasepool {
-        if (!gSessionEncoder || m <= 0 || k <= 0 || n <= 0 || k % 32 != 0) return 0;
-        id<MTLComputePipelineState> pipeline = nil;
-        NSUInteger bm = 64, threads = 256;
-        if (mode == 1) {
-            pipeline = fp4kmSgPipeline(sgSource);
-            threads = 128;
-        } else {
-            bm = m <= 16 ? 16 : (m <= 32 ? 32 : 64);
-            pipeline = getPipeline([NSString stringWithFormat:@"gemm_fp4km_rb_%d", (int)bm]);
-            if (pipeline && pipeline.maxTotalThreadsPerThreadgroup < 256) pipeline = nil;
-        }
-        if (!pipeline) return 0;
-        [gSessionEncoder setComputePipelineState:pipeline];
-        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)a offset:0 atIndex:0];
-        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)w offset:0 atIndex:1];
-        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)lut offset:0 atIndex:2];
-        [gSessionEncoder setBuffer:(__bridge id<MTLBuffer>)c offset:0 atIndex:3];
-        [gSessionEncoder setBytes:&m length:sizeof(int) atIndex:4];
-        [gSessionEncoder setBytes:&k length:sizeof(int) atIndex:5];
-        [gSessionEncoder setBytes:&n length:sizeof(int) atIndex:6];
-        MTLSize groups = MTLSizeMake(((NSUInteger)n + 63) / 64, ((NSUInteger)m + bm - 1) / bm, 1);
-        [gSessionEncoder dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-        sessionBarrier();
-        return 1;
-    }
-}
-
 int metal_matmul_enc(MetalBufferHandle a, MetalBufferHandle b, MetalBufferHandle c, int m, int k, int n) {
     @autoreleasepool {
         if (!gSessionEncoder) { NSLog(@"[metal_matmul_enc] metal_session_begin not called"); return 0; }

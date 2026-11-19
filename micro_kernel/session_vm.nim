@@ -98,7 +98,22 @@ const
   OP_Q4_GEMV*      = 0xAB'u32   # Vulkan micro-kernel: subgroup Q4 GEMV for decode; next 5 words are M,K,N,group,nGroups
   OP_FP4_COOP_GEMM* = 0xAC'u32  # Vulkan micro-kernel: FP4-KM GEMM via KHR cooperative matrices; next 5 words are M,K,N,32,K/32
   OP_SIMD_GID*     = 0xA4'u32   # U[a] = global thread id / threads_per_simdgroup (grid-wide simdgroup index)
+  # ── FP16 weight loads (buffer 2 read as an array of IEEE halves, accumulate in FP32) ──
+  OP_U_LOAD_F16*   = 0xAD'u32   # R[a] = float(half(memU8)[U[b] + word])            (index in halves)
+  OP_U_LOAD_F16X4* = 0xAE'u32   # R[a..a+3] = float4(half4(memU8)[U[b] + word ..+3]) (index a multiple of 4)
   OP_GRID_EPILOGUE* = 0x9C'u32  # next word = ctrl index; the last TG resets the counter, copies err -> lastErr
+  # ── Tile GEMM micro-kernel (one threadgroup computes a BM x 64 block of C = X * W^T) ──
+  # The lowering turns each op into code for the device: KHR cooperative matrices (Vulkan),
+  # simdgroup_matrix (Apple GPU family 7+) or a register-tiled loop (any GPU); the CPU VM runs the
+  # header as a reference product. See tile_gemm.nim.
+  OP_TILE_GEMM*       = 0xB0'u32  # a = weight format (0 = FP4-KM); next 5 words M, K, N, scaleBase (byte in slot u8), lutBase (float in slot lut); M = 0: rows per dispatch
+  OP_TILE_ZERO*       = 0xB1'u32  # clear the accumulator tile (also publishes the staged decode table)
+  OP_TILE_K_BEGIN*    = 0xB2'u32  # for each K slice of the target's depth
+  OP_TILE_K_END*      = 0xB3'u32
+  OP_TILE_LOAD_A*     = 0xB4'u32  # stage the activation slice [BM rows, slice] (buffer 4) in threadgroup memory
+  OP_TILE_DECODE_FP4* = 0xB5'u32  # stage the decoded FP4-KM weight slice [64 columns, slice] (buffers 2, 3)
+  OP_TILE_MMA*        = 0xB6'u32  # accumulator += staged activations x staged weights
+  OP_TILE_STORE*      = 0xB7'u32  # write the in-bounds accumulator elements to buffer 1
 
 type
   VmProgram* = object
@@ -254,13 +269,14 @@ proc opHasWord*(op: uint32): bool {.inline.} =
      OP_ADD_CONST, OP_MUL_CONST, OP_TG_LOAD_F32, OP_TG_STORE_F32,
      OP_U_CONST, OP_U_ADDK, OP_U_MULK, OP_U_ANDK, OP_U_SHRK, OP_U_SHLK,
      OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_CONSTF, OP_U_LOAD_IN, OP_U_LOAD_IN4, OP_U_STORE_F32,
-     OP_U_LOAD_F32, OP_U_ATOMIC_ADD, OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM: true
+     OP_U_LOAD_F32, OP_U_ATOMIC_ADD, OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM,
+     OP_U_LOAD_F16, OP_U_LOAD_F16X4: true
   else: false
 
 proc opImmediateWords*(op: uint32): int {.inline.} =
   ## Number of immediate words following an instruction. Most opcodes have
   ## zero or one; custom shape-specialized micro-kernels may carry more.
-  if op in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM]: return 5
+  if op in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM, OP_TILE_GEMM]: return 5
   if opHasWord(op): return 1
   0
 
@@ -284,6 +300,28 @@ proc emitFp4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
   ## kept so every cooperative-matrix shape op has the same five-word layout.
   p.emit OP_FP4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
+
+proc emitTileGemm*(p: var VmProgram; format, M, K, N, scaleBase, lutBase: uint32) =
+  p.emit pack1(OP_TILE_GEMM, format)
+  p.emit M; p.emit K; p.emit N; p.emit scaleBase; p.emit lutBase
+
+proc buildFp4TileGemmProgram*(M, K, N, scaleBase, lutBase: int): VmProgram =
+  ## The FP4-KM tile GEMM micro-kernel: out[M, N] = x[M, K] * W[N, K]^T with W packed FP4-KM in
+  ## slot u8 (nibble bytes [N, K/2] from byte 0: byte j of a 32-value group holds element j in the
+  ## low nibble and j+16 in the high one; scale bytes [N, K/32] from byte scaleBase) and the
+  ## 272-float decode table (16 FP4 values, 256 scale values) at float lutBase of slot lut.
+  ## M = 0 leaves the row count to each dispatch.
+  result.emitTileGemm(0, uint32(M), uint32(K), uint32(N), uint32(scaleBase), uint32(lutBase))
+  result.emit OP_TILE_ZERO
+  result.emit OP_TILE_K_BEGIN
+  result.emit OP_TILE_LOAD_A
+  result.emit OP_TILE_DECODE_FP4
+  result.emit OP_BARRIER_TG
+  result.emit OP_TILE_MMA
+  result.emit OP_BARRIER_TG
+  result.emit OP_TILE_K_END
+  result.emit OP_TILE_STORE
+  result.emit OP_HALT
 
 proc emitQ4Gemv*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
   p.emit OP_Q4_GEMV
@@ -366,6 +404,13 @@ proc emitULoadIn4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
   ## a multiple of 4 floats (16 bytes) - the kernel must guarantee it.
   doAssert rd + 3 <= 31, "emitULoadIn4: exceeds the 32 R[] registers"
   p.emit pack2(OP_U_LOAD_IN4, rd, ub); p.emit off
+proc emitULoadF16*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+  ## R[rd] = float of the IEEE half at element U[ub]+off of buffer 2 (index in halves, not bytes).
+  p.emit pack2(OP_U_LOAD_F16, rd, ub); p.emit off
+proc emitULoadF16x4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+  ## R[rd..rd+3] = 4 consecutive halves of buffer 2 at element U[ub]+off, widened to float.
+  ## The element index must be a multiple of 4 (one 8-byte load) - the kernel must guarantee it.
+  p.emit pack2(OP_U_LOAD_F16X4, rd, ub); p.emit off
 proc emitUStoreF32*(p: var VmProgram; rs, ub: uint32; off: uint32 = 0) =
   p.emit pack2(OP_U_STORE_F32, rs, ub); p.emit off
 proc emitULoadF32*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =

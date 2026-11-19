@@ -1,7 +1,8 @@
 # metal_backend.nim - Metal GPU backend wrapper (compiled on macOS only).
 when defined(macosx):
-  import std/os
+  import std/[os, tables]
   import ../../probe
+  import ../../micro_kernel/[session_vm, tile_gemm]
 proc c_free(p: pointer) {.importc: "free", header: "<stdlib.h>".}
 
 when defined(macosx):
@@ -13,7 +14,6 @@ when defined(macosx):
 
   const kMetalKernelSrc = staticRead(metalDir / "kernels" / "vecop_matmul.metal") &
     "\n" & staticRead(metalDir / "kernels" / "gemm_blocked.metal") &
-    "\n" & staticRead(metalDir / "kernels" / "gemm_fp4km.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_decode_all_heads.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash.metal") &
     "\n" & staticRead(metalDir / "kernels" / "attention_prefill_flash_fp16.metal") &
@@ -623,15 +623,40 @@ when defined(macosx):
     if m <= 1: return false
     metal_matmul_mps_nt_enc_c(a, b, c, cint(m), cint(k), cint(n), cint(stride), cint(offset)) != 0
 
-  const kFp4kmSgSrc = staticRead(metalDir / "kernels" / "gemm_fp4km_sg.metal")
-  proc metal_fp4km_gemm_enc_c(a, w, lut, c: MetalBufferHandle; m, k, n, mode: cint;
-      sgSource: cstring): cint {.importc: "metal_fp4km_gemm_enc", header: "metal_shim.h".}
-  proc metalSessionFp4GemmEnc*(a, w, lut, c: MetalBufferHandle; m, k, n: int; simdgroup: bool): bool =
-    ## C(m,n) = A(m,k) @ W^T for packed FP4-KM weights (prefill, any m >= 1). simdgroup = the
-    ## simdgroup_matrix kernel (Apple GPU only); false = the register-blocked kernel (any GPU).
-    ## False means the kernel is unavailable and the caller keeps its packed micro-VM tiles.
-    metal_fp4km_gemm_enc_c(a, w, lut, c, cint(m), cint(k), cint(n), cint(if simdgroup: 1 else: 0),
-      kFp4kmSgSrc.cstring) != 0
+  proc metal_jit_compile_c(source, kernelName: cstring): cint {.importc: "metal_jit_compile", header: "metal_shim.h".}
+  proc metal_enc_pipeline_c(kernelName: cstring): cint {.importc: "metal_enc_pipeline", header: "metal_shim.h".}
+  proc metal_enc_bind_buffer_c(index: cint; buf: MetalBufferHandle; offsetBytes: cint): cint {.importc: "metal_enc_bind_buffer", header: "metal_shim.h".}
+  proc metal_enc_bind_int_c(index, v: cint): cint {.importc: "metal_enc_bind_int", header: "metal_shim.h".}
+  proc metal_enc_dispatch_c(gx, gy, gz, tx, ty, tz: cint): cint {.importc: "metal_enc_dispatch", header: "metal_shim.h".}
+  proc metal_enc_barrier_c(): cint {.importc: "metal_enc_barrier", header: "metal_shim.h".}
+
+  var gFp4TilePipelines = initTable[string, bool]()   ## kernel name -> compiled (false: failed once)
+
+  proc metalSessionFp4TileGemmEnc*(a, w, lut, c: MetalBufferHandle; m, k, n: int; simdgroup: bool): bool =
+    ## C(m,n) = A(m,k) @ W^T for packed FP4-KM weights through the tile GEMM micro-kernel
+    ## (session_vm.buildFp4TileGemmProgram, lowered by tile_gemm.nim): simdgroup = the
+    ## simdgroup_matrix lowering (Apple GPU family 7+), false = the register-tiled lowering (any
+    ## GPU). W holds the nibble bytes then the scale bytes; lut the 272-float decode table. The row
+    ## count is bound per dispatch, so one pipeline per (K, N, row tile) serves every prompt
+    ## length. False: the kernel is unavailable and the caller keeps its packed micro-VM tiles.
+    if m <= 0 or n <= 0 or k <= 0 or k mod 32 != 0: return false
+    if simdgroup and not metalSimdgroupMatrixSupported(): return false
+    let target = if simdgroup: ttMetalSimd else: ttMetalTiled
+    let tile = tileGemmRowTile(m)
+    let name = "fp4_tile_" & $target & "_k" & $k & "_n" & $n & "_r" & $tile
+    if name notin gFp4TilePipelines:
+      let program = buildFp4TileGemmProgram(0, k, n, n * (k div 2), 0)
+      gFp4TilePipelines[name] = metal_jit_compile_c(lowerTileGemm(program, target, name, tile).cstring,
+        name.cstring) != 0
+      if not gFp4TilePipelines[name]:
+        stderr.writeLine "[metal] FP4-KM tile GEMM micro-kernel " & name & " failed to compile"
+    if not gFp4TilePipelines[name]: return false
+    result = metal_enc_pipeline_c(name.cstring) != 0 and
+      metal_enc_bind_buffer_c(1, c, 0) != 0 and metal_enc_bind_buffer_c(2, w, 0) != 0 and
+      metal_enc_bind_buffer_c(3, lut, 0) != 0 and metal_enc_bind_buffer_c(4, a, 0) != 0 and
+      metal_enc_bind_int_c(5, cint(m)) != 0 and
+      metal_enc_dispatch_c(cint(tileGemmGroups(m, n, tile)), 1, 1, cint(TileGemmThreads), 1, 1) != 0
+    if result: discard metal_enc_barrier_c()
 
   proc metal_matmul_mps_enc_c(a, b, c: MetalBufferHandle;
       m, k, n, stride, offset: cint): cint {.importc: "metal_matmul_mps_enc", header: "metal_shim.h".}

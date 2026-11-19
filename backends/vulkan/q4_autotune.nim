@@ -17,7 +17,7 @@ const Q4TuneSourceSignature = staticRead("kernels/matmul_q4.comp") &
   staticRead("kernels/matmul_q4_sg.glsl") &
   staticRead("kernels/matmul_q4_gemm.glsl") &
   staticRead("kernels/matmul_coop.glsl") &
-  staticRead("kernels/matmul_fp4km_tiled.glsl")
+  staticRead("kernels/matmul_coop_tiled.glsl")
 
 proc q4Compile(tg, rows, batch: int): VkQ4Plan
 proc q4CompileSubgroup(tg, rows, vec: int; sharedReduce: bool): VkQ4Plan

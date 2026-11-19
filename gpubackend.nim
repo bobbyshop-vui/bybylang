@@ -1423,7 +1423,8 @@ proc sessionMatmulNTFp16Coop*(backend: GpuBackend, a, b: SessionHandle,
 
 proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
     c: var SessionHandle; M, K, N: int): bool {.probed.} =
-  ## False means the caller must use its packed FP4 microkernel.
+  ## FP4-KM tile GEMM micro-kernel on Vulkan cooperative matrices. False means the caller must
+  ## use its packed FP4 microkernel.
   if normalizeBackend(backend) != gbVulkan: return false
   if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
   vulkanSessionFp4GemmEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
@@ -1431,21 +1432,22 @@ proc sessionFp4GemmTensorCore*(backend: GpuBackend, a, w, lut: SessionHandle,
 
 proc sessionFp4GemmMetal*(backend: GpuBackend, a, w, lut: SessionHandle,
     c: var SessionHandle; M, K, N: int; simdgroup: bool): bool {.probed.} =
-  ## Packed FP4-KM prefill GEMM on Metal: the register-blocked kernel on every GPU, or the
-  ## simdgroup_matrix kernel on an Apple GPU. False means unavailable; use the packed micro-VM tiles.
+  ## Packed FP4-KM prefill GEMM on Metal through the tile GEMM micro-kernel: register tiles on
+  ## every GPU, or simdgroup_matrix on an Apple GPU (family 7+). False means unavailable; use the
+  ## packed micro-VM tiles.
   when defined(macosx):
     if normalizeBackend(backend) != gbMetal: return false
     if a.metalHandle == nil or w.metalHandle == nil or lut.metalHandle == nil or c.metalHandle == nil:
       return false
-    metalSessionFp4GemmEnc(a.metalHandle, w.metalHandle, lut.metalHandle,
+    metalSessionFp4TileGemmEnc(a.metalHandle, w.metalHandle, lut.metalHandle,
       c.metalHandle, M, K, N, simdgroup)
   else:
     false
 
 proc sessionFp4GemmTiledEnc*(backend: GpuBackend, a, w, lut: SessionHandle,
     c: var SessionHandle; M, K, N: int): bool {.probed.} =
-  ## Only the tiled FP4 cooperative kernel (for parity checks); false if it
-  ## cannot run on this device/shape.
+  ## The register-tiled lowering of the FP4-KM tile GEMM micro-kernel on Vulkan (no cooperative
+  ## matrices needed); false if it cannot run on this device/shape.
   if normalizeBackend(backend) != gbVulkan: return false
   if c.vulkanHandle.buf == nil: c = sessionAllocScratch(gbVulkan, M * N)
   vulkanSessionFp4GemmTiledEnc(a.vulkanHandle, w.vulkanHandle, lut.vulkanHandle,
@@ -1461,10 +1463,6 @@ proc sessionMatmulNTTiledEnc*(backend: GpuBackend, a, w: SessionHandle,
 proc sessionSetF32GemmTiled*(backend: GpuBackend; enabled: bool) {.probed.} =
   ## Let sessionMatmulNTAccelerated / sessionMatmulNTFp16Coop prefer the tiled kernel.
   if normalizeBackend(backend) == gbVulkan: vulkanSetF32GemmTiled(enabled)
-
-proc sessionSetFp4GemmTiled*(backend: GpuBackend; enabled: bool) {.probed.} =
-  ## Let sessionFp4GemmTensorCore prefer the tiled kernel (after a parity check).
-  if normalizeBackend(backend) == gbVulkan: vulkanSetFp4GemmTiled(enabled)
 
 proc sessionSoftmax*(backend: GpuBackend, x: SessionHandle, y: var SessionHandle, rows, cols: int): bool {.probed.} =
   var chosen = backend

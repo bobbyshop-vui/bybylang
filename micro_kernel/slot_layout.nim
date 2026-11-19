@@ -25,10 +25,10 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
       result.writes.incl "mem"
     of OP_U_ATOMIC_ADD:
       result.reads.incl "mem"; result.writes.incl "mem"
-    of OP_LOAD_U8, OP_U_LOAD_U8, OP_U_LOAD_U32: result.reads.incl "u8"
+    of OP_LOAD_U8, OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_F16, OP_U_LOAD_F16X4: result.reads.incl "u8"
     of OP_LUT_U8, OP_U_LOAD_CONSTF, OP_U_LOAD_META: result.reads.incl "lut"
     of OP_U_LOAD_IN, OP_U_LOAD_IN4: result.reads.incl "input"
-    of OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM:
+    of OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM, OP_TILE_GEMM:
       result.reads.incl "u8"; result.reads.incl "lut"; result.reads.incl "input"
       result.writes.incl "mem"
     of OP_GRID_BARRIER, OP_GRID_EPILOGUE:
@@ -42,9 +42,9 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
        OP_U_LOAD_U8, OP_U_LOAD_U32, OP_U_LOAD_CONSTF, OP_U_LOAD_IN,
        OP_U_LOAD_IN4, OP_U_STORE_F32, OP_U_LOAD_F32, OP_U_ATOMIC_ADD,
        OP_U_LOAD_META, OP_GRID_BARRIER, OP_GRID_EPILOGUE,
-       OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM: extra = 1
+       OP_MM_LOAD, OP_MM_STORE_TG, OP_MM_STORE_MEM, OP_U_LOAD_F16, OP_U_LOAD_F16X4: extra = 1
     of OP_VTG_BEGIN: extra = 2
-    of OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM: extra = 5
+    of OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM, OP_TILE_GEMM: extra = 5
     of OP_NOP, OP_HALT, OP_LOAD_F32_IDX, OP_STORE_F32_IDX, OP_LOAD_LID,
        OP_LOAD_TGID, OP_ADD, OP_MUL, OP_SUB, OP_EXP, OP_NEG, OP_SIGMOID,
        OP_DIV, OP_SOFTPLUS, OP_RSQRT, OP_LUT_U8, OP_FOR_BEGIN, OP_FOR_END,
@@ -52,13 +52,15 @@ proc vmAccess*(words: openArray[uint32]): VmAccess =
        OP_U_ADD, OP_U_MUL, OP_U_SHR, OP_U_TO_R, OP_R_TO_U, OP_BASE_F32,
        OP_BASE_U8, OP_BASE_LUT, OP_BASE_IN, OP_VTG_END, OP_LOAD_VACT,
        OP_SIMD_SUM, OP_SIMD_LANE, OP_SIMD_ID, OP_SIMD_W, OP_SIMD_GID,
-       OP_MM_ZERO, OP_MM_MAC: discard
+       OP_MM_ZERO, OP_MM_MAC, OP_TILE_ZERO, OP_TILE_K_BEGIN, OP_TILE_K_END,
+       OP_TILE_LOAD_A, OP_TILE_DECODE_FP4, OP_TILE_MMA, OP_TILE_STORE: discard
     else: raise newException(ValueError, "unknown VM opcode 0x" & toHex(op, 2))
     if pc+extra > words.len: raise newException(ValueError, "truncated recorded VM instruction")
     case op
-    of OP_FOR_BEGIN, OP_IF_BEGIN, OP_VTG_BEGIN: scopes.add op
-    of OP_FOR_END, OP_IF_END, OP_VTG_END:
-      let opening = if op == OP_FOR_END: OP_FOR_BEGIN elif op == OP_IF_END: OP_IF_BEGIN else: OP_VTG_BEGIN
+    of OP_FOR_BEGIN, OP_IF_BEGIN, OP_VTG_BEGIN, OP_TILE_K_BEGIN: scopes.add op
+    of OP_FOR_END, OP_IF_END, OP_VTG_END, OP_TILE_K_END:
+      let opening = if op == OP_FOR_END: OP_FOR_BEGIN elif op == OP_IF_END: OP_IF_BEGIN
+                    elif op == OP_TILE_K_END: OP_TILE_K_BEGIN else: OP_VTG_BEGIN
       if scopes.len == 0 or scopes[^1] != opening:
         raise newException(ValueError, "unbalanced recorded VM scope")
       scopes.setLen(scopes.len-1)
