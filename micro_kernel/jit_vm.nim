@@ -386,13 +386,13 @@ proc lowerStep(st: var LowerState; p: VmProgram) =
     let k = st.imm(p)
     if st.glsl:
       st.body.add st.ind() & &"{{ vec4 v4 = vec4(inF32[U[{b}] + {k}u], inF32[U[{b}] + {k}u + 1u], inF32[U[{b}] + {k}u + 2u], inF32[U[{b}] + {k}u + 3u]);" &
-        &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
+        &" R[{a}] = v4.x; R[{a + 1}] = v4.y; R[{a + 2}] = v4.z; R[{a + 3}] = v4.w; }}"
     elif st.ctrlBuf:
-      st.body.add st.ind() & &"{{ R[{a}] = ldShared(inF32 + U[{b}] + {k}u); R[{a}+1] = ldShared(inF32 + U[{b}] + {k}u + 1u);" &
-        &" R[{a}+2] = ldShared(inF32 + U[{b}] + {k}u + 2u); R[{a}+3] = ldShared(inF32 + U[{b}] + {k}u + 3u); }}"
+      st.body.add st.ind() & &"{{ R[{a}] = ldShared(inF32 + U[{b}] + {k}u); R[{a + 1}] = ldShared(inF32 + U[{b}] + {k}u + 1u);" &
+        &" R[{a + 2}] = ldShared(inF32 + U[{b}] + {k}u + 2u); R[{a + 3}] = ldShared(inF32 + U[{b}] + {k}u + 3u); }}"
     else:
       st.body.add st.ind() & &"{{ float4 v4 = *(device const float4*)(inF32 + U[{b}] + {k}u);" &
-        &" R[{a}] = v4.x; R[{a}+1] = v4.y; R[{a}+2] = v4.z; R[{a}+3] = v4.w; }}"
+        &" R[{a}] = v4.x; R[{a + 1}] = v4.y; R[{a + 2}] = v4.z; R[{a + 3}] = v4.w; }}"
   of OP_U_LOAD_F16:
     let k = st.imm(p)
     if st.glsl:

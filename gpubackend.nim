@@ -2589,6 +2589,14 @@ proc sessionGpuSeconds*(backend: GpuBackend): float =
   if chosen == gbVulkan: return vulkanSessionGpuSeconds()
   0.0
 
+proc sessionSetGpuTiming*(backend: GpuBackend; on: bool): bool =
+  ## Autotuners turn this on around their timed sessions so sessionGpuSeconds reports device
+  ## time on Vulkan too (Metal always reports it). Returns whether GPU time is available.
+  var chosen = backend
+  if chosen == gbAuto: chosen = detectBackend()
+  if chosen == gbVulkan: return vulkanSessionSetTimestamps(on)
+  chosen == gbMetal
+
 proc sessionTimingReset*(backend: GpuBackend) =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()

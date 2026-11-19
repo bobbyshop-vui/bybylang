@@ -1257,12 +1257,23 @@ var gVkSessionQueryPool: VkQueryPool
 var gVkSessionTimingActive = false
 var gVkStatsEnabled = false
 var gVkGpuSecondsTotal = 0.0
+## Set by autotuners: time every non-recorded session with device timestamps, so a candidate
+## kernel is judged by its GPU time instead of submit + fence latency.
+var gVkForceTimestamps = false
 var gVkEndCommandSeconds, gVkFenceCreateSeconds = 0.0
 var gVkQueueSubmitSeconds, gVkFenceWaitSeconds, gVkCleanupSeconds = 0.0
 var gVkSessionEnds, gVkQueueSubmits = 0
 var gVkDispatches, gVkBarriers, gVkCopies, gVkDescriptorSets = 0
 
 proc vulkanSessionGpuSeconds*(): float = gVkGpuSecondsTotal
+
+proc vulkanSessionSetTimestamps*(on: bool): bool =
+  ## Times every following non-recorded session with device timestamps (summed into
+  ## vulkanSessionGpuSeconds). Returns false when the queue has no usable timestamps.
+  gVkForceTimestamps = on
+  gQueueTimestampValidBits > 0 and
+    gDeviceCaps.properties.limits.timestampComputeAndGraphics != 0 and
+    gDeviceCaps.properties.limits.timestampPeriod > 0
 
 proc vulkanSessionTimingReset*() =
   gVkStatsEnabled = true
@@ -1646,7 +1657,7 @@ proc vulkanSessionBegin*(reusable = false): bool =
   gLastRecording = -1
   gVkSessionTimingActive = false
   # A replayed command buffer must not write to a query pool that sessionEnd destroys.
-  if not reusable and getEnv("BYBY_VULKAN_TIMESTAMPS", "0") == "1" and
+  if not reusable and (gVkForceTimestamps or getEnv("BYBY_VULKAN_TIMESTAMPS", "0") == "1") and
       gQueueTimestampValidBits > 0 and
       gDeviceCaps.properties.limits.timestampComputeAndGraphics != 0 and
       gDeviceCaps.properties.limits.timestampPeriod > 0:
