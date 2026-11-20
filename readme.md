@@ -1,6 +1,10 @@
 # BybyLang
 
-A Nim-based DSL, AOT-compiled to Nim source then built into a native binary. Its `gpu ...` commands generate tensor operations; `session:` batches supported operations; and `micro kernel` defines a native BybyLang VM kernel that is lowered to Metal or Vulkan GPU code. Generic control flow and hardware-simulation commands are also available.
+A Nim-based DSL that compiles to Nim source and then a native binary. Its
+`gpu ...` commands generate tensor operations and `session:` batches supported
+operations. The `micro kernel` block defines VM bytecode for Metal and Vulkan
+lowering or the CPU interpreter. The DSL also supports general control flow and
+hardware-simulation commands.
 
 ## Build & run
 
@@ -274,16 +278,74 @@ residentFreeQ4(q4) # call only when unloading the weights
 
 The old `cu*` resident-tensor names are compatibility stubs in this revision; they do not provide CUDA/cuBLAS execution. Use the common Session API above. The legacy backend string `cuda` resolves to Vulkan.
 
+### Command replay
+
+Use `sessionCanRecord(backend)` before choosing the replay path. Allocate all
+persistent inputs, outputs and scratch first. Call `sessionBeginRecording`,
+encode the fixed-shape step and verify `sessionEnd`. `sessionLastRecording`
+returns a recording ID or `-1` if the runtime could not retain the commands.
+Staging uploads, deferred frees and internal scratch can prevent retention.
+
+Bindings and launch sizes remain fixed. Change inputs with `sessionHostWrite`
+on mapped buffers allocated by `sessionHostBuffer`. Encode a copy to the
+mapped output and call `sessionHostReadBarrier` in the recorded step if the
+host reads results. `sessionReplay` submits and waits outside an active
+session. Call `sessionFreeRecording` before freeing the referenced buffers.
+The lifecycle and expected results are exercised by the Metal replay test.
+[Replay test](tests/t_metal_session_replay.nim)
+
+Vulkan replay reuses a command buffer with its descriptor pools. Metal can
+use an indirect command buffer or a plain encoder. `sessionRecordingNote`
+reports the Metal path or why the recording was refused, and
+`BYBY_METAL_REPLAY_ICB=0` selects the plain path.
+
+### Tile GEMM and SSD prefill
+
+- `sessionFp4GemmTensorCore`, `sessionFp4GemmTiledEnc`, and
+  `sessionFp4GemmMetal` compute `C[M, N] = A[M, K] @ W[N, K].T` from FP4-KM
+  weights. The packed weight slot holds nibble bytes followed by one scale
+  byte per 32 weights. The LUT slot holds 16 FP4 values and 256 scale values as
+  `float32`. The first Vulkan encoder requests cooperative matrices, the
+  second uses register tiles. Metal uses register tiles or Apple
+  `simdgroup_matrix`, with a caller-allocated output handle.
+- `sessionF16GemmTile` uses IEEE FP16 weights in `[N, K]` order on Vulkan.
+  Select cooperative matrices with `tensorCore = true` or register tiles with
+  `false`. FP16 and FP4-KM need whole K slices. Vulkan cooperative tiles need
+  `K` divisible by 64 and `N >= 16`. Register tiles need `K` divisible by 32.
+- `sessionTileGemmReady(backend, f16, tensorCore)` checks a Vulkan tile path
+  before selecting it. The first call for a path opens a small parity-check
+  session of its own. A GEMM encoder returning `false` lets the caller choose
+  a fallback.
+- `sessionMamba2SsdPrepare(backend, N, D, Q)` picks and checks a Vulkan kernel
+  for the state size, head dimension and chunk length. Call it outside an
+  active session. It returns `"coop"`, `"scalar"`, or `""` when unavailable.
+  `sessionMamba2SsdPrefillEnc` applies the chunked pass with state carry in a
+  caller-supplied `float32` arena.
+- `sessionCompileSeconds()` accumulates shader and pipeline creation time on
+  cache misses. Sample it before and after a phase to measure JIT setup.
+
+`buildFp4TileGemmProgram` and `buildF16TileGemmProgram` produce tile VM
+programs. The cooperative Vulkan lowering fetches the next K slice into
+registers while the current slice is processed. The tests compare tile
+results against host references and compile unused GPU routes where tools are
+available. [Tile lowering](micro_kernel/tile_gemm.nim) ·
+[Tile regression test](tests/t_fp4_tile_gemm.nim)
+
 ## 5. Native BybyLang micro-kernels
 
-Write a `micro kernel` block directly in `.bybylang`; no Nim helper module or external micro-kernel import is required. The compiler builds a `VmProgram`, lowers it to Metal or Vulkan code, dispatches it in a GPU session, and reads back the output:
+The `.bybylang` compiler builds a `VmProgram` from the `micro kernel` block.
+The CPU VM interprets it, while GPU execution lowers it to Metal or Vulkan
+and reads the output after dispatch.
 
-```text
-gpu backend is "vulkan"
+```bybylang
+gpu backend is "cpu"
 gpu array INPUT = [1, 2, 3, 4, 5, 6, 7, 8]
 
 micro kernel scale INPUT -> OUTPUT threads 8 tg 4 out 8:
-  emitULid 0
+  emitUTgid 0
+  emitUMulK 0 0 4
+  emitULid 1
+  emitUAdd 0 0 1
   emitULoadIn 1 0 0
   emitLoadConstF32 2 2.0'f32
   emitMul 1 1 2
@@ -295,7 +357,13 @@ print OUTPUT
 
 The VM instruction API is exported by `vendor/bybylang/micro_kernel` and re-exported by `vendor/bybylang/bybylang`: create a `VmProgram` and append instructions with `emit*` procedures. Instructions include float/integer loads and stores, arithmetic, FMA, loops and conditionals, thread/threadgroup IDs, threadgroup memory and barriers, atomics, and virtual-threadgroup helpers. Integer registers are 32-bit; float registers are `float32`. Each instruction takes register indices and offsets as documented at its declaration in `micro_kernel/session_vm.nim`.
 
-The DSL header is `micro kernel NAME INPUT -> OUTPUT threads N tg N out N:` and its indented body accepts `emit...` instruction calls. `threads` is the dispatch thread count, `tg` the threadgroup size, and `out` the output element count. Choose counts and guard memory accesses so every dispatched thread stays in bounds. This path currently requires Metal or Vulkan; it raises for CPU/unsupported backends. For more complex kernels, import `vendor/bybylang/bybylang`, create the `VmProgram` in Nim, and call `executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)` directly.
+The header sets total dispatch threads, threads per group and output elements.
+The example uses `group_id * 4 + local_id` to cover both groups and prints
+`@[2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]`. For a custom dispatch,
+choose counts or guard accesses so each thread stays in bounds. Nim callers
+can build the `VmProgram` and call
+`executeMicroKernel(backend, kernelName, program, input, outputElems, threads, tgSize)`
+directly.
 
 ### Control flow and scopes
 
@@ -343,6 +411,20 @@ Nested scopes run on Metal, Vulkan and the CPU backend.
 ### CPU backend
 
 The CPU VM keeps byte (`u8`), look-up table, input and float memory in separate arrays (`nimf_cpu_vm_run_slots`), so a program sees the same slot layout as on the GPU. `nimf_cpu_vm_run` is kept and treats one float arena as every slot. An out-of-range index reports an error instead of reading another slot.
+
+### Core recording for FIR
+
+Run with `BYBY_FIR_PROBE=run.fprobe` to record backend calls, buffer metadata
+and registered VM words. Programs already registered by the compiler remain
+available when recording starts. `BYBY_FIR_PROBE_STEPS=decode:2,prefill:1`
+limits explicitly marked steps. `BYBY_FIR_PROBE_DATA=1` opts in to exact upload
+bytes for general file recordings. Drivers may otherwise record short values
+and fingerprints. `firProbeStart` and `firProbeStop` control the recorder from Nim.
+
+A parent process can provide `BYBY_FIR_PROBE=fd:T[,D]`, passing inherited file
+descriptors for trace records and optional upload data. The recorder sends the
+trace when it stops. A trace descriptor alone supports fingerprints without
+an upload payload stream. [Recorder implementation](probe.nim)
 
 ---
 
