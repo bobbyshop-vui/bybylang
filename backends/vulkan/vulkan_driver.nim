@@ -12,6 +12,21 @@ import ../../probe
 import ../../micro_kernel/[session_vm, tile_gemm]
 export vulkan_caps.VulkanCaps
 
+var gAtomicCacheTempSequence: uint64
+
+proc atomicWriteVulkanCache(path, contents: string) =
+  ## Publish shared process-level cache files with a same-directory rename.
+  ## Readers therefore see either the old complete file or the new complete file.
+  inc gAtomicCacheTempSequence
+  let tempPath = path & "." & $getCurrentProcessId() & "." &
+    $gAtomicCacheTempSequence & ".tmp"
+  defer:
+    if fileExists(tempPath):
+      try: removeFile(tempPath)
+      except CatchableError: discard
+  writeFile(tempPath, contents)
+  moveFile(tempPath, path)
+
 type
   VkInstance* = pointer
   VkPhysicalDevice* = pointer
@@ -608,7 +623,10 @@ proc ensureInit() =
   var selected = -1
   let requested = getEnv("BYBY_VULKAN_DEVICE")
   if requested.len > 0:
-    selected = parseInt(requested)
+    try:
+      selected = parseInt(requested)
+    except ValueError:
+      gpuCheck(false, "BYBY_VULKAN_DEVICE must be a non-negative device ordinal")
     gpuCheck(selected >= 0 and selected < devices.len, "BYBY_VULKAN_DEVICE index out of range")
   var bestScore = -1
   for i, physical in devices:
@@ -1196,7 +1214,7 @@ proc vkSavePipelineCache() {.noconv.} =
     return
   data.setLen(int(size))
   try:
-    writeFile(gVkPipelineCachePath, data)
+    atomicWriteVulkanCache(gVkPipelineCachePath, data)
   except CatchableError:
     discard
 
@@ -2190,6 +2208,7 @@ proc vulkanSessionMicroVmEnc*(code: VulkanBufferHandle, mem: VulkanBufferHandle,
 
 var gJitSpvPaths = initTable[string, tuple[source, path: string]]()
 var gJitPathHits, gJitPathMisses, gJitDummyAllocations: int
+var gJitTempSequence: uint64
 
 proc vulkanJitCacheStats*(): tuple[pathHits, pathMisses, dummyAllocations: int] =
   (gJitPathHits, gJitPathMisses, gJitDummyAllocations)
@@ -2210,6 +2229,17 @@ proc vulkanJitShaderPaths(kernelName, source: string): tuple[srcPath, spvPath: s
   let stem = kernelName & "_" & sourceKey
   (dir / (stem & ".comp"), dir / (stem & ".spv"))
 
+proc vulkanJitTempPaths(spvPath: string): tuple[srcPath, spvPath: string] =
+  inc gJitTempSequence
+  let unique = "." & $getCurrentProcessId() & "." & $gJitTempSequence & ".tmp"
+  (spvPath & unique & ".comp", spvPath & unique & ".spv")
+
+proc cleanupVulkanJitTemps(paths: tuple[srcPath, spvPath: string]) =
+  for path in [paths.srcPath, paths.spvPath]:
+    if fileExists(path):
+      try: removeFile(path)
+      except CatchableError: discard
+
 proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
   ## Compile every shader the next phase needs concurrently. Each glslc call is
   ## a separate process, so N shaders cost about one compile instead of the
@@ -2225,24 +2255,33 @@ proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
     raise newException(CatchableError,
       "Vulkan JIT needs glslc on PATH (install shaderc/Vulkan SDK)")
   let budget = max(2, min(8, countProcessors()))
-  type PendingJob = tuple[name, source, srcPath, spvPath: string, running: Process]
+  type PendingJob = tuple[name, source, tempSrcPath, tempSpvPath, spvPath: string, running: Process]
   var pending: seq[PendingJob]
   proc drain() =
     for job in pending.mitems:
       let code = job.running.waitForExit()
       job.running.close()
       if code == 0:
-        gJitSpvPaths[job.name] = (job.source, job.spvPath)
+        try:
+          if fileExists(job.tempSpvPath): moveFile(job.tempSpvPath, job.spvPath)
+          if fileExists(job.spvPath):
+            gJitSpvPaths[job.name] = (job.source, job.spvPath)
+          elif getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
+            stderr.writeLine "[vulkan_jit] prewarm produced no SPIR-V kernel=" & job.name
+        except CatchableError as e:
+          if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
+            stderr.writeLine "[vulkan_jit] prewarm publish failed kernel=" & job.name & " error=" & e.msg
       elif getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
         stderr.writeLine "[vulkan_jit] prewarm failed kernel=" & job.name &
           " exit=" & $code & " (retried on first dispatch)"
+      cleanupVulkanJitTemps((job.tempSrcPath, job.tempSpvPath))
     pending.setLen(0)
   var spawned = 0
   # Callers list a shader once per layer; two glslc processes must never write one file.
   var queued = initHashSet[string]()
   for job in jobs:
     if job.name.len == 0 or job.source.len == 0: continue
-    let (srcPath, spvPath) = vulkanJitShaderPaths(job.name, job.source)
+    let (_, spvPath) = vulkanJitShaderPaths(job.name, job.source)
     if spvPath in queued: continue
     queued.incl spvPath
     if fileExists(spvPath):
@@ -2250,22 +2289,24 @@ proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
       continue
     if job.name in gJitSpvPaths and gJitSpvPaths[job.name].source == job.source:
       continue
-    writeFile(srcPath, job.source)
+    let (tempSrcPath, tempSpvPath) = vulkanJitTempPaths(spvPath)
     var args = @["-fshader-stage=compute"]
     # Same targets as compileVulkanJitShader: subgroup builtins need SPIR-V 1.3.
     if job.source.contains("GL_KHR_cooperative_matrix"):
       args.add "--target-env=vulkan1.3"
     elif job.source.contains("GL_KHR_shader_subgroup"):
       args.add "--target-env=vulkan1.1"
-    args.add srcPath
+    args.add tempSrcPath
     args.add "-o"
-    args.add spvPath
+    args.add tempSpvPath
     try:
+      writeFile(tempSrcPath, job.source)
       # poParentStreams keeps the child off our pipes: a failed compile can
       # print freely without blocking a background prewarm.
-      pending.add((job.name, job.source, srcPath, spvPath,
+      pending.add((job.name, job.source, tempSrcPath, tempSpvPath, spvPath,
         startProcess(compiler, args = args, options = {poUsePath, poParentStreams})))
-    except OSError:
+    except CatchableError:
+      cleanupVulkanJitTemps((tempSrcPath, tempSpvPath))
       continue
     inc spawned
     if pending.len >= budget: drain()
@@ -2290,7 +2331,7 @@ proc compileVulkanJitShader(kernelName, source: string): string =
   if compiler.len == 0:
     raise newException(CatchableError,
       "Vulkan JIT needs glslc on PATH (install shaderc/Vulkan SDK)")
-  let (srcPath, spvPath) = vulkanJitShaderPaths(kernelName, source)
+  let (_, spvPath) = vulkanJitShaderPaths(kernelName, source)
   if fileExists(spvPath):
     # cache hit - silent
     discard
@@ -2298,7 +2339,9 @@ proc compileVulkanJitShader(kernelName, source: string): string =
     if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") != "0":
       stderr.writeLine "[vulkan_jit] compile kernel=" & kernelName &
         " srcBytes=" & $source.len & " -> " & spvPath
-    writeFile(srcPath, source)
+    let (tempSrcPath, tempSpvPath) = vulkanJitTempPaths(spvPath)
+    defer: cleanupVulkanJitTemps((tempSrcPath, tempSpvPath))
+    writeFile(tempSrcPath, source)
     if getEnv("BYBY_JIT_DUMP_SOURCE", "0") == "1":
       stderr.writeLine "════ [vulkan_jit] GLSL source kernel=" & kernelName & " ════"
       stderr.writeLine source
@@ -2307,13 +2350,16 @@ proc compileVulkanJitShader(kernelName, source: string): string =
                  elif source.contains("GL_KHR_shader_subgroup"): " --target-env=vulkan1.1"
                  else: ""
     let cmd = quoteShell(compiler) & target & " -fshader-stage=compute " &
-      quoteShell(srcPath) & " -o " & quoteShell(spvPath)
+      quoteShell(tempSrcPath) & " -o " & quoteShell(tempSpvPath)
     let compiled = execCmdEx(cmd)
     if compiled.exitCode != 0:
       stderr.writeLine "[vulkan_jit] FAIL kernel=" & kernelName &
         " glslc exit=" & $compiled.exitCode
       raise newException(CatchableError,
         "glslc Vulkan JIT compile failed for " & kernelName & ":\n" & compiled.output)
+    if not fileExists(tempSpvPath):
+      raise newException(CatchableError, "glslc Vulkan JIT produced no SPIR-V for " & kernelName)
+    moveFile(tempSpvPath, spvPath)
     # first compile only - silent on cache hits
   result = spvPath
   if useCache: gJitSpvPaths[kernelName] = (source, spvPath)
