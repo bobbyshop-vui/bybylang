@@ -5,6 +5,7 @@
 #import "metal_shim.h"
 #include <stdint.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <unistd.h>
 #include <sys/sysctl.h>
 #include <math.h>
@@ -85,6 +86,21 @@ double metal_compile_seconds(void) { return gMetalCompileSeconds; }
 // iOS) lists every GPU so we choose/try them instead of trusting one default.
 static id<MTLDevice> pickMetalDeviceUncached(void) {
     NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
+    const char *requested = getenv("BYBY_METAL_DEVICE");
+    if (requested && requested[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        long ordinal = strtol(requested, &end, 10);
+        if (errno != 0 || end == requested || *end != '\0' || ordinal < 0 ||
+            (unsigned long)ordinal >= (unsigned long)all.count) {
+            NSLog(@"[metal] BYBY_METAL_DEVICE must be a valid device ordinal in [0, %lu)",
+                  (unsigned long)all.count);
+            return nil;
+        }
+        id<MTLDevice> selected = all[(NSUInteger)ordinal];
+        NSLog(@"[metal] BYBY_METAL_DEVICE=%ld selected %@", ordinal, selected.name);
+        return selected;
+    }
     if (all.count == 0) {
         NSLog(@"[metal] MTLCopyAllDevices() rong, thu MTLCreateSystemDefaultDevice()");
         return MTLCreateSystemDefaultDevice();

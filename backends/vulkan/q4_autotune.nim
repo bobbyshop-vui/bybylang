@@ -82,7 +82,7 @@ proc q4SaveTuneCache(key: string, plan: VkQ4Plan) =
     plans[cacheKey] = cachedPlan
   root["plans"] = plans
   try:
-    writeFile(q4TuneCachePath(), $root)
+    atomicWriteVulkanCache(q4TuneCachePath(), $root)
   except CatchableError:
     discard
 
