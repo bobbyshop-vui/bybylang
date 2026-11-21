@@ -332,7 +332,7 @@ const Q4FusedOutRows = 4
 proc vulkanSessionMatmulQ4FusedEnc*(mode: int; a: VulkanBufferHandle;
     wq, scales, zeros, outputs: openArray[VulkanBufferHandle]; residual, gamma: VulkanBufferHandle;
     K, groupSize, groupsPerRow: int; Ns, offsets: openArray[int]; eps: float32;
-    hasNorm, hasRes: bool): bool =
+    hasNorm, hasRes: bool): bool  {.apiHooked.}=
   ## Fused M=1 Q4 path matching Metal's shared-input Q/K/V and gate/up kernels.
   ## MODE 0 writes up to three projection vectors; MODE 1 writes silu(gate)*up.
   if not gSessionActive or a.buf == nil or K <= 0 or K mod 8 != 0 or
@@ -385,7 +385,7 @@ proc vulkanSessionMatmulQ4FusedEnc*(mode: int; a: VulkanBufferHandle;
     uint32((totalN + Q4FusedOutRows - 1) div Q4FusedOutRows), 1, 1, 128, spv)
 
 proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
-                           K, N, group, groups, mode: int; wqOffset = 0): bool =
+                           K, N, group, groups, mode: int; wqOffset = 0): bool  {.apiHooked.}=
   ensureInit()
   if gSessionActive or getEnv("BYBY_Q4_TUNED", "1") == "0" or
      getEnv("BYBY_GPU_AUTOTUNE", "1") == "0" or findExe("glslc").len == 0: return false
@@ -542,12 +542,12 @@ proc vulkanPrepareQ4Tuned*(w, scales, zeros: VulkanBufferHandle;
     formatFloat(float((getMonoTime() - tuneStart).inNanoseconds) / 1e9, ffDecimal, 3) & "s)"
   true
 
-proc vulkanQ4TuningStats*(): tuple[preparedPlans, wideDispatches: int] =
+proc vulkanQ4TuningStats*(): tuple[preparedPlans, wideDispatches: int]  {.apiHooked.}=
   (gVkQ4Plans.len, gVkQ4WideDispatches)
 
 proc vulkanSessionMatmulQ4Enc*(a: VulkanBufferHandle, wq, scales, zeros: VulkanBufferHandle,
                                 c: var VulkanBufferHandle, M, K, N, groupSize, nGroupsPerRow: int;
-                                wqOffset = 0): bool =
+                                wqOffset = 0): bool  {.apiHooked.}=
   ## wqOffset: byte position of the packed weights inside wq.
   if getEnv("BYBY_Q4_TUNED", "1") != "0":
     let key = q4Key(K, N, groupSize, nGroupsPerRow, M)

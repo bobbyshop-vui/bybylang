@@ -10,7 +10,7 @@
 ## Enabled with BYBY_FIR_PROBE=<path>; step selection with
 ## BYBY_FIR_PROBE_STEPS=decode:N,prefill:M. When disabled every hook is one
 ## predictable boolean test.
-import std/[os, strutils, tables, json, macros, exitprocs, locks]
+import std/[os, strutils, tables, json, macros, exitprocs, locks, algorithm, typetraits]
 import ./probe_data
 
 const
@@ -20,6 +20,385 @@ const
 const probeSmallLimit* = 64
 
 var firProbeOn* = false
+
+type
+  BybyApiHookPhase* = enum
+    bybyApiBefore, bybyApiAfter
+
+  BybyApiHook* = proc(api: string; phase: BybyApiHookPhase;
+      metadata: string) {.closure.}
+  BybyApiHookId* = int
+  BybyApiArg* = object
+    name*: string
+    typeName*: string
+    address*: pointer
+  BybyApiCall* = object
+    args*: seq[BybyApiArg]
+    output*: BybyApiArg
+  BybyApiValueHook* = proc(api: string; phase: BybyApiHookPhase;
+      call: var BybyApiCall) {.closure.}
+  BybyApiValueHookId* = int
+
+  BybyApiHookRegistration = object
+    id: BybyApiHookId
+    selector: string
+    callback: BybyApiHook
+  BybyApiValueHookRegistration = object
+    id: BybyApiValueHookId
+    selector: string
+    callback: BybyApiValueHook
+
+var gBybyApiHooks: seq[BybyApiHookRegistration]
+var gNextBybyApiHookId = 1
+var gBybyApiValueHooks: seq[BybyApiValueHookRegistration]
+var gNextBybyApiValueHookId = 1
+
+proc bybyApiHooksActive*(): bool {.inline.} =
+  gBybyApiHooks.len > 0
+
+proc registerBybyApiHook*(selector: string;
+    callback: BybyApiHook): BybyApiHookId =
+  ## Observe calls to instrumented BybyLang session APIs. Use an exact proc
+  ## name (for example "sessionMatmul") or "*" for every instrumented API.
+  let normalized = selector.strip().toLowerAscii()
+  if normalized.len == 0:
+    raise newException(ValueError, "BybyLang API hook selector must not be empty")
+  if callback == nil:
+    raise newException(ValueError, "BybyLang API hook callback must not be nil")
+  result = gNextBybyApiHookId
+  inc gNextBybyApiHookId
+  gBybyApiHooks.add(BybyApiHookRegistration(id: result,
+    selector: normalized, callback: callback))
+
+proc removeBybyApiHook*(id: BybyApiHookId): bool =
+  for i in 0 ..< gBybyApiHooks.len:
+    if gBybyApiHooks[i].id == id:
+      gBybyApiHooks.delete(i)
+      return true
+
+proc clearBybyApiHooks*(selector = "") =
+  if selector.len == 0:
+    gBybyApiHooks.setLen(0)
+    return
+  let normalized = selector.strip().toLowerAscii()
+  var retained: seq[BybyApiHookRegistration]
+  for registration in gBybyApiHooks:
+    if registration.selector != normalized:
+      retained.add(registration)
+  gBybyApiHooks = retained
+
+proc runBybyApiHooks*(api: string; phase: BybyApiHookPhase;
+    metadata: string) =
+  let normalized = api.toLowerAscii()
+  for registration in gBybyApiHooks:
+    if registration.selector == "*" or registration.selector == normalized:
+      registration.callback(api, phase, metadata)
+
+proc bybyApiValueHooksActive*(): bool {.inline.} =
+  gBybyApiValueHooks.len > 0
+
+proc registerBybyApiValueHook*(selector: string;
+    callback: BybyApiValueHook): BybyApiValueHookId =
+  ## Register a typed hook that may replace arguments and returned values.
+  let normalized = selector.strip().toLowerAscii()
+  if normalized.len == 0:
+    raise newException(ValueError, "BybyLang API value hook selector must not be empty")
+  if callback == nil:
+    raise newException(ValueError, "BybyLang API value hook callback must not be nil")
+  result = gNextBybyApiValueHookId
+  inc gNextBybyApiValueHookId
+  gBybyApiValueHooks.add(BybyApiValueHookRegistration(id: result,
+    selector: normalized, callback: callback))
+
+proc removeBybyApiValueHook*(id: BybyApiValueHookId): bool =
+  for i in 0 ..< gBybyApiValueHooks.len:
+    if gBybyApiValueHooks[i].id == id:
+      gBybyApiValueHooks.delete(i)
+      return true
+
+proc clearBybyApiValueHooks*(selector = "") =
+  if selector.len == 0:
+    gBybyApiValueHooks.setLen(0)
+    return
+  let normalized = selector.strip().toLowerAscii()
+  var retained: seq[BybyApiValueHookRegistration]
+  for registration in gBybyApiValueHooks:
+    if registration.selector != normalized:
+      retained.add(registration)
+  gBybyApiValueHooks = retained
+
+proc runBybyApiValueHooks*(api: string; phase: BybyApiHookPhase;
+    call: var BybyApiCall) =
+  let normalized = api.toLowerAscii()
+  for registration in gBybyApiValueHooks:
+    if registration.selector == "*" or registration.selector == normalized:
+      registration.callback(api, phase, call)
+
+proc bybyHookTypeName*[T](value: T): string =
+  name(T)
+
+proc apiArg*[T](arg: var BybyApiArg): var T =
+  ## Return a checked mutable reference to one API argument or result.
+  if arg.address == nil:
+    raise newException(ValueError, "API hook value is unavailable for " & arg.name)
+  let expected = name(T)
+  if arg.typeName != expected:
+    raise newException(ValueError, "API hook type mismatch for " & arg.name &
+      ": requested " & expected & ", actual " & arg.typeName)
+  result = cast[ptr T](arg.address)[]
+
+proc bybyHookValue*[T](value: T): string =
+  ## Small, non-owning summary for API hooks. Never serializes tensor contents.
+  when T is string:
+    if value.len <= 128: value else: value[0 ..< 128] & "…"
+  elif T is SomeInteger or T is bool or T is enum:
+    $value
+  elif T is SomeFloat:
+    $value
+  elif compiles(value.len):
+    "(len=" & $value.len & ")"
+  else:
+    "opaque"
+
+proc bybyHookValue*[T](value: openArray[T]): string =
+  "(len=" & $value.len & ")"
+
+proc withoutApiHookPragma(definition: NimNode): NimNode {.compileTime.} =
+  result = definition.copyNimTree
+  if result.kind == nnkProcDef and result.len > 4 and result[4].kind == nnkPragma:
+    var retained = newNimNode(nnkPragma)
+    for pragma in result[4]:
+      if "apiHooked" notin pragma.repr:
+        retained.add(pragma.copyNimTree)
+    result[4] = retained
+
+proc withoutProbePragma(definition: NimNode): NimNode {.compileTime.} =
+  result = definition.copyNimTree
+  if result.kind == nnkProcDef and result.len > 4 and result[4].kind == nnkPragma:
+    var retained = newNimNode(nnkPragma)
+    for pragma in result[4]:
+      if "probed" notin pragma.repr:
+        retained.add(pragma.copyNimTree)
+    result[4] = retained
+
+proc withoutPrivateApiExportPragmas(definition: NimNode): NimNode {.compileTime.} =
+  result = withoutApiHookPragma(definition)
+  if result.kind == nnkProcDef and result.len > 4 and result[4].kind == nnkPragma:
+    var retained = newNimNode(nnkPragma)
+    for pragma in result[4]:
+      let marker = pragma.repr
+      if "exportc" notin marker and "exportcpp" notin marker and "dynlib" notin marker:
+        retained.add(pragma.copyNimTree)
+    result[4] = retained
+
+macro apiHooked*(fn: untyped): untyped =
+  ## Wrap a public API with observational hooks and typed argument/result hooks.
+  ## The unhooked path calls the private body directly with original arguments;
+  ## it does not allocate argument copies or build hook metadata.
+  let apiArgType = bindSym"BybyApiArg"
+  let apiCallType = bindSym"BybyApiCall"
+  let apiBeforePhase = bindSym"bybyApiBefore"
+  let apiAfterPhase = bindSym"bybyApiAfter"
+  let apiHooksActiveProc = bindSym"bybyApiHooksActive"
+  let apiValueHooksActiveProc = bindSym"bybyApiValueHooksActive"
+  let runApiHooksProc = bindSym"runBybyApiHooks"
+  let runApiValueHooksProc = bindSym"runBybyApiValueHooks"
+  let hookValueProc = bindSym"bybyHookValue"
+  let hookTypeNameProc = bindSym"bybyHookTypeName"
+  let body = fn.body
+  let apiLit = newLit($fn.name)
+  let hasResult = fn.params[0].kind notin {nnkEmpty, nnkVarTy}
+  let hasVarResult = fn.params[0].kind == nnkVarTy
+  var observerBefore = newLit("")
+  var observerAfter = newLit("")
+  var valueBefore = newLit("")
+  var valueAfter = newLit("")
+  var firstObserverArg = true
+  var firstObserverOut = true
+  var firstValueArg = true
+  var firstValueOut = true
+  var valueLocals = newStmtList()
+  var valueArguments = newTree(nnkBracket)
+  var callArguments: seq[NimNode]
+  var copyBack = newStmtList()
+
+  for paramIdx in 1 ..< fn.params.len:
+    let group = fn.params[paramIdx]
+    let typNode = group[^2]
+    let isVar = typNode.kind == nnkVarTy
+    let baseType = if isVar: typNode[0] else: typNode
+    let isOpenArray = baseType.repr.replace(" ", "").startsWith("openArray[")
+    for nameIdx in 0 ..< group.len - 2:
+      let original = group[nameIdx]
+      let nameS = $original
+      let local = genSym(nskVar, nameS & "HookValue")
+      var initialValue = original
+      if isOpenArray:
+        initialValue = newTree(nnkPrefix, ident"@", original)
+      valueLocals.add newTree(nnkVarSection,
+        newTree(nnkIdentDefs, local, newEmptyNode(), initialValue))
+      callArguments.add(local)
+      let apiArg = newTree(nnkObjConstr, apiArgType,
+        newTree(nnkExprColonExpr, ident"name", newLit(nameS)),
+        newTree(nnkExprColonExpr, ident"typeName",
+          newCall(hookTypeNameProc, local)),
+        newTree(nnkExprColonExpr, ident"address", newCall(ident"addr", local)))
+      valueArguments.add(apiArg)
+
+      let observerExpr = infix(newLit(nameS & "="), "&",
+        newCall(hookValueProc, original))
+      observerBefore = infix(observerBefore, "&",
+        infix(newLit(if firstObserverArg: "" else: ","), "&", observerExpr))
+      firstObserverArg = false
+      let valueExpr = infix(newLit(nameS & "="), "&",
+        newCall(hookValueProc, local))
+      valueBefore = infix(valueBefore, "&",
+        infix(newLit(if firstValueArg: "" else: ","), "&", valueExpr))
+      firstValueArg = false
+      if isVar:
+        observerAfter = infix(observerAfter, "&",
+          infix(newLit(if firstObserverOut: "" else: ","), "&", observerExpr))
+        firstObserverOut = false
+        valueAfter = infix(valueAfter, "&",
+          infix(newLit(if firstValueOut: "" else: ","), "&", valueExpr))
+        firstValueOut = false
+        if isOpenArray:
+          let index = genSym(nskForVar, "hookCopyBackIndex")
+          let paramName = newLit(nameS)
+          copyBack.add quote do:
+            if `local`.len != `original`.len:
+              raise newException(ValueError,
+                "API hooks must preserve openArray length for " & `paramName`)
+            for `index` in 0 ..< `original`.len:
+              `original`[`index`] = `local`[`index`]
+        else:
+          copyBack.add newAssignment(original, local)
+
+  if hasResult and not hasVarResult:
+    let resultIdent = ident"result"
+    let resultExpr = infix(newLit("result="), "&",
+      newCall(hookValueProc, resultIdent))
+    observerAfter = infix(observerAfter, "&",
+      infix(newLit(if firstObserverOut: "" else: ","), "&", resultExpr))
+    valueAfter = infix(valueAfter, "&",
+      infix(newLit(if firstValueOut: "" else: ","), "&", resultExpr))
+    let outputArg = newTree(nnkObjConstr, apiArgType,
+      newTree(nnkExprColonExpr, ident"name", newLit("result")),
+      newTree(nnkExprColonExpr, ident"typeName",
+        newCall(hookTypeNameProc, resultIdent)),
+      newTree(nnkExprColonExpr, ident"address", newCall(ident"addr", resultIdent)))
+    discard outputArg
+
+  let beforeCall = genSym(nskLet, "bybyApiBeforeMetadata")
+  let afterCall = genSym(nskLet, "bybyApiAfterMetadata")
+
+  # A proc returning `var T` cannot be wrapped around copied arguments without
+  # changing the alias it returns. Keep its original body and observer hooks.
+  if hasVarResult:
+    result = withoutApiHookPragma(fn)
+    result.body = quote do:
+      if unlikely(`apiHooksActiveProc`()):
+        let `beforeCall` = `observerBefore`
+        `runApiHooksProc`(`apiLit`, `apiBeforePhase`, `beforeCall`)
+        try:
+          `body`
+        finally:
+          let `afterCall` = `observerAfter`
+          `runApiHooksProc`(`apiLit`, `apiAfterPhase`, `afterCall`)
+      else:
+        `body`
+    return
+
+  let implName = genSym(nskProc, "apiHookImpl")
+  var implementation = withoutPrivateApiExportPragmas(fn)
+  implementation[0] = implName
+  var wrapper = withoutApiHookPragma(fn)
+  var implCallee: NimNode = implName
+  if fn[2].kind == nnkGenericParams and fn[2].len > 0:
+    implCallee = newNimNode(nnkBracketExpr)
+    implCallee.add(implName)
+    for genericParam in fn[2]:
+      if genericParam.kind == nnkIdentDefs:
+        for nameIdx in 0 ..< genericParam.len - 2:
+          implCallee.add(genericParam[nameIdx])
+      else:
+        implCallee.add(genericParam)
+  let implCall = newCall(implCallee, callArguments)
+  let hookArgsSeq = newTree(nnkPrefix, ident"@", valueArguments)
+  let outputValue = newCall(apiArgType)
+  let outputValueAfter = if hasResult:
+      newTree(nnkObjConstr, apiArgType,
+        newTree(nnkExprColonExpr, ident"name", newLit("result")),
+        newTree(nnkExprColonExpr, ident"typeName",
+          newCall(hookTypeNameProc, ident"result")),
+        newTree(nnkExprColonExpr, ident"address", newCall(ident"addr", ident"result")))
+    else:
+      newCall(apiArgType)
+  let callVar = genSym(nskVar, "bybyApiCall")
+  var hookedCall = newStmtList()
+  if hasResult:
+    hookedCall.add newAssignment(ident"result", implCall)
+    hookedCall.add newAssignment(newDotExpr(callVar, ident"output"), outputValueAfter)
+  else:
+    hookedCall.add implCall
+  var observedCall = newStmtList()
+  var observerCallArgs = newTree(nnkArgList)
+  for paramIdx in 1 ..< fn.params.len:
+    let group = fn.params[paramIdx]
+    for nameIdx in 0 ..< group.len - 2:
+      observerCallArgs.add(group[nameIdx])
+  if hasResult:
+    var observerImplCall = newNimNode(nnkCall)
+    observerImplCall.add(implCallee.copyNimTree)
+    for arg in observerCallArgs:
+      observerImplCall.add(arg)
+    observedCall.add newAssignment(ident"result", observerImplCall)
+  else:
+    var observerImplCall = newNimNode(nnkCall)
+    observerImplCall.add(implCallee.copyNimTree)
+    for arg in observerCallArgs:
+      observerImplCall.add(arg)
+    observedCall.add observerImplCall
+
+  var fastImplCall = newNimNode(nnkCall)
+  fastImplCall.add(implCallee.copyNimTree)
+  for arg in observerCallArgs:
+    fastImplCall.add(arg)
+  let fastPath = if hasResult:
+      newAssignment(ident"result", fastImplCall)
+    else:
+      fastImplCall
+
+  wrapper.body = quote do:
+    if unlikely(`apiValueHooksActiveProc`()):
+      `valueLocals`
+      var `callVar` = `apiCallType`(args: `hookArgsSeq`, output: `outputValue`)
+      let `beforeCall` = `valueBefore`
+      if unlikely(`apiHooksActiveProc`()):
+        `runApiHooksProc`(`apiLit`, `apiBeforePhase`, `beforeCall`)
+      `runApiValueHooksProc`(`apiLit`, `apiBeforePhase`, `callVar`)
+      try:
+        `hookedCall`
+      finally:
+        try:
+          `runApiValueHooksProc`(`apiLit`, `apiAfterPhase`, `callVar`)
+          if unlikely(`apiHooksActiveProc`()):
+            let `afterCall` = `valueAfter`
+            `runApiHooksProc`(`apiLit`, `apiAfterPhase`, `afterCall`)
+        finally:
+          `copyBack`
+    elif unlikely(`apiHooksActiveProc`()):
+      let `beforeCall` = `observerBefore`
+      `runApiHooksProc`(`apiLit`, `apiBeforePhase`, `beforeCall`)
+      try:
+        `observedCall`
+      finally:
+        let `afterCall` = `observerAfter`
+        `runApiHooksProc`(`apiLit`, `apiAfterPhase`, `afterCall`)
+    else:
+      `fastPath`
+
+  result = newStmtList(implementation, wrapper)
 
 type
   BufferRecord = object
@@ -735,7 +1114,7 @@ macro probed*(fn: untyped): untyped =
     var arenaExpr: NimNode = newLit("")
     if apiName in ["sessionMicroVmEnc", "sessionJitMicroVmEnc"]:
       arenaExpr = newCall(ident"probeBufferRef", ident"mem")
-    result.body = quote do:
+    var probedBody = quote do:
       if unlikely(firProbeOn):
         `before`
         let `ctx` = probeOpStart(`apiLit`, `tagCall`, `insStr`, `attrsStr`, `implStr`, `progStr`)
@@ -748,6 +1127,9 @@ macro probed*(fn: untyped): untyped =
           probeCpuRestore(`prevArena`)
       else:
         `body`
+    var hookableFn = withoutProbePragma(fn)
+    hookableFn.body = probedBody
+    result = newCall(ident"apiHooked", hookableFn)
   else:
     let ctx = genSym(nskLet, "probeCall")
     let prevArena = genSym(nskLet, "probeArena")
@@ -800,7 +1182,7 @@ macro probed*(fn: untyped): untyped =
         probeTransfer("read", " src=" & probeBufferRef(`h`) & "@0:" & $(`n`*4) & " bytes=" & $(`n`*4))
     if apiName in ["sessionEnd", "sessionCommitContinue"]:
       post.add quote do: probeEvent("barrier kind=host_wait op=" & (if currentOp < 0: "none" else: "o" & $currentOp))
-    result.body = quote do:
+    var probedBody = quote do:
       if unlikely(firProbeOn):
         `before`
         let `ctx` = probeOpStart(`apiLit`, probeTagFor(`apiLit`), `insStr`, `attrsStr`, `implStr`, `progStr`)
@@ -814,6 +1196,9 @@ macro probed*(fn: untyped): untyped =
           probeCpuRestore(`prevArena`)
       else:
         `body`
+    var hookableFn = withoutProbePragma(fn)
+    hookableFn.body = probedBody
+    result = newCall(ident"apiHooked", hookableFn)
 
 proc probeIsHandleResult*(s: string): bool = s.startsWith("b")
 

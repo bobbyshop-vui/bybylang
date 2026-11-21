@@ -2,6 +2,7 @@
 ## Each child receives its selected backend and device ordinal before it starts.
 
 import std/[os, osproc, strtabs, strutils, times, tables, math, sequtils, streams]
+import ./probe
 when defined(posix):
   import std/posix
 
@@ -36,7 +37,7 @@ type
 
 proc normalizedRatios(group: ProcessGroup; requested: openArray[float64]): seq[float64]
 
-proc initProcessGroup*(devices: openArray[string]; ratios: openArray[float64] = []): ProcessGroup =
+proc initProcessGroup*(devices: openArray[string]; ratios: openArray[float64] = []): ProcessGroup {.apiHooked.} =
   if devices.len == 0:
     raise newException(ValueError, "A process group requires at least one device")
   if ratios.len > 0 and ratios.len != devices.len:
@@ -105,7 +106,7 @@ proc weights(group: ProcessGroup; workload: string; requested: openArray[float64
     return group.initialRatios
   result = initialRates(group)
 
-proc partition*(group: ProcessGroup; length: int; ratios: openArray[float64] = []): seq[int] =
+proc partition*(group: ProcessGroup; length: int; ratios: openArray[float64] = []): seq[int] {.apiHooked.} =
   if group.isNil or group.devices.len == 0:
     raise newException(ValueError, "Process group has no devices")
   if length < 0:
@@ -301,7 +302,7 @@ proc runAssigned(group: ProcessGroup; commands: openArray[ParallelCommand]; coun
       raise
 
 proc runCommands*(group: ProcessGroup; commands: openArray[ParallelCommand];
-                  ratios: openArray[float64] = []; workload = "commands"): seq[ParallelResult] =
+                  ratios: openArray[float64] = []; workload = "commands"): seq[ParallelResult] {.apiHooked.} =
   if group.isNil or group.devices.len == 0:
     raise newException(ValueError, "Process group has no devices")
   if ratios.len > 0: discard normalizedRatios(group, ratios)
@@ -326,7 +327,7 @@ proc runCommands*(group: ProcessGroup; commands: openArray[ParallelCommand];
 
 proc runShards*(group: ProcessGroup; length: int;
                 build: proc(device: ParallelDevice; offset, count: int): ParallelCommand {.closure.};
-                ratios: openArray[float64] = []; workload = "shards"): seq[ParallelResult] =
+                ratios: openArray[float64] = []; workload = "shards"): seq[ParallelResult] {.apiHooked.} =
   if group.isNil or group.devices.len == 0:
     raise newException(ValueError, "Process group has no devices")
   if ratios.len > 0: discard normalizedRatios(group, ratios)

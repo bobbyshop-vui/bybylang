@@ -13,6 +13,7 @@
 ##   CXX=...               compiler (default c++)
 
 import std/[os, osproc, strutils, tables, dynlib]
+import ../../probe
 import ../../micro_kernel/session_vm
 import ../../micro_kernel/jit_vm
 
@@ -34,7 +35,7 @@ template <typename T, typename S> static inline T as_type(S s) { T t; memcpy(&t,
 static inline float rsqrt(float x) { return 1.0f / sqrtf(x); }
 """
 
-proc cpuJitEnabled*(): bool =
+proc cpuJitEnabled*(): bool  {.apiHooked.}=
   getEnv("BYBY_CPU_JIT", "1") != "0"
 
 proc fnv64(text: string): uint64 =
@@ -42,13 +43,13 @@ proc fnv64(text: string): uint64 =
   for ch in text:
     result = (result xor uint64(ord(ch))) * 1099511628211'u64
 
-proc cpuJitFunctionName*(p: VmProgram): string =
+proc cpuJitFunctionName*(p: VmProgram): string  {.apiHooked.}=
   var text = newStringOfCap(p.words.len*9)
   for w in p.words:
     text.add toHex(cast[int64](w), 8)
   "fjit_" & toHex(cast[int64](fnv64(text)), 16)
 
-proc cpuJitSource*(p: VmProgram; fnName: string): string =
+proc cpuJitSource*(p: VmProgram; fnName: string): string  {.apiHooked.}=
   ## C++ source of one kernel, or "" when the interpreter must run it.
   let metal = lowerBytecodeToMetal(p, fnName)
   let head = "[[threadgroup_position_in_grid]])\n{\n"
@@ -71,7 +72,7 @@ proc cacheDir(): string =
 
 var cpuJitLastError* = ""
 
-proc cpuJitBuild*(units: seq[CpuJitUnit]): Table[string, pointer] =
+proc cpuJitBuild*(units: seq[CpuJitUnit]): Table[string, pointer]  {.apiHooked.}=
   ## Compile (or reuse from the cache) one library holding all `units`; map function name -> address.
   result = initTable[string, pointer]()
   if units.len == 0 or not cpuJitEnabled():
@@ -108,7 +109,7 @@ proc cpuJitBuild*(units: seq[CpuJitUnit]): Table[string, pointer] =
 
 type CpuJitFn = proc(mem: ptr float32; n, tgs: cint) {.cdecl.}
 
-proc cpuJitRun*(fn: pointer; mem: var seq[float32]; nThreads, tgSize: int): bool =
+proc cpuJitRun*(fn: pointer; mem: var seq[float32]; nThreads, tgSize: int): bool  {.apiHooked.}=
   if fn == nil or mem.len == 0 or nThreads <= 0 or tgSize <= 0:
     return false
   cast[CpuJitFn](fn)(addr mem[0], cint(nThreads), cint(tgSize))

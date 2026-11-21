@@ -4,7 +4,8 @@
 ##
 ## sessionFor = a HOST-side for loop while writing the program (or OP_FOR_BEGIN/END in the bytecode).
 
-import std/streams
+import std/[streams, strutils, algorithm]
+import ../probe
 
 # ── Opcodes (must match micro_vm.metal) ─────────────────────────────
 const
@@ -123,6 +124,75 @@ const
 type
   VmProgram* = object
     words*: seq[uint32]
+    ## Internal marker prevents a named micro-kernel hook from rewriting the
+    ## same program twice as it passes through compile and dispatch layers.
+    hooksApplied*: bool
+    hookTag*: string
+
+  MicroKernelHook* = proc(tag: string; program: var VmProgram) {.closure.}
+  MicroKernelHookId* = int
+
+  MicroKernelHookRegistration = object
+    id: MicroKernelHookId
+    selector: string
+    callback: MicroKernelHook
+
+var gMicroKernelHooks: seq[MicroKernelHookRegistration]
+var gNextMicroKernelHookId = 1
+
+proc bybyHookValue*(program: VmProgram): string =
+  "VmProgram(words=" & $program.words.len & ")"
+
+proc registerMicroKernelHook*(selector: string;
+    callback: MicroKernelHook): MicroKernelHookId =
+  ## Register a bytecode rewrite for one generated micro-kernel tag or for
+  ## every tag with "*". A callback may replace `program` with another program
+  ## that follows the same input/output buffer and launch ABI.
+  let normalized = selector.strip().toLowerAscii()
+  if normalized.len == 0:
+    raise newException(ValueError, "micro-kernel hook selector must not be empty")
+  if callback == nil:
+    raise newException(ValueError, "micro-kernel hook callback must not be nil")
+  result = gNextMicroKernelHookId
+  inc gNextMicroKernelHookId
+  gMicroKernelHooks.add(MicroKernelHookRegistration(id: result,
+    selector: normalized, callback: callback))
+
+proc removeMicroKernelHook*(id: MicroKernelHookId): bool =
+  ## Remove one micro-kernel rewrite. Returns false when the ID is unknown.
+  for i in 0 ..< gMicroKernelHooks.len:
+    if gMicroKernelHooks[i].id == id:
+      gMicroKernelHooks.delete(i)
+      return true
+
+proc clearMicroKernelHooks*(selector = "") =
+  ## Remove all micro-kernel rewrites, or only those for one tag selector.
+  if selector.len == 0:
+    gMicroKernelHooks.setLen(0)
+    return
+  let normalized = selector.strip().toLowerAscii()
+  var retained: seq[MicroKernelHookRegistration]
+  for registration in gMicroKernelHooks:
+    if registration.selector != normalized:
+      retained.add(registration)
+  gMicroKernelHooks = retained
+
+proc microKernelHooksActive*(): bool {.inline, apiHooked.} =
+  gMicroKernelHooks.len > 0
+
+proc applyMicroKernelHooks*(tag: string; program: var VmProgram) =
+  ## Resolve the tagged program once so all later compile/encode stages use
+  ## identical replacement bytecode.
+  let normalized = tag.strip().toLowerAscii()
+  if gMicroKernelHooks.len == 0:
+    return
+  if program.hooksApplied and program.hookTag == normalized:
+    return
+  for registration in gMicroKernelHooks:
+    if registration.selector == "*" or registration.selector == normalized:
+      registration.callback(tag, program)
+  program.hooksApplied = true
+  program.hookTag = normalized
 
 const VmMaxRegisters* = 256   ## register index limit of the encoding (8-bit fields); a program uses what it needs
 
@@ -143,131 +213,131 @@ proc pack2(op, a, b: uint32): uint32 {.inline.} =
 proc pack1(op, a: uint32): uint32 {.inline.} =
   (op and 0xFF'u32) or regField(a, 8, 23)
 
-proc vmRegA*(w: uint32): uint32 {.inline.} = ((w shr 8) and 0x1F) or (((w shr 23) and 0x7) shl 5)
-proc vmRegB*(w: uint32): uint32 {.inline.} = ((w shr 13) and 0x1F) or (((w shr 26) and 0x7) shl 5)
-proc vmRegC*(w: uint32): uint32 {.inline.} = ((w shr 18) and 0x1F) or (((w shr 29) and 0x7) shl 5)
+proc vmRegA*(w: uint32): uint32 {.inline, apiHooked.} = ((w shr 8) and 0x1F) or (((w shr 23) and 0x7) shl 5)
+proc vmRegB*(w: uint32): uint32 {.inline, apiHooked.} = ((w shr 13) and 0x1F) or (((w shr 26) and 0x7) shl 5)
+proc vmRegC*(w: uint32): uint32 {.inline, apiHooked.} = ((w shr 18) and 0x1F) or (((w shr 29) and 0x7) shl 5)
 
 # ── Emit (writes a "file" in RAM) ──────────────────────────────
 
-proc emit*(p: var VmProgram; w: uint32) =
+proc emit*(p: var VmProgram; w: uint32) {.apiHooked.} =
   p.words.add w
 
-proc emitNop*(p: var VmProgram) =
+proc emitNop*(p: var VmProgram) {.apiHooked.} =
   p.emit OP_NOP
 
-proc emitHalt*(p: var VmProgram) =
+proc emitHalt*(p: var VmProgram) {.apiHooked.} =
   p.emit OP_HALT
 
-proc emitLoadF32*(p: var VmProgram; rd, rb: uint32; offset: uint32) =
+proc emitLoadF32*(p: var VmProgram; rd, rb: uint32; offset: uint32) {.apiHooked.} =
   ## R[rd] = memF32[R[rb] + offset]
   p.emit pack2(OP_LOAD_F32, rd, rb)
   p.emit offset
 
-proc emitStoreF32*(p: var VmProgram; rs, rb: uint32; offset: uint32) =
+proc emitStoreF32*(p: var VmProgram; rs, rb: uint32; offset: uint32) {.apiHooked.} =
   p.emit pack2(OP_STORE_F32, rs, rb)
   p.emit offset
 
-proc emitLoadU8*(p: var VmProgram; rd, rb: uint32; offset: uint32) =
+proc emitLoadU8*(p: var VmProgram; rd, rb: uint32; offset: uint32) {.apiHooked.} =
   p.emit pack2(OP_LOAD_U8, rd, rb)
   p.emit offset
 
-proc emitLoadConstF32*(p: var VmProgram; rd: uint32; v: float32) =
+proc emitLoadConstF32*(p: var VmProgram; rd: uint32; v: float32) {.apiHooked.} =
   p.emit pack1(OP_LOAD_CONST, rd)
   var bits: uint32
   copyMem(addr bits, unsafeAddr v, 4)
   p.emit bits
 
-proc emitAdd*(p: var VmProgram; rd, ra, rb: uint32) =
+proc emitAdd*(p: var VmProgram; rd, ra, rb: uint32) {.apiHooked.} =
   p.emit pack3(OP_ADD, rd, ra, rb)
 
-proc emitMul*(p: var VmProgram; rd, ra, rb: uint32) =
+proc emitMul*(p: var VmProgram; rd, ra, rb: uint32) {.apiHooked.} =
   p.emit pack3(OP_MUL, rd, ra, rb)
 
-proc emitFma*(p: var VmProgram; rd, ra, rb, rc: uint32) =
+proc emitFma*(p: var VmProgram; rd, ra, rb, rc: uint32) {.apiHooked.} =
   p.emit pack3(OP_FMA, rd, ra, rb)
   p.emit (rc and 0xFF)
 
-proc emitLutU8*(p: var VmProgram; rd, ri: uint32) =
+proc emitLutU8*(p: var VmProgram; rd, ri: uint32) {.apiHooked.} =
   ## R[rd] = lut[uint(R[ri]) & 255]
   p.emit pack2(OP_LUT_U8, rd, ri)
 
-proc emitForBegin*(p: var VmProgram; countReg: uint32) =
+proc emitForBegin*(p: var VmProgram; countReg: uint32) {.apiHooked.} =
   ## GPU loop: remain = R[countReg]
   p.emit pack1(OP_FOR_BEGIN, countReg)
 
-proc emitForEnd*(p: var VmProgram) =
+proc emitForEnd*(p: var VmProgram) {.apiHooked.} =
   p.emit OP_FOR_END
 
-proc emitBarrierTg*(p: var VmProgram) =
+proc emitBarrierTg*(p: var VmProgram) {.apiHooked.} =
   p.emit OP_BARRIER_TG
 
-proc emitTgLoadF32*(p: var VmProgram; rd, rb: uint32; offset: uint32) =
+proc emitTgLoadF32*(p: var VmProgram; rd, rb: uint32; offset: uint32) {.apiHooked.} =
   p.emit pack2(OP_TG_LOAD_F32, rd, rb)
   p.emit offset
 
-proc emitTgStoreF32*(p: var VmProgram; rs, rb: uint32; offset: uint32) =
+proc emitTgStoreF32*(p: var VmProgram; rs, rb: uint32; offset: uint32) {.apiHooked.} =
   p.emit pack2(OP_TG_STORE_F32, rs, rb)
   p.emit offset
 
 # ── emit for the new opcodes ───────────────────────────────────────
 
-proc emitSub*(p: var VmProgram; rd, ra, rb: uint32) =
+proc emitSub*(p: var VmProgram; rd, ra, rb: uint32) {.apiHooked.} =
   p.emit pack3(OP_SUB, rd, ra, rb)
 
-proc emitDiv*(p: var VmProgram; rd, ra, rb: uint32) =
+proc emitDiv*(p: var VmProgram; rd, ra, rb: uint32) {.apiHooked.} =
   p.emit pack3(OP_DIV, rd, ra, rb)
 
-proc emitExp*(p: var VmProgram; rd, rb: uint32) =
+proc emitExp*(p: var VmProgram; rd, rb: uint32) {.apiHooked.} =
   p.emit pack2(OP_EXP, rd, rb)
 
-proc emitNeg*(p: var VmProgram; rd, rb: uint32) =
+proc emitNeg*(p: var VmProgram; rd, rb: uint32) {.apiHooked.} =
   p.emit pack2(OP_NEG, rd, rb)
 
-proc emitSigmoid*(p: var VmProgram; rd, rb: uint32) =
+proc emitSigmoid*(p: var VmProgram; rd, rb: uint32) {.apiHooked.} =
   p.emit pack2(OP_SIGMOID, rd, rb)
 
-proc emitSoftplus*(p: var VmProgram; rd, rb: uint32) =
+proc emitSoftplus*(p: var VmProgram; rd, rb: uint32) {.apiHooked.} =
   p.emit pack2(OP_SOFTPLUS, rd, rb)
 
-proc emitRsqrt*(p: var VmProgram; rd, rb: uint32) =
+proc emitRsqrt*(p: var VmProgram; rd, rb: uint32) {.apiHooked.} =
   p.emit pack2(OP_RSQRT, rd, rb)
 
-proc emitLoadF32Idx*(p: var VmProgram; rd, rb: uint32) =
+proc emitLoadF32Idx*(p: var VmProgram; rd, rb: uint32) {.apiHooked.} =
   ## R[rd] = memF32[(uint)R[rb]]  — DYNAMIC offset (computed at run time),
   ## unlike emitLoadF32 (STATIC offset fixed when the bytecode is built).
   p.emit pack2(OP_LOAD_F32_IDX, rd, rb)
 
-proc emitStoreF32Idx*(p: var VmProgram; rs, rb: uint32) =
+proc emitStoreF32Idx*(p: var VmProgram; rs, rb: uint32) {.apiHooked.} =
   p.emit pack2(OP_STORE_F32_IDX, rs, rb)
 
-proc emitAddConst*(p: var VmProgram; rd, rb: uint32; v: float32) =
+proc emitAddConst*(p: var VmProgram; rd, rb: uint32; v: float32) {.apiHooked.} =
   p.emit pack2(OP_ADD_CONST, rd, rb)
   var bits: uint32
   copyMem(addr bits, unsafeAddr v, 4)
   p.emit bits
 
-proc emitMulConst*(p: var VmProgram; rd, rb: uint32; v: float32) =
+proc emitMulConst*(p: var VmProgram; rd, rb: uint32; v: float32) {.apiHooked.} =
   p.emit pack2(OP_MUL_CONST, rd, rb)
   var bits: uint32
   copyMem(addr bits, unsafeAddr v, 4)
   p.emit bits
 
-proc emitCmpLt*(p: var VmProgram; rd, ra, rb: uint32) =
+proc emitCmpLt*(p: var VmProgram; rd, ra, rb: uint32) {.apiHooked.} =
   p.emit pack3(OP_CMP_LT, rd, ra, rb)
 
-proc emitIfBegin*(p: var VmProgram; condReg: uint32) =
+proc emitIfBegin*(p: var VmProgram; condReg: uint32) {.apiHooked.} =
   p.emit pack1(OP_IF_BEGIN, condReg)
 
-proc emitIfEnd*(p: var VmProgram) =
+proc emitIfEnd*(p: var VmProgram) {.apiHooked.} =
   p.emit OP_IF_END
 
-proc emitLoadLid*(p: var VmProgram; rd: uint32) =
+proc emitLoadLid*(p: var VmProgram; rd: uint32) {.apiHooked.} =
   p.emit pack1(OP_LOAD_LID, rd)
 
-proc emitLoadTgid*(p: var VmProgram; rd: uint32) =
+proc emitLoadTgid*(p: var VmProgram; rd: uint32) {.apiHooked.} =
   p.emit pack1(OP_LOAD_TGID, rd)
 
-proc opHasWord*(op: uint32): bool {.inline.} =
+proc opHasWord*(op: uint32): bool {.inline, apiHooked.} =
   ## Which ops read one extra operand word right after them (for skipBlock/disasm).
   case op
   of OP_LOAD_F32, OP_STORE_F32, OP_LOAD_U8, OP_LOAD_CONST, OP_FMA,
@@ -278,39 +348,39 @@ proc opHasWord*(op: uint32): bool {.inline.} =
      OP_U_LOAD_F16, OP_U_LOAD_F16X4: true
   else: false
 
-proc opImmediateWords*(op: uint32): int {.inline.} =
+proc opImmediateWords*(op: uint32): int {.inline, apiHooked.} =
   ## Number of immediate words following an instruction. Most opcodes have
   ## zero or one; custom shape-specialized micro-kernels may carry more.
   if op in [OP_Q4_COOP_GEMM, OP_Q4_GEMV, OP_FP4_COOP_GEMM, OP_TILE_GEMM]: return 5
   if opHasWord(op): return 1
   0
 
-proc emitSimdSum*(p: var VmProgram; rd, rs: uint32) = p.emit pack2(OP_SIMD_SUM, rd, rs)
-proc emitSimdLane*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_LANE, ud)
-proc emitSimdId*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_ID, ud)
-proc emitMmZero*(p: var VmProgram; ma: uint32) = p.emit pack1(OP_MM_ZERO, ma)
-proc emitMmLoad*(p: var VmProgram; ma, ub, transpose, ld: uint32) =
+proc emitSimdSum*(p: var VmProgram; rd, rs: uint32) {.apiHooked.} = p.emit pack2(OP_SIMD_SUM, rd, rs)
+proc emitSimdLane*(p: var VmProgram; ud: uint32) {.apiHooked.} = p.emit pack1(OP_SIMD_LANE, ud)
+proc emitSimdId*(p: var VmProgram; ud: uint32) {.apiHooked.} = p.emit pack1(OP_SIMD_ID, ud)
+proc emitMmZero*(p: var VmProgram; ma: uint32) {.apiHooked.} = p.emit pack1(OP_MM_ZERO, ma)
+proc emitMmLoad*(p: var VmProgram; ma, ub, transpose, ld: uint32) {.apiHooked.} =
   p.emit pack3(OP_MM_LOAD, ma, ub, transpose); p.emit ld
-proc emitMmMac*(p: var VmProgram; ma, mb, mc: uint32) = p.emit pack3(OP_MM_MAC, ma, mb, mc)
-proc emitMmStoreTg*(p: var VmProgram; ma, ub, ld: uint32) =
+proc emitMmMac*(p: var VmProgram; ma, mb, mc: uint32) {.apiHooked.} = p.emit pack3(OP_MM_MAC, ma, mb, mc)
+proc emitMmStoreTg*(p: var VmProgram; ma, ub, ld: uint32) {.apiHooked.} =
   p.emit pack2(OP_MM_STORE_TG, ma, ub); p.emit ld
-proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) =
+proc emitMmStoreMem*(p: var VmProgram; ma, ub, ld: uint32) {.apiHooked.} =
   p.emit pack2(OP_MM_STORE_MEM, ma, ub); p.emit ld
-proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
+proc emitQ4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) {.apiHooked.} =
   p.emit OP_Q4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
 
-proc emitFp4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
+proc emitFp4CoopGemm*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) {.apiHooked.} =
   ## FP4-KM GEMM shape op. The format fixes groupSize = 32 and nGroups = K / 32; both words are
   ## kept so every cooperative-matrix shape op has the same five-word layout.
   p.emit OP_FP4_COOP_GEMM
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
 
-proc emitTileGemm*(p: var VmProgram; format, M, K, N, scaleBase, lutBase: uint32) =
+proc emitTileGemm*(p: var VmProgram; format, M, K, N, scaleBase, lutBase: uint32) {.apiHooked.} =
   p.emit pack1(OP_TILE_GEMM, format)
   p.emit M; p.emit K; p.emit N; p.emit scaleBase; p.emit lutBase
 
-proc buildFp4TileGemmProgram*(M, K, N, scaleBase, lutBase: int): VmProgram =
+proc buildFp4TileGemmProgram*(M, K, N, scaleBase, lutBase: int): VmProgram {.apiHooked.} =
   ## The FP4-KM tile GEMM micro-kernel: out[M, N] = x[M, K] * W[N, K]^T with W packed FP4-KM in
   ## slot u8 (nibble bytes [N, K/2] from byte 0: byte j of a 32-value group holds element j in the
   ## low nibble and j+16 in the high one; scale bytes [N, K/32] from byte scaleBase) and the
@@ -328,7 +398,7 @@ proc buildFp4TileGemmProgram*(M, K, N, scaleBase, lutBase: int): VmProgram =
   result.emit OP_TILE_STORE
   result.emit OP_HALT
 
-proc buildF16TileGemmProgram*(M, K, N: int): VmProgram =
+proc buildF16TileGemmProgram*(M, K, N: int): VmProgram {.apiHooked.} =
   ## The FP16 tile GEMM micro-kernel: out[M, N] = x[M, K] * W[N, K]^T with W IEEE halves,
   ## row-major [N, K], from byte 0 of slot u8 (slot lut is unused). FP32 accumulation; on the
   ## cooperative-matrix target the activations are rounded to FP16 like the FP4-KM kernel.
@@ -345,7 +415,7 @@ proc buildF16TileGemmProgram*(M, K, N: int): VmProgram =
   result.emit OP_TILE_STORE
   result.emit OP_HALT
 
-proc emitQ4Gemv*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) =
+proc emitQ4Gemv*(p: var VmProgram; M, K, N, groupSize, nGroups: uint32) {.apiHooked.} =
   p.emit OP_Q4_GEMV
   p.emit M; p.emit K; p.emit N; p.emit groupSize; p.emit nGroups
 
@@ -353,33 +423,33 @@ const Q4GemvThreads* = 128             ## workgroup width of the Q4 GEMV micro-k
 const Q4GemvRowChoices* = [1, 2, 4]    ## output rows one 32-lane subgroup computes
 const Q4GemvDefaultRows* = 2
 
-proc q4GemvSupported*(K, groupSize, nGroups: int): bool =
+proc q4GemvSupported*(K, groupSize, nGroups: int): bool {.apiHooked.} =
   ## Shapes the Q4 GEMV micro-kernel handles: whole 32-bit words inside one group.
   K > 0 and K mod 8 == 0 and groupSize > 0 and groupSize mod 8 == 0 and
     K mod groupSize == 0 and nGroups == K div groupSize
 
-proc q4GemvRowsPerGroup*(rowsPerSubgroup: int; threads = Q4GemvThreads): int =
+proc q4GemvRowsPerGroup*(rowsPerSubgroup: int; threads = Q4GemvThreads): int {.apiHooked.} =
   ## Output rows of one Q4 GEMV workgroup: one 32-lane group of invocations per
   ## `rowsPerSubgroup` rows. The grid is ceil(N / this) workgroups per activation row.
   rowsPerSubgroup * (threads div 32)
 
-proc q4GemvThreadCount*(M, N, rowsPerSubgroup: int; threads = Q4GemvThreads): int =
+proc q4GemvThreadCount*(M, N, rowsPerSubgroup: int; threads = Q4GemvThreads): int {.apiHooked.} =
   let perGroup = q4GemvRowsPerGroup(rowsPerSubgroup, threads)
   M * ((N + perGroup - 1) div perGroup) * threads
 
 const Q4CoopRowTiles* = [64, 32, 16]   ## row tiles the Q4 and FP4-KM cooperative-matrix shaders are built for
 
-proc fp4CoopSupported*(K, N, groupSize, nGroups: int): bool =
+proc fp4CoopSupported*(K, N, groupSize, nGroups: int): bool {.apiHooked.} =
   ## Shapes the FP4-KM cooperative-matrix micro-kernel handles: 64-deep K steps (two 32-value
   ## groups, one uvec4 each) and at least one 16-column fragment.
   K > 0 and K mod 64 == 0 and N >= 16 and groupSize == 32 and nGroups == K div 32
 
-proc fp4CoopLutWord*(K, N: int): int =
+proc fp4CoopLutWord*(K, N: int): int {.apiHooked.} =
   ## Float word of the 272-float decode table in an FP4-KM blob: after the nibble bytes
   ## [N, K/2] and the scale bytes [N, K/32], padded to whole words.
   (N * (K div 2) + N * (K div 32) + 3) div 4
 
-proc q4CoopRowTile*(rows, N: int; computeUnits = 0; perUnit = 2): int =
+proc q4CoopRowTile*(rows, N: int; computeUnits = 0; perUnit = 2): int {.apiHooked.} =
   ## Rows one 128-thread workgroup of the Q4 cooperative-matrix micro-kernel computes for a
   ## dispatch of `rows` rows (its columns are always 64). Each row tile dequantizes the Q4
   ## weights again, so the tallest tile wins while the grid still gives every SM/CU `perUnit`
@@ -392,56 +462,56 @@ proc q4CoopRowTile*(rows, N: int; computeUnits = 0; perUnit = 2): int =
   for bm in [64, 32]:
     if rows > bm div 2 and ((rows + bm - 1) div bm) * cols >= perUnit * units:
       return bm
-proc emitSimdW*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_W, ud)
-proc emitSimdGid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_SIMD_GID, ud)
-proc emitUTgid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_TGID, ud)
-proc emitULid*(p: var VmProgram; ud: uint32) = p.emit pack1(OP_U_LID, ud)
-proc emitUConst*(p: var VmProgram; ud: uint32; v: uint32) =
+proc emitSimdW*(p: var VmProgram; ud: uint32) {.apiHooked.} = p.emit pack1(OP_SIMD_W, ud)
+proc emitSimdGid*(p: var VmProgram; ud: uint32) {.apiHooked.} = p.emit pack1(OP_SIMD_GID, ud)
+proc emitUTgid*(p: var VmProgram; ud: uint32) {.apiHooked.} = p.emit pack1(OP_U_TGID, ud)
+proc emitULid*(p: var VmProgram; ud: uint32) {.apiHooked.} = p.emit pack1(OP_U_LID, ud)
+proc emitUConst*(p: var VmProgram; ud: uint32; v: uint32) {.apiHooked.} =
   p.emit pack1(OP_U_CONST, ud); p.emit v
-proc emitUAdd*(p: var VmProgram; ud, ua, ub: uint32) = p.emit pack3(OP_U_ADD, ud, ua, ub)
-proc emitUMul*(p: var VmProgram; ud, ua, ub: uint32) = p.emit pack3(OP_U_MUL, ud, ua, ub)
-proc emitUShr*(p: var VmProgram; ud, ua, ub: uint32) = p.emit pack3(OP_U_SHR, ud, ua, ub)
-proc emitUAddK*(p: var VmProgram; ud, ua: uint32; k: uint32) =
+proc emitUAdd*(p: var VmProgram; ud, ua, ub: uint32) {.apiHooked.} = p.emit pack3(OP_U_ADD, ud, ua, ub)
+proc emitUMul*(p: var VmProgram; ud, ua, ub: uint32) {.apiHooked.} = p.emit pack3(OP_U_MUL, ud, ua, ub)
+proc emitUShr*(p: var VmProgram; ud, ua, ub: uint32) {.apiHooked.} = p.emit pack3(OP_U_SHR, ud, ua, ub)
+proc emitUAddK*(p: var VmProgram; ud, ua: uint32; k: uint32) {.apiHooked.} =
   p.emit pack2(OP_U_ADDK, ud, ua); p.emit k
-proc emitUMulK*(p: var VmProgram; ud, ua: uint32; k: uint32) =
+proc emitUMulK*(p: var VmProgram; ud, ua: uint32; k: uint32) {.apiHooked.} =
   p.emit pack2(OP_U_MULK, ud, ua); p.emit k
-proc emitUAndK*(p: var VmProgram; ud, ua: uint32; k: uint32) =
+proc emitUAndK*(p: var VmProgram; ud, ua: uint32; k: uint32) {.apiHooked.} =
   p.emit pack2(OP_U_ANDK, ud, ua); p.emit k
-proc emitUShrK*(p: var VmProgram; ud, ua: uint32; k: uint32) =
+proc emitUShrK*(p: var VmProgram; ud, ua: uint32; k: uint32) {.apiHooked.} =
   p.emit pack2(OP_U_SHRK, ud, ua); p.emit k
-proc emitUShlK*(p: var VmProgram; ud, ua: uint32; k: uint32) =
+proc emitUShlK*(p: var VmProgram; ud, ua: uint32; k: uint32) {.apiHooked.} =
   p.emit pack2(OP_U_SHLK, ud, ua); p.emit k
-proc emitULoadU8*(p: var VmProgram; ud, ub: uint32; off: uint32 = 0) =
+proc emitULoadU8*(p: var VmProgram; ud, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   p.emit pack2(OP_U_LOAD_U8, ud, ub); p.emit off
-proc emitULoadU32*(p: var VmProgram; ud, ub: uint32; off: uint32 = 0) =
+proc emitULoadU32*(p: var VmProgram; ud, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   ## Loads 32 bits (4 consecutive bytes, little-endian) from memU8[U[ub]+off]. The address MUST be a multiple of 4.
   p.emit pack2(OP_U_LOAD_U32, ud, ub); p.emit off
 
-proc emitULoadConstF*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+proc emitULoadConstF*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   p.emit pack2(OP_U_LOAD_CONSTF, rd, ub); p.emit off
-proc emitULoadIn*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+proc emitULoadIn*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   p.emit pack2(OP_U_LOAD_IN, rd, ub); p.emit off
-proc emitULoadIn4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+proc emitULoadIn4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   ## R[rd..rd+3] = 4 consecutive floats of inF32 at U[ub]+off. The address must be
   ## a multiple of 4 floats (16 bytes) - the kernel must guarantee it.
   doAssert rd + 3 <= 31, "emitULoadIn4: exceeds the 32 R[] registers"
   p.emit pack2(OP_U_LOAD_IN4, rd, ub); p.emit off
-proc emitULoadF16*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+proc emitULoadF16*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   ## R[rd] = float of the IEEE half at element U[ub]+off of buffer 2 (index in halves, not bytes).
   p.emit pack2(OP_U_LOAD_F16, rd, ub); p.emit off
-proc emitULoadF16x4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+proc emitULoadF16x4*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   ## R[rd..rd+3] = 4 consecutive halves of buffer 2 at element U[ub]+off, widened to float.
   ## The element index must be a multiple of 4 (one 8-byte load) - the kernel must guarantee it.
   p.emit pack2(OP_U_LOAD_F16X4, rd, ub); p.emit off
-proc emitUStoreF32*(p: var VmProgram; rs, ub: uint32; off: uint32 = 0) =
+proc emitUStoreF32*(p: var VmProgram; rs, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   p.emit pack2(OP_U_STORE_F32, rs, ub); p.emit off
-proc emitULoadF32*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) =
+proc emitULoadF32*(p: var VmProgram; rd, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   p.emit pack2(OP_U_LOAD_F32, rd, ub); p.emit off
-proc emitUAtomicAdd*(p: var VmProgram; rs, ub: uint32; off: uint32 = 0) =
+proc emitUAtomicAdd*(p: var VmProgram; rs, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   ## memF32[U[ub] + off] += R[rs]  (atomic, for gradients shared between threads)
   p.emit pack2(OP_U_ATOMIC_ADD, rs, ub); p.emit off
-proc emitUToR*(p: var VmProgram; rd, ub: uint32) = p.emit pack2(OP_U_TO_R, rd, ub)
-proc emitRToU*(p: var VmProgram; ud, rb: uint32) = p.emit pack2(OP_R_TO_U, ud, rb)
+proc emitUToR*(p: var VmProgram; rd, ub: uint32) {.apiHooked.} = p.emit pack2(OP_U_TO_R, rd, ub)
+proc emitRToU*(p: var VmProgram; ud, rb: uint32) {.apiHooked.} = p.emit pack2(OP_R_TO_U, ud, rb)
 
 template sessionVmIfGpu*(p: var VmProgram; condReg: uint32; body: untyped) =
   ## if (R[condReg] != 0) on the GPU — writes IF_BEGIN/body/IF_END into the bytecode.
@@ -464,24 +534,24 @@ template sessionVmForGpu*(p: var VmProgram; countReg: uint32; body: untyped) =
 
 # ── ONE-DISPATCH emit helpers ───────────────────────────────
 
-proc emitGridBarrier*(p: var VmProgram; ctrlIdx: uint32) =
+proc emitGridBarrier*(p: var VmProgram; ctrlIdx: uint32) {.apiHooked.} =
   p.emit OP_GRID_BARRIER; p.emit ctrlIdx
-proc emitGridEpilogue*(p: var VmProgram; ctrlIdx: uint32) =
+proc emitGridEpilogue*(p: var VmProgram; ctrlIdx: uint32) {.apiHooked.} =
   p.emit OP_GRID_EPILOGUE; p.emit ctrlIdx
-proc emitBaseF32*(p: var VmProgram; ua: uint32) = p.emit pack1(OP_BASE_F32, ua)
-proc emitBaseU8*(p: var VmProgram; ua: uint32) = p.emit pack1(OP_BASE_U8, ua)
-proc emitBaseLut*(p: var VmProgram; ua: uint32) = p.emit pack1(OP_BASE_LUT, ua)
-proc emitBaseIn*(p: var VmProgram; ua: uint32) = p.emit pack1(OP_BASE_IN, ua)
-proc emitULoadMeta*(p: var VmProgram; ud, ub: uint32; off: uint32 = 0) =
+proc emitBaseF32*(p: var VmProgram; ua: uint32) {.apiHooked.} = p.emit pack1(OP_BASE_F32, ua)
+proc emitBaseU8*(p: var VmProgram; ua: uint32) {.apiHooked.} = p.emit pack1(OP_BASE_U8, ua)
+proc emitBaseLut*(p: var VmProgram; ua: uint32) {.apiHooked.} = p.emit pack1(OP_BASE_LUT, ua)
+proc emitBaseIn*(p: var VmProgram; ua: uint32) {.apiHooked.} = p.emit pack1(OP_BASE_IN, ua)
+proc emitULoadMeta*(p: var VmProgram; ud, ub: uint32; off: uint32 = 0) {.apiHooked.} =
   p.emit pack2(OP_U_LOAD_META, ud, ub); p.emit off
-proc emitVtgBegin*(p: var VmProgram; mode: uint32; nVirt, param: uint32) =
+proc emitVtgBegin*(p: var VmProgram; mode: uint32; nVirt, param: uint32) {.apiHooked.} =
   p.emit pack1(OP_VTG_BEGIN, mode); p.emit nVirt; p.emit param
-proc emitVtgEnd*(p: var VmProgram) = p.emit OP_VTG_END
-proc emitLoadVact*(p: var VmProgram; rd: uint32) = p.emit pack1(OP_LOAD_VACT, rd)
+proc emitVtgEnd*(p: var VmProgram) {.apiHooked.} = p.emit OP_VTG_END
+proc emitLoadVact*(p: var VmProgram; rd: uint32) {.apiHooked.} = p.emit pack1(OP_LOAD_VACT, rd)
 
 # ── Save / load .bvm files ─────────────────────────────────────
 
-proc saveBvm*(p: VmProgram; path: string) =
+proc saveBvm*(p: VmProgram; path: string) {.apiHooked.} =
   ## File = raw uint32 LE words.
   var f = newFileStream(path, fmWrite)
   if f.isNil: raise newException(IOError, "cannot write " & path)
@@ -490,7 +560,7 @@ proc saveBvm*(p: VmProgram; path: string) =
     var le = w
     f.writeData(addr le, 4)
 
-proc loadBvm*(path: string): VmProgram =
+proc loadBvm*(path: string): VmProgram {.apiHooked.} =
   var f = newFileStream(path, fmRead)
   if f.isNil: raise newException(IOError, "cannot read " & path)
   defer: f.close()
@@ -502,7 +572,7 @@ proc loadBvm*(path: string): VmProgram =
 
 # ── Example: a "kernel" decoding one fp4-ish byte + fma (illustration) ───
 
-proc buildExampleLutFma*(): VmProgram =
+proc buildExampleLutFma*(): VmProgram {.apiHooked.} =
   ## R0 = tid (set by the kernel)
   ## Assume: memU8[tid] = index, lut[] ready, memF32[tid] *= scale then fma
   var p: VmProgram

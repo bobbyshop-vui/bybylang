@@ -1,6 +1,7 @@
 ## Vulkan capability queries; layouts match the Vulkan 1.0/KHR ABI.
 ## No SDK headers or CUDA runtime are needed to build this module.
 import std/sets
+import ../../probe
 
 type
   VkPhysicalDeviceLimits* = object
@@ -203,7 +204,7 @@ const
   CoopFeaturesType* = 1000506000'u32
   MemoryModelType* = 1000211000'u32
 
-proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): VulkanCaps =
+proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): VulkanCaps  {.apiHooked.}=
   let getProps = cast[proc(d: pointer; p: ptr VkPhysicalDeviceProperties) {.cdecl.}](
     resolve(instance, "vkGetPhysicalDeviceProperties"))
   if getProps == nil: raise newException(ValueError, "Vulkan properties query is unavailable")
@@ -308,10 +309,10 @@ proc queryVulkanCaps*(resolve: VkProcResolver; instance, device: pointer): Vulka
        t.scope == 3 and t.saturating == 0 and t.m == 16 and t.n == 16 and t.k == 16:
       result.float8E4M3CooperativeMatrix = true
 
-proc deviceName*(caps: VulkanCaps): string =
+proc deviceName*(caps: VulkanCaps): string  {.apiHooked.}=
   $cast[cstring](unsafeAddr caps.properties.deviceName[0])
 
-proc deviceClass*(deviceType: uint32): string =
+proc deviceClass*(deviceType: uint32): string  {.apiHooked.}=
   case deviceType
   of 1: "iGPU"
   of 2: "dGPU"
@@ -319,7 +320,7 @@ proc deviceClass*(deviceType: uint32): string =
   of 4: "CPU"
   else: "other"
 
-proc useDeviceLocalWeights*(deviceType: uint32; mode = "auto"): bool =
+proc useDeviceLocalWeights*(deviceType: uint32; mode = "auto"): bool  {.apiHooked.}=
   ## Private/device-local resident weights are permitted only on a dGPU.
   ## An old DEVICE_LOCAL=1 setting must never force the iGPU/UMA path private.
   deviceType == 2'u32 and mode in ["auto", "1"]

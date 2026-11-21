@@ -1,5 +1,6 @@
 ## Validate recorded bytecode and conservatively classify its memory domains.
 import std/[sets, strutils]
+import ../probe
 import ./session_vm
 
 type VmAccess* = object
@@ -7,7 +8,7 @@ type VmAccess* = object
   virtual*, grid*: bool
   atomic*: bool
 
-proc vmAccess*(words: openArray[uint32]): VmAccess =
+proc vmAccess*(words: openArray[uint32]): VmAccess  {.apiHooked.}=
   var pc = 0
   var scopes: seq[uint32]
   var halted = false
