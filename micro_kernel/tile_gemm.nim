@@ -26,6 +26,7 @@
 ## memory latency of slice k+1 hides behind the tensor-core work of slice k.
 
 import std/strutils
+import ../probe
 import ./session_vm
 
 type
@@ -43,15 +44,15 @@ const
   TileGemmCols* = 64          ## output columns per threadgroup
   TileGemmRowTiles* = [64, 32, 16]
 
-proc tileTargetDepth*(t: TileTarget): int =
+proc tileTargetDepth*(t: TileTarget): int  {.apiHooked.}=
   ## K values one TILE_K_BEGIN step covers: two 32-value groups for the cooperative matrices
   ## (16-deep fragments, one uvec4 per group and column), one group elsewhere.
   if t == ttVulkanCoop: 64 else: 32
 
-proc isTileGemmProgram*(p: VmProgram): bool =
+proc isTileGemmProgram*(p: VmProgram): bool  {.apiHooked.}=
   p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_TILE_GEMM
 
-proc fp4TileProgram*(p: VmProgram): VmProgram =
+proc fp4TileProgram*(p: VmProgram): VmProgram  {.apiHooked.}=
   ## The tile GEMM program of an FP4-KM micro-kernel: unchanged for an OP_TILE_GEMM program; the
   ## legacy OP_FP4_COOP_GEMM shape op (one blob: nibbles, scales, then the table) expands to it.
   if p.isTileGemmProgram: return p
@@ -64,7 +65,7 @@ proc fp4TileProgram*(p: VmProgram): VmProgram =
     return buildFp4TileGemmProgram(M, K, N, N * (K div 2), fp4CoopLutWord(K, N))
   raise newException(ValueError, "not an FP4-KM tile GEMM micro-kernel program")
 
-proc tileGemmShape*(p: VmProgram): TileGemmShape =
+proc tileGemmShape*(p: VmProgram): TileGemmShape  {.apiHooked.}=
   let q = fp4TileProgram(p)
   if q.words.len < 6:
     raise newException(ValueError, "truncated tile GEMM header")
@@ -76,17 +77,17 @@ proc tileGemmShape*(p: VmProgram): TileGemmShape =
   if result.K <= 0 or result.K mod 32 != 0 or result.N <= 0:
     raise newException(ValueError, "unsupported tile GEMM shape K=" & $result.K & " N=" & $result.N)
 
-proc tileGemmSupported*(s: TileGemmShape; t: TileTarget): bool =
+proc tileGemmSupported*(s: TileGemmShape; t: TileTarget): bool  {.apiHooked.}=
   ## Shapes a target handles: whole K slices, and for the cooperative matrices at least one
   ## 16-column fragment. FP16 weights have Vulkan lowerings only.
   s.K mod tileTargetDepth(t) == 0 and (t != ttVulkanCoop or s.N >= 16) and
     (s.format == TileFormatFp4Km or t in [ttVulkanCoop, ttVulkanTiled])
 
-proc tileGemmRowTile*(rows: int): int =
+proc tileGemmRowTile*(rows: int): int  {.apiHooked.}=
   ## Row tile of a session dispatch: the shortest tile that holds `rows`, at most 64.
   if rows <= 16: 16 elif rows <= 32: 32 else: 64
 
-proc tileGemmGroups*(rows, N, rowTile: int): int =
+proc tileGemmGroups*(rows, N, rowTile: int): int  {.apiHooked.}=
   ## Threadgroups of one dispatch over `rows` rows.
   ((rows + rowTile - 1) div rowTile) * ((N + TileGemmCols - 1) div TileGemmCols)
 
@@ -613,7 +614,7 @@ proc emitStore(e: var TileEmitter) =
     }"""
 
 proc lowerTileGemm*(p: VmProgram; target: TileTarget; kernelName: string; rowTile: int;
-                    fragments = 2): string =
+                    fragments = 2): string  {.apiHooked.}=
   ## Source of the tile GEMM micro-kernel `p` (or a legacy FP4 cooperative shape op) for one
   ## target and row tile. `fragments` (cooperative matrices only): 16-column fragments per
   ## subgroup; 1 needs four 32-wide subgroups per 128-invocation workgroup (NVIDIA), 2 also covers
@@ -660,7 +661,7 @@ proc lowerTileGemm*(p: VmProgram; target: TileTarget; kernelName: string; rowTil
   e.lines.join("\n") & "\n"
 
 proc tileGemmReference*(x: openArray[float32]; packed: openArray[uint8]; table: openArray[float32];
-                        rows, K, N, scaleBase, lutBase: int): seq[float32] =
+                        rows, K, N, scaleBase, lutBase: int): seq[float32]  {.apiHooked.}=
   ## Host reference of the FP4-KM tile GEMM (the CPU VM computes the same sums in C).
   result = newSeq[float32](rows * N)
   let groups = K div 32

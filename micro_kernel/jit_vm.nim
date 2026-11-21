@@ -53,7 +53,7 @@ type
     cfg*: JitConfig
     entries*: Table[string, CompiledEntry]  ## key = programKey
 
-proc defaultJitConfig*(): JitConfig =
+proc defaultJitConfig*(): JitConfig {.apiHooked.} =
   JitConfig(
     hotThreshold: 10,
     enableMetalJit: true,
@@ -62,7 +62,7 @@ proc defaultJitConfig*(): JitConfig =
     maxCacheEntries: 64
   )
 
-proc initJitCache*(cfg = defaultJitConfig()): JitCache =
+proc initJitCache*(cfg = defaultJitConfig()): JitCache {.apiHooked.} =
   JitCache(cfg: cfg, entries: initTable[string, CompiledEntry]())
 
 # ── Lower bytecode → Metal source ────────────────────────────
@@ -567,32 +567,35 @@ proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string
 proc isFp4CoopProgram*(p: VmProgram): bool
 proc lowerFp4TiledMetal*(p: VmProgram; kernelName: string; rowTile: int): string
 
-proc metalTileGemmSimdgroup(): bool =
+proc metalTileGemmSimdgroup(): bool  {.apiHooked.}=
   ## The Metal device runs simdgroup_matrix (Apple GPU family 7+).
   when defined(macosx): byby.sessionSimdgroupMatrixEnabled(byby.gbMetal)
   else: false
 
 
-proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
+proc lowerBytecodeToMetal*(program: VmProgram; kernelName: string): string {.apiHooked.} =
   ## Generates one Metal kernel from bytecode. Every thread: tid → R0.
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM, OP_TILE_GEMM]:
+  var activeProgram = program
+  if not activeProgram.hooksApplied:
+    applyMicroKernelHooks(kernelName, activeProgram)
+  if activeProgram.words.len > 0 and (activeProgram.words[0] and 0xFF'u32) in [OP_Q4_COOP_GEMM, OP_FP4_COOP_GEMM, OP_TILE_GEMM]:
     # Tile GEMM micro-kernel: simdgroup_matrix on an Apple GPU (family 7+), register tiles on
     # any other Metal GPU (FP4-KM only; the Q4 shape op needs simdgroup_matrix). Default tile for
     # a device of unknown size; the FIR runtime builds its own tiles per dispatch.
-    let s = coopGemmShape(p)
+    let s = coopGemmShape(activeProgram)
     let tile = q4CoopRowTile(max(1, s.M), s.N)
-    if isFp4CoopProgram(p) and not metalTileGemmSimdgroup():
-      return lowerFp4TiledMetal(p, kernelName, tile)
-    return lowerCoopGemmMetal(p, kernelName, tile)
-  if p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV:
+    if isFp4CoopProgram(activeProgram) and not metalTileGemmSimdgroup():
+      return lowerFp4TiledMetal(activeProgram, kernelName, tile)
+    return lowerCoopGemmMetal(activeProgram, kernelName, tile)
+  if activeProgram.words.len > 0 and (activeProgram.words[0] and 0xFF'u32) == OP_Q4_GEMV:
     raise newException(ValueError, "the Q4 subgroup GEMV micro-kernel is Vulkan-only")
   var st = LowerState(indent: 2)
   # A chain kernel (grid control buffer) reads data other threadgroups wrote during the same
   # dispatch; those loads go through relaxed atomics, which are served from the coherent level.
-  for i in 0 ..< p.words.len - 1:
-    if (p.words[i] and 0xFF'u32) in [OP_GRID_BARRIER, OP_GRID_EPILOGUE] and p.words[i+1] == 0xFFFFFFFF'u32:
+  for i in 0 ..< activeProgram.words.len - 1:
+    if (activeProgram.words[i] and 0xFF'u32) in [OP_GRID_BARRIER, OP_GRID_EPILOGUE] and activeProgram.words[i+1] == 0xFFFFFFFF'u32:
       st.ctrlBuf = true
-  st.lowerAll(p)
+  st.lowerAll(activeProgram)
   st.closeBlocks()
   let nReg = st.regCount()
   let wide = st.wideRegisters()
@@ -620,11 +623,11 @@ proc lowerBytecodeToMetal*(p: VmProgram; kernelName: string): string =
 #include <metal_stdlib>
 using namespace metal;
 
-inline float ldShared(device const float* p) {
-  return as_type<float>(atomic_load_explicit((device const atomic_uint*)p, memory_order_relaxed));
+inline float ldShared(device const float* activeProgram) {
+  return as_type<float>(atomic_load_explicit((device const atomic_uint*)activeProgram, memory_order_relaxed));
 }
-inline float ldShared(device float* p) {
-  return as_type<float>(atomic_load_explicit((device atomic_uint*)p, memory_order_relaxed));
+inline float ldShared(device float* activeProgram) {
+  return as_type<float>(atomic_load_explicit((device atomic_uint*)activeProgram, memory_order_relaxed));
 }
 
 // Auto-JIT (one-dispatch persistent kernel) from bytecode — do not edit
@@ -673,10 +676,10 @@ kernel void """ & kernelName & """(
 }
 """
 
-proc isQ4CoopProgram*(p: VmProgram): bool =
+proc isQ4CoopProgram*(p: VmProgram): bool {.apiHooked.} =
   p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_COOP_GEMM
 
-proc q4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+proc q4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] {.apiHooked.} =
   ## Shape carried by a Q4 cooperative-matrix micro-kernel program.
   if not p.isQ4CoopProgram or p.words.len != 7 or p.words[6] != OP_HALT:
     raise newException(ValueError, "Q4 cooperative micro-kernel must be one shape op followed by halt")
@@ -686,7 +689,7 @@ proc q4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
       result.nGroups != result.K div result.groupSize:
     raise newException(ValueError, "unsupported Q4 cooperative micro-kernel shape")
 
-proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
+proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string {.apiHooked.} =
   ## The Q4 cooperative-matrix shader built for one row tile (Q4CoopRowTiles). The runtime
   ## builds the tiles a graph can need and picks one per dispatch (q4CoopRowTile).
   ## `fragments`: 16-column fragments per subgroup. 1 needs four subgroups per 128-invocation
@@ -707,11 +710,11 @@ proc lowerQ4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments 
     .replace("@BM@", $rowTile)
     .replace("@FRAGS@", $fragments)
 
-proc isFp4CoopProgram*(p: VmProgram): bool =
+proc isFp4CoopProgram*(p: VmProgram): bool {.apiHooked.} =
   ## An FP4-KM tile GEMM micro-kernel: the legacy cooperative shape op or an OP_TILE_GEMM program.
   p.words.len > 0 and (p.words[0] and 0xFF'u32) in [OP_FP4_COOP_GEMM, OP_TILE_GEMM]
 
-proc fp4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+proc fp4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] {.apiHooked.} =
   ## Shape carried by an FP4-KM tile GEMM micro-kernel (groupSize is always 32).
   if not p.isFp4CoopProgram:
     raise newException(ValueError, "not an FP4-KM tile GEMM micro-kernel")
@@ -722,23 +725,23 @@ proc fp4CoopShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
   if result.M == 0 or result.N == 0:
     raise newException(ValueError, "unsupported FP4 tile GEMM micro-kernel shape")
 
-proc lowerFp4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
+proc lowerFp4CoopGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string {.apiHooked.} =
   ## Vulkan KHR cooperative-matrix lowering of the FP4-KM tile GEMM micro-kernel for one row
   ## tile (Q4CoopRowTiles, chosen per dispatch with q4CoopRowTile like the Q4 shader).
   lowerTileGemm(p, ttVulkanCoop, kernelName, rowTile, fragments)
 
-proc lowerFp4TiledGlsl*(p: VmProgram; kernelName: string; rowTile: int): string =
+proc lowerFp4TiledGlsl*(p: VmProgram; kernelName: string; rowTile: int): string {.apiHooked.} =
   ## Register-tiled Vulkan lowering (devices without cooperative matrices); same grid.
   lowerTileGemm(p, ttVulkanTiled, kernelName, rowTile)
 
-proc isCoopGemmProgram*(p: VmProgram): bool =
+proc isCoopGemmProgram*(p: VmProgram): bool {.apiHooked.} =
   ## A cooperative-matrix GEMM shape op of either weight format (Q4 or FP4-KM).
   p.isQ4CoopProgram or p.isFp4CoopProgram
 
-proc coopGemmShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+proc coopGemmShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] {.apiHooked.} =
   if p.isFp4CoopProgram: fp4CoopShape(p) else: q4CoopShape(p)
 
-proc lowerCoopGemmGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string =
+proc lowerCoopGemmGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragments = 2): string {.apiHooked.} =
   ## The cooperative-matrix shader of either weight format for one row tile; both formats share
   ## the slot layout, the 128-invocation workgroup, the 64-column tiles and the row tile choice.
   if p.isFp4CoopProgram: lowerFp4CoopGlsl(p, kernelName, rowTile, fragments)
@@ -747,7 +750,7 @@ proc lowerCoopGemmGlsl*(p: VmProgram; kernelName: string; rowTile: int; fragment
 const SimdgroupMatrixRequired* = "needs MSL simdgroup_matrix (an Apple GPU, family 7+); this Metal device does not have it"
   ## Shared wording of the error raised when a Tensor Core micro-kernel meets a Metal GPU without simdgroup_matrix.
 
-proc lowerQ4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+proc lowerQ4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string {.apiHooked.} =
   ## Metal counterpart of lowerQ4CoopGlsl: the same shape op, slots, 128-thread threadgroup,
   ## 64-column tiles and row tile choice, with MSL simdgroup_matrix (FP32 8x8 fragments)
   ## instead of KHR cooperative matrices. Runs only on Apple GPUs (family 7+).
@@ -764,24 +767,24 @@ proc lowerQ4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
     .replace("@N_GROUPS@", $s.nGroups)
     .replace("@BM@", $rowTile)
 
-proc lowerFp4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+proc lowerFp4CoopMetal*(p: VmProgram; kernelName: string; rowTile: int): string {.apiHooked.} =
   ## simdgroup_matrix lowering of the FP4-KM tile GEMM micro-kernel (Apple GPUs only).
   lowerTileGemm(p, ttMetalSimd, kernelName, rowTile)
 
-proc lowerFp4TiledMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+proc lowerFp4TiledMetal*(p: VmProgram; kernelName: string; rowTile: int): string {.apiHooked.} =
   ## Register-tiled Metal lowering (any Metal GPU); same grid as the simdgroup_matrix one.
   lowerTileGemm(p, ttMetalTiled, kernelName, rowTile)
 
-proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string =
+proc lowerCoopGemmMetal*(p: VmProgram; kernelName: string; rowTile: int): string {.apiHooked.} =
   ## The simdgroup_matrix kernel of either weight format for one row tile. The grid is the
   ## Vulkan one: ceil(rows / rowTile) * ceil(N / 64) threadgroups of 128 threads.
   if p.isFp4CoopProgram: lowerFp4CoopMetal(p, kernelName, rowTile)
   else: lowerQ4CoopMetal(p, kernelName, rowTile)
 
-proc isQ4GemvProgram*(p: VmProgram): bool =
+proc isQ4GemvProgram*(p: VmProgram): bool {.apiHooked.} =
   p.words.len > 0 and (p.words[0] and 0xFF'u32) == OP_Q4_GEMV
 
-proc q4GemvShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
+proc q4GemvShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] {.apiHooked.} =
   ## Shape carried by a Q4 GEMV micro-kernel program.
   if not p.isQ4GemvProgram or p.words.len != 7 or p.words[6] != OP_HALT:
     raise newException(ValueError, "Q4 GEMV micro-kernel must be one shape op followed by halt")
@@ -790,7 +793,7 @@ proc q4GemvShape*(p: VmProgram): tuple[M, K, N, groupSize, nGroups: int] =
     raise newException(ValueError, "unsupported Q4 GEMV micro-kernel shape")
 
 proc lowerQ4GemvGlsl*(p: VmProgram; kernelName: string; rowsPerSubgroup = Q4GemvDefaultRows;
-                      sharedReduce = true; threads = Q4GemvThreads): string =
+                      sharedReduce = true; threads = Q4GemvThreads): string {.apiHooked.} =
   ## The Q4 GEMV shader for `rowsPerSubgroup` output rows per 32 invocations. sharedReduce=false
   ## sums with subgroupAdd and needs compute subgroups that are exactly 32 wide (NVIDIA); the
   ## shared-memory sum runs on any device. The grid is q4GemvThreadCount(M, N, rows, threads).
@@ -813,22 +816,25 @@ proc lowerQ4GemvGlsl*(p: VmProgram; kernelName: string; rowsPerSubgroup = Q4Gemv
     .replace("@WG@", $threads)
     .replace("@SHARED_REDUCE@", (if sharedReduce: "1" else: "0"))
 
-proc lowerBytecodeToGlsl*(p: VmProgram; kernelName: string): string =
+proc lowerBytecodeToGlsl*(program: VmProgram; kernelName: string): string {.apiHooked.} =
   ## Static Vulkan counterpart to the Metal bytecode JIT. In contrast to the
   ## generic interpreter, this emits barriers at uniform static control-flow
   ## locations, which is required by Vulkan when per-lane IF/loop paths diverge.
-  if p.isQ4CoopProgram:
+  var activeProgram = program
+  if not activeProgram.hooksApplied:
+    applyMicroKernelHooks(kernelName, activeProgram)
+  if activeProgram.isQ4CoopProgram:
     # Default tile for a device of unknown size; the FIR runtime builds its own per dispatch.
-    let s = q4CoopShape(p)
-    return lowerQ4CoopGlsl(p, kernelName, q4CoopRowTile(s.M, s.N))
-  if p.isFp4CoopProgram:
-    let s = fp4CoopShape(p)
-    return lowerFp4CoopGlsl(p, kernelName, q4CoopRowTile(s.M, s.N))
-  if p.isQ4GemvProgram:
+    let s = q4CoopShape(activeProgram)
+    return lowerQ4CoopGlsl(activeProgram, kernelName, q4CoopRowTile(s.M, s.N))
+  if activeProgram.isFp4CoopProgram:
+    let s = fp4CoopShape(activeProgram)
+    return lowerFp4CoopGlsl(activeProgram, kernelName, q4CoopRowTile(s.M, s.N))
+  if activeProgram.isQ4GemvProgram:
     # Portable default (shared-memory sum); the FIR runtime picks the subgroup sum where it can.
-    return lowerQ4GemvGlsl(p, kernelName)
+    return lowerQ4GemvGlsl(activeProgram, kernelName)
   var st = LowerState(indent: 2, glsl: true)
-  st.lowerAll(p)
+  st.lowerAll(activeProgram)
   st.closeBlocks()
   if st.usesMm:
     raise newException(ValueError, "simdgroup_matrix bytecode is Metal-only and cannot be compiled by the Vulkan JIT")
@@ -881,7 +887,7 @@ void main() {
 
 var gGlslByKernel = initTable[string, string]()
 
-proc lowerBytecodeToGlslCached*(p: VmProgram; kernelName: string): string =
+proc lowerBytecodeToGlslCached*(p: VmProgram; kernelName: string): string {.apiHooked.} =
   ## Lowering is a pure function of (bytecode, kernel name) and costs
   ## milliseconds for the scan/conv programs (thousands of emitted lines).
   ## Inference encodes the same program on every layer, so cache by kernel
@@ -905,7 +911,7 @@ const
   HashHeaderFloats = 8                ## 32 byte header
   HashKernelName = "jit_vm_hash"
 
-proc buildHashProgram*(): VmProgram =
+proc buildHashProgram*(): VmProgram {.apiHooked.} =
   var p: VmProgram
   p.emitLoadF32(1, 0, 0)                  # R1 = nBytes   (tid 0 only)
   p.emitUConst(0, 0x811C9DC5'u32)         # U0 = h1
@@ -958,7 +964,7 @@ when defined(macosx):
   # tryMetalJitCompile is declared below; forward-declared for the hash kernel
   proc tryMetalJitCompile*(source, kernelName: string): bool
 
-  proc gpuHashWords(words: seq[uint32]): string =
+  proc gpuHashWords(words: seq[uint32]): string  {.apiHooked.}=
     if not gHashKernelReady:
       let src = lowerBytecodeToMetal(buildHashProgram(), HashKernelName)
       if not tryMetalJitCompile(src, HashKernelName):
@@ -1003,7 +1009,7 @@ else:
 
 var gJitDeviceReady = false
 
-proc ensureJitDeviceReady*(): bool =
+proc ensureJitDeviceReady*(): bool {.apiHooked.} =
   ## Initialises the GPU device (Metal: gDevice/gQueue) before any JIT/hash kernel. Safe to call repeatedly.
   ## Uses the existing API: sessionBegin -> metalSessionBegin -> ensureMetalInit (dispatch_once).
   ## If sessionBegin returns false because a session IS open, the device is surely initialised -> ready.
@@ -1016,30 +1022,34 @@ proc ensureJitDeviceReady*(): bool =
   else:
     result = true
 
-proc programKey*(p: VmProgram; tag = ""): string =
+proc programKey*(p: VmProgram; tag = ""): string {.apiHooked.} =
   ## Hash (GPU micro-kernel) + tag. The name must be a valid Metal identifier.
-  result = gWordsKey.getOrDefault(p.words, "")
+  var activeProgram = p
+  applyMicroKernelHooks(tag, activeProgram)
+  result = gWordsKey.getOrDefault(activeProgram.words, "")
   if result.len == 0:
-    result = gpuHashWords(p.words)       # GPU (opens its own session) - inside a session: fallback key
-    gWordsKey[p.words] = result
+    result = gpuHashWords(activeProgram.words) # GPU (opens its own session) - inside a session: fallback key
+    gWordsKey[activeProgram.words] = result
   if tag.len > 0:
     result.add '_'
     result.add sanitizeTag(tag)
 
-  recordPipelines(result, p.words)
+  recordPipelines(result, activeProgram.words)
 
-proc programKeyNoSession*(p: VmProgram; tag = ""): string =
+proc programKeyNoSession*(p: VmProgram; tag = ""): string {.apiHooked.} =
   ## LIKE programKey but NEVER opens a session (safe INSIDE a session, e.g. encodeMicroVm).
   ## A program hashed on the GPU before reuses that key (same kernel name); otherwise the fallback.
-  result = gWordsKey.getOrDefault(p.words, "")
+  var activeProgram = p
+  applyMicroKernelHooks(tag, activeProgram)
+  result = gWordsKey.getOrDefault(activeProgram.words, "")
   if result.len == 0:
-    result = fallbackWordsKey(p.words)
-    gWordsKey[p.words] = result
+    result = fallbackWordsKey(activeProgram.words)
+    gWordsKey[activeProgram.words] = result
   if tag.len > 0:
     result.add '_'
     result.add sanitizeTag(tag)
 
-  recordPipelines(result, p.words)
+  recordPipelines(result, activeProgram.words)
 
 # ── Compile hook (Metal) — needs a C bridge ──────────────────────
 ## Like tinygrad's MetalCompiler: source → compiled library → pipeline name.
@@ -1053,9 +1063,9 @@ when defined(macosx):
   proc metal_jit_compile(source, kernelName: cstring): cint {.
     importc: "metal_jit_compile", header: "metal_shim.h".}
 
-  proc metalJitCompileAvailable*: bool = true
+  proc metalJitCompileAvailable*: bool  {.apiHooked.}= true
 
-  proc tryMetalJitCompile*(source, kernelName: string): bool =
+  proc tryMetalJitCompile*(source, kernelName: string): bool {.apiHooked.} =
     try:
       # FIX "[metal_jit] gDevice nil": make sure Metal is initialised (gDevice/gQueue) BEFORE JIT.
       if not ensureJitDeviceReady():
@@ -1069,19 +1079,19 @@ else:
   ## metal_shim.h/.m on the include path. Compiles "successfully" but does
   ## nothing - every kernel stays on the interpret tier (session_vm_dispatch also stubs
   ## sessionPipeline/... = true in its else branch).
-  proc metalJitCompileAvailable*: bool = false
-  proc tryMetalJitCompile*(source, kernelName: string): bool = false
+  proc metalJitCompileAvailable*: bool  {.apiHooked.}= false
+  proc tryMetalJitCompile*(source, kernelName: string): bool {.apiHooked.} = false
 
 # ── Main API: run a program through the cache + JIT ──────────────────
 
-proc noteHit*(cache: var JitCache; key: string): var CompiledEntry =
+proc noteHit*(cache: var JitCache; key: string): var CompiledEntry {.apiHooked.} =
   if key notin cache.entries:
     cache.entries[key] = CompiledEntry(tier: tierInterpret, hitCount: 0,
                                         kernelName: "micro_vm_kernel")
   cache.entries[key].hitCount.inc
   result = cache.entries[key]
 
-proc maybeJit*(cache: var JitCache; p: VmProgram; key: string): CompiledEntry =
+proc maybeJit*(cache: var JitCache; p: VmProgram; key: string): CompiledEntry {.apiHooked.} =
   ## Call before each run. When hot enough and Metal JIT is on → compile + move to tierCompiled.
   var e = cache.noteHit(key)
   if e.tier == tierCompiled:
@@ -1125,36 +1135,44 @@ proc maybeJit*(cache: var JitCache; p: VmProgram; key: string): CompiledEntry =
 ## Bytecode hashes are memoized by their complete word sequence in gWordsKey.
 ## A tag is a readable namespace, not proof that programs with that tag match.
 
-proc dispatchProgramTagged*(cache: var JitCache; p: VmProgram; tag: string): string =
+proc dispatchProgramTagged*(cache: var JitCache; p: VmProgram; tag: string): string {.apiHooked.} =
   ## Always include the full program hash. The old tag-only cache was unsound:
   ## equal-shape kernels with different embedded buffer offsets could silently
   ## reuse a pipeline compiled for the first layout.
-  let key = programKey(p, tag)
-  result = cache.maybeJit(p, key).kernelName
+  var activeProgram = p
+  applyMicroKernelHooks(tag, activeProgram)
+  let key = programKey(activeProgram, tag)
+  result = cache.maybeJit(activeProgram, key).kernelName
 
-proc dispatchProgramNoSession*(cache: var JitCache; p: VmProgram; tag = ""): string =
+proc dispatchProgramNoSession*(cache: var JitCache; p: VmProgram; tag = ""): string {.apiHooked.} =
   ## Like dispatchProgram but never opens a session to hash -> usable INSIDE an open session
   ## (encodeMicroVm/encodeVm while encoding). JIT compile (when hot) needs no session.
-  let key = programKeyNoSession(p, tag)
-  cache.maybeJit(p, key).kernelName
+  var activeProgram = p
+  applyMicroKernelHooks(tag, activeProgram)
+  let key = programKeyNoSession(activeProgram, tag)
+  cache.maybeJit(activeProgram, key).kernelName
 
-proc dispatchProgram*(cache: var JitCache; p: VmProgram; tag = ""): string =
+proc dispatchProgram*(cache: var JitCache; p: VmProgram; tag = ""): string {.apiHooked.} =
   ## Returns the kernel name for sessionPipeline.
   ## tierCompiled → the JIT kernel; otherwise micro_vm_kernel.
-  let key = programKey(p, tag)
-  let e = cache.maybeJit(p, key)
+  var activeProgram = p
+  applyMicroKernelHooks(tag, activeProgram)
+  let key = programKey(activeProgram, tag)
+  let e = cache.maybeJit(activeProgram, key)
   result = e.kernelName
 
 # ── Vulkan GLSL helpers (multi-buffer inference path) ─────────
 
-proc kernelNameFor*(cache: var JitCache; p: VmProgram; tag: string): string =
+proc kernelNameFor*(cache: var JitCache; p: VmProgram; tag: string): string {.apiHooked.} =
   ## Compile GLSL, cache SPIR-V name, return kernelName. No dispatch.
   ## Used at prepare time so hot-path encode only looks up cached source.
-  let key = programKeyNoSession(p, tag)
+  var activeProgram = p
+  applyMicroKernelHooks(tag, activeProgram)
+  let key = programKeyNoSession(activeProgram, tag)
   var e = cache.noteHit(key)
   if e.glslSource.len == 0 or e.kernelName == "micro_vm_kernel" or e.kernelName.len == 0:
     let kname = "jit_vk_" & key
-    let src = lowerBytecodeToGlsl(p, kname)
+    let src = lowerBytecodeToGlsl(activeProgram, kname)
     e.glslSource = src
     e.kernelName = kname
     e.tier = tierCompiled
@@ -1164,7 +1182,7 @@ proc kernelNameFor*(cache: var JitCache; p: VmProgram; tag: string): string =
     # The cache-hit branch has its own elif below (same BYBY_VULKAN_JIT_VERBOSE gate).
     if getEnv("BYBY_VULKAN_JIT_VERBOSE", "0") == "1":
       stderr.writeLine "[vulkan_jit] kernelNameFor tag=" & tag &
-        " kernel=" & kname & " srcBytes=" & $src.len & " words=" & $p.words.len
+        " kernel=" & kname & " srcBytes=" & $src.len & " words=" & $activeProgram.words.len
     if getEnv("BYBY_JIT_DUMP_SOURCE", "0") == "1":
       stderr.writeLine "════ [vulkan_jit] GLSL source kernel=" & kname & " ════"
       stderr.writeLine src
@@ -1175,13 +1193,13 @@ proc kernelNameFor*(cache: var JitCache; p: VmProgram; tag: string): string =
       " kernel=" & e.kernelName
   result = e.kernelName
 
-proc glslSourceFor*(cache: var JitCache; p: VmProgram; tag: string): string =
+proc glslSourceFor*(cache: var JitCache; p: VmProgram; tag: string): string {.apiHooked.} =
   ## Return GLSL source string for program (generate + cache if needed).
   let key = programKeyNoSession(p, tag)
   discard cache.kernelNameFor(p, tag)
   result = cache.entries[key].glslSource
 
-proc cachedGlslSource*(cache: var JitCache; kernelName: string): string =
+proc cachedGlslSource*(cache: var JitCache; kernelName: string): string {.apiHooked.} =
   ## Lookup GLSL source by kernel name (after kernelNameFor has run once).
   for e in cache.entries.values:
     if e.kernelName == kernelName:
@@ -1214,7 +1232,7 @@ proc mergeParts(dst: var VmProgram; parts: openArray[VmProgram]; i: int) =
   dst.mergePart(parts[i], 0, i < parts.high)
   dst.mergeParts(parts, i + 1)
 
-proc mergePrograms*(parts: openArray[VmProgram]): VmProgram =
+proc mergePrograms*(parts: openArray[VmProgram]): VmProgram {.apiHooked.} =
   ## Merges several .bvm files into one that runs in a single dispatch (mid-program HALTs dropped).
   result.mergeParts(parts, 0)
   if result.words.len == 0 or (result.words[^1] and 0xFF'u32) != OP_HALT:

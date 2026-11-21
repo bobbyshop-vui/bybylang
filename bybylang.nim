@@ -36,7 +36,8 @@ import ./micro_kernel
 import ./backends/metal/metal_backend
 import ./backends/vulkan/vulkan_driver
 import ./diag as dg
-export gpubackend, micro_kernel, metal_backend, vulkan_driver
+import ./probe
+export gpubackend, micro_kernel, metal_backend, vulkan_driver, probe
 
 # --------------------------
 # Traceback system - LUÔN BẬT, IN RA TERMINAL
@@ -52,7 +53,7 @@ proc currentTime(): string =
   let t = getTime()
   return format(t, "HH:mm:ss")
 
-proc trace*(level: TraceLevel, msg: string, file: string = "", line: int = 0) =
+proc trace*(level: TraceLevel, msg: string, file: string = "", line: int = 0) {.apiHooked.} =
   if not gTraceEnabled: return
   if level < gTraceLevel: return
   
@@ -67,10 +68,10 @@ proc trace*(level: TraceLevel, msg: string, file: string = "", line: int = 0) =
   
   echo prefix & " " & currentTime() & " " & loc & ":" & $ln & " - " & msg
 
-proc traceDebug*(msg: string) = trace(tlDebug, msg)
-proc traceInfo*(msg: string) = trace(tlInfo, msg)
-proc traceWarn*(msg: string) = trace(tlWarn, msg)
-proc traceError*(msg: string) = trace(tlError, msg)
+proc traceDebug*(msg: string) {.apiHooked.} = trace(tlDebug, msg)
+proc traceInfo*(msg: string) {.apiHooked.} = trace(tlInfo, msg)
+proc traceWarn*(msg: string) {.apiHooked.} = trace(tlWarn, msg)
+proc traceError*(msg: string) {.apiHooked.} = trace(tlError, msg)
 
 # --------------------------
 # Helpers
@@ -91,7 +92,7 @@ proc parseIntSafe(s: string): int =
 # like the old branches of genGpuLine) - used by the newly added ops.
 # e.g. rhsParts = ["Y", "n", "10", "p", "0.5", "seed", "42"],
 # findNamedParam(rhsParts, "p", "0.0") -> "0.5"
-proc findNamedParam*(parts: seq[string], key: string, default: string): string =
+proc findNamedParam*(parts: seq[string], key: string, default: string): string {.apiHooked.} =
   for i in 0..<parts.len:
     if parts[i] == key and i+1 < parts.len:
       return parts[i+1]
@@ -320,8 +321,10 @@ proc isBlockHeader(line: string): bool =
 
 proc executeMicroKernel*(backend: GpuBackend; kernelName: string;
     program: VmProgram; inputValues: seq[float32]; outputElems, nThreads,
-    tgSize: int): seq[float32] =
+    tgSize: int): seq[float32] {.apiHooked.} =
   ## Compile and run a BybyLang bytecode program inside one backend session.
+  var activeProgram = program
+  applyMicroKernelHooks(kernelName, activeProgram)
   let selected = case backend
     of gbAuto: detectBackend()
     of gbCuda: gbVulkan
@@ -331,7 +334,7 @@ proc executeMicroKernel*(backend: GpuBackend; kernelName: string;
     var outv = newSeq[float32](outputElems)
     if nThreads <= 0 or tgSize <= 0 or tgSize > nThreads:
       raise newException(ValueError, "micro kernel needs positive output, threads and group sizes")
-    if not cpu.vmRun(program.words, outv, inputValues, nThreads, 0, tgSize):
+    if not cpu.vmRun(activeProgram.words, outv, inputValues, nThreads, 0, tgSize):
       raise newException(ValueError, "CPU micro kernel failed: " & cpu.cpuLastErrorMessage())
     return outv
   if selected notin {gbMetal, gbVulkan}:
@@ -343,8 +346,8 @@ proc executeMicroKernel*(backend: GpuBackend; kernelName: string;
 
   if not isVulkan:
     doAssert ensureGpuInit(selected), "micro-kernel: backend initialization failed"
-  let source = if isVulkan: lowerBytecodeToGlsl(program, kernelName)
-               else: lowerBytecodeToMetal(program, kernelName)
+  let source = if isVulkan: lowerBytecodeToGlsl(activeProgram, kernelName)
+               else: lowerBytecodeToMetal(activeProgram, kernelName)
   if not isVulkan:
     doAssert tryMetalJitCompile(source, kernelName),
       "micro-kernel: Metal JIT compilation failed"
@@ -472,7 +475,7 @@ proc tranPulse(pin: int, width: string) =
 #   gpu embedding TABLE, INDICES -> Y vocab V dim D
 #   gpu attention Q, K, V -> O, S_MATRIX B H S D scale SCALE
 #   gpu attention_backward Q, K, V, S_MATRIX, DY -> DQ, DK, DV B H S D scale SCALE
-proc genGpuLine*(line: string): seq[string] =
+proc genGpuLine*(line: string): seq[string] {.apiHooked.} =
   traceDebug("Parsing GPU line: " & line)
   result = @[]
   let rest = line[3..^1].strip()

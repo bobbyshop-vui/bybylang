@@ -30,21 +30,21 @@ when defined(macosx):
   proc metal_enc_max_tg_threads(): cint {.
     importc: "metal_enc_max_tg_threads", header: "metal_shim.h".}
 
-  proc sessionPipeline*(kernelName: string): bool =
+  proc sessionPipeline*(kernelName: string): bool  {.apiHooked.}=
     result = metal_enc_pipeline(kernelName.cstring) != 0
     if result and unlikely(firProbeOn): probeEncoderPipeline(kernelName, "metal")
 
-  proc sessionBindBuffer*(index: int; buf: MetalBufferHandle; offsetBytes = 0): bool =
+  proc sessionBindBuffer*(index: int; buf: MetalBufferHandle; offsetBytes = 0): bool  {.apiHooked.}=
     result = metal_enc_bind_buffer(index.cint, buf, offsetBytes.cint) != 0
     if result and unlikely(firProbeOn): probeEncoderBind(index, buf, max(0, offsetBytes))
 
-  proc sessionBindInt*(index: int; v: int): bool =
+  proc sessionBindInt*(index: int; v: int): bool  {.apiHooked.}=
     metal_enc_bind_int(index.cint, v.cint) != 0
 
-  proc sessionBindFloat*(index: int; v: float32): bool =
+  proc sessionBindFloat*(index: int; v: float32): bool  {.apiHooked.}=
     metal_enc_bind_float(index.cint, v.cfloat) != 0
 
-  proc sessionDispatch*(nThreads: int; tgSize = 0): bool =
+  proc sessionDispatch*(nThreads: int; tgSize = 0): bool  {.apiHooked.}=
     ## Every current micro-VM dispatch may write a buffer that the next
     ## dispatch reads (Mamba state stages, Linear++ state/projection, GEMV and
     ## LoRA). Metal preserves command order but Intel GPUs need an explicit
@@ -59,14 +59,14 @@ when defined(macosx):
       probeEncoderDispatch(nThreads, actualTg)
     metal_enc_barrier() != 0
 
-  proc sessionBarrier*(): bool =
+  proc sessionBarrier*(): bool  {.apiHooked.}=
     metal_enc_barrier() != 0
 
-  proc sessionSetThreadgroupBytes*(index: int; nBytes: int): bool =
+  proc sessionSetThreadgroupBytes*(index: int; nBytes: int): bool  {.apiHooked.}=
     result = metal_enc_set_threadgroup_bytes(index.cint, nBytes.cint) != 0
     if result and unlikely(firProbeOn): probeEncoderTgBytes(nBytes)
 
-  proc sessionSimdWidth*(): int =
+  proc sessionSimdWidth*(): int  {.apiHooked.}=
     ## NEW: reads the REAL threadExecutionWidth of the bound pipeline
     ## (sessionPipeline() must have run) - used to dispatch the right number of
     ## threads/simdgroups instead of hardcoding 32 (see the full explanation in
@@ -74,7 +74,7 @@ when defined(macosx):
     ## sessionPipeline(name), before dispatch.
     int(metal_enc_simd_width())
 
-  proc sessionMaxTgThreads*(): int =
+  proc sessionMaxTgThreads*(): int  {.apiHooked.}=
     ## NEW (fix for garbage-token bug #9): reads the REAL maxTotalThreadsPerThreadgroup of
     ## the bound pipeline. Metal does NOT allow a threadgroup larger than this;
     ## metal_enc_dispatch_threads SILENTLY lowers tgSize to maxTG if we ask for
@@ -85,39 +85,39 @@ when defined(macosx):
 
 else:
   type MetalBufferHandle* = pointer
-  proc sessionPipeline*(kernelName: string): bool = true
-  proc sessionBindBuffer*(index: int; buf: pointer; offsetBytes = 0): bool = true
-  proc sessionBindInt*(index: int; v: int): bool = true
-  proc sessionBindFloat*(index: int; v: float32): bool = true
-  proc sessionDispatch*(nThreads: int; tgSize = 0): bool = true
-  proc sessionBarrier*(): bool = true
-  proc sessionSetThreadgroupBytes*(index: int; nBytes: int): bool = true
-  proc sessionSimdWidth*(): int = 32
-  proc sessionMaxTgThreads*(): int = 1024
+  proc sessionPipeline*(kernelName: string): bool  {.apiHooked.}= true
+  proc sessionBindBuffer*(index: int; buf: pointer; offsetBytes = 0): bool  {.apiHooked.}= true
+  proc sessionBindInt*(index: int; v: int): bool  {.apiHooked.}= true
+  proc sessionBindFloat*(index: int; v: float32): bool  {.apiHooked.}= true
+  proc sessionDispatch*(nThreads: int; tgSize = 0): bool  {.apiHooked.}= true
+  proc sessionBarrier*(): bool  {.apiHooked.}= true
+  proc sessionSetThreadgroupBytes*(index: int; nBytes: int): bool  {.apiHooked.}= true
+  proc sessionSimdWidth*(): int  {.apiHooked.}= 32
+  proc sessionMaxTgThreads*(): int  {.apiHooked.}= 1024
 
 # ── Vulkan multi-buffer session wrappers (available on all platforms) ──
 # Inference encode path: pipeline → bind × N → dispatch, parallel to Metal.
 # Relative path inside vendor/bybylang: micro_kernel → backends/vulkan
 import ../backends/vulkan/vulkan_driver as vkDrv
 
-proc sessionPipelineVk*(name, glslSrc: string): bool =
+proc sessionPipelineVk*(name, glslSrc: string): bool  {.apiHooked.}=
   result = vkDrv.vulkanJitBegin(name, glslSrc)
   if result and unlikely(firProbeOn): probeEncoderPipeline(name, "vulkan")
 
-proc sessionBindBufferVk*(idx: int; buf: vkDrv.VulkanBufferHandle; offElems = 0): bool =
+proc sessionBindBufferVk*(idx: int; buf: vkDrv.VulkanBufferHandle; offElems = 0): bool  {.apiHooked.}=
   result = vkDrv.vulkanBindBuf(idx, buf, offElems)
   if result and unlikely(firProbeOn):
     probeEncoderBind(idx, cast[pointer](buf.buf), offElems*4, int(buf.sizeBytes))
 
-proc sessionDispatchVk*(nThreads, tgSize: int; tgBytes = 0): bool =
+proc sessionDispatchVk*(nThreads, tgSize: int; tgBytes = 0): bool  {.apiHooked.}=
   result = vkDrv.vulkanKernelDispatch(nThreads, tgSize, tgBytes)
   if result and unlikely(firProbeOn): probeEncoderDispatch(nThreads, tgSize, tgBytes)
 
-proc sessionSetThreadgroupBytesVk*(index, nBytes: int): bool =
+proc sessionSetThreadgroupBytesVk*(index, nBytes: int): bool  {.apiHooked.}=
   result = vkDrv.vulkanSetThreadgroupBytes(index, nBytes)
   if result and unlikely(firProbeOn): probeEncoderTgBytes(nBytes)
 
-proc sessionMaxTgThreadsVk*(): int =
+proc sessionMaxTgThreadsVk*(): int  {.apiHooked.}=
   vkDrv.vulkanMaxTgThreads()
 
 # ════════════════════════════════════════════════════════════════════
@@ -125,7 +125,7 @@ proc sessionMaxTgThreadsVk*(): int =
 # The native shims stay separate; this layer keeps encodeVm / encodeVmKernel free of if-chains.
 # ════════════════════════════════════════════════════════════════════
 
-proc sessionEncPipeline*(isVulkan: bool; name: string; glslSrc = ""): bool =
+proc sessionEncPipeline*(isVulkan: bool; name: string; glslSrc = ""): bool  {.apiHooked.}=
   ## Vulkan REQUIRES glslSrc; Metal only needs the name of an already JIT-compiled pipeline.
   if isVulkan:
     if glslSrc.len == 0: return false
@@ -135,7 +135,7 @@ proc sessionEncPipeline*(isVulkan: bool; name: string; glslSrc = ""): bool =
 proc sessionEncBindVkOrMetal*(isVulkan: bool; idx: int;
                               metalBuf: pointer;
                               vkBuf: vkDrv.VulkanBufferHandle;
-                              offElems = 0): bool =
+                              offElems = 0): bool  {.apiHooked.}=
   ## Metal: offset = offElems * 4 (byte). Vulkan: offElems (float index).
   if isVulkan:
     return sessionBindBufferVk(idx, vkBuf, offElems)
@@ -144,16 +144,16 @@ proc sessionEncBindVkOrMetal*(isVulkan: bool; idx: int;
   else:
     return true
 
-proc sessionEncDispatch*(isVulkan: bool; nThreads, tgSize: int; tgBytes = 0): bool =
+proc sessionEncDispatch*(isVulkan: bool; nThreads, tgSize: int; tgBytes = 0): bool  {.apiHooked.}=
   if isVulkan:
     return sessionDispatchVk(nThreads, tgSize, tgBytes)
   sessionDispatch(nThreads, tgSize)
 
-proc sessionEncMaxTg*(isVulkan: bool): int =
+proc sessionEncMaxTg*(isVulkan: bool): int  {.apiHooked.}=
   if isVulkan: return sessionMaxTgThreadsVk()
   sessionMaxTgThreads()
 
-proc sessionEncTgBytes*(isVulkan: bool; index, nBytes: int): bool =
+proc sessionEncTgBytes*(isVulkan: bool; index, nBytes: int): bool  {.apiHooked.}=
   if isVulkan: return sessionSetThreadgroupBytesVk(index, nBytes)
   sessionSetThreadgroupBytes(index, nBytes)
 

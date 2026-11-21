@@ -759,15 +759,15 @@ proc ensureInit() =
       else: "unknown")
   stderr.writeLine "[vulkan] Initialised: instance+device+queue+commandPool ready (queueFamily=" & $gQueueFamilyIndex & ")"
 
-proc vulkanDeviceCaps*(): VulkanCaps =
+proc vulkanDeviceCaps*(): VulkanCaps  {.apiHooked.}=
   ensureInit()
   gDeviceCaps
 
-proc vulkanTensorCoreAvailable*(): bool =
+proc vulkanTensorCoreAvailable*(): bool  {.apiHooked.}=
   ensureInit()
   gCoopEnabled
 
-proc vulkanTensorCoreRequired*(): bool =
+proc vulkanTensorCoreRequired*(): bool  {.apiHooked.}=
   ## True when every prefill GEMM (M > 1) must run on the tensor cores.
   ensureInit()
   gCoopRequired
@@ -856,7 +856,7 @@ proc readFromBuffer(mem: VkDeviceMemory, data: pointer, sizeBytes: uint64) =
 #
 #     glslangValidator -V kernels/vecadd.comp -o kernels/vecadd.spv
 # ---------------------------------------------------------------------
-proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32] =
+proc vulkanVecAddTest*(a, b: seq[float32]): seq[float32]  {.apiHooked.}=
   ensureInit()
   gpuCheck(a.len == b.len, "vulkanVecAddTest: a and b must have the same length")
   let n = a.len
@@ -1010,7 +1010,7 @@ const MMQ4_NDST = 2  # CHANGED: 8 -> 2 (mirrors the MEASURED Metal result -
   # results/crash. NOT YET RUN ON A REAL VULKAN GPU.
 
 proc vulkanMatmulQ4*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
-                      M, K, N, groupSize, nGroupsPerRow: int): seq[float32] =
+                      M, K, N, groupSize, nGroupsPerRow: int): seq[float32]  {.apiHooked.}=
   ensureInit()
   let bytesA = uint64(a.len * sizeof(float32))
   let bytesWq = uint64(wq.len * sizeof(uint8))
@@ -1283,9 +1283,9 @@ var gVkQueueSubmitSeconds, gVkFenceWaitSeconds, gVkCleanupSeconds = 0.0
 var gVkSessionEnds, gVkQueueSubmits = 0
 var gVkDispatches, gVkBarriers, gVkCopies, gVkDescriptorSets = 0
 
-proc vulkanSessionGpuSeconds*(): float = gVkGpuSecondsTotal
+proc vulkanSessionGpuSeconds*(): float  {.apiHooked.}= gVkGpuSecondsTotal
 
-proc vulkanSessionSetTimestamps*(on: bool): bool =
+proc vulkanSessionSetTimestamps*(on: bool): bool  {.apiHooked.}=
   ## Times every following non-recorded session with device timestamps (summed into
   ## vulkanSessionGpuSeconds). Returns false when the queue has no usable timestamps.
   gVkForceTimestamps = on
@@ -1293,7 +1293,7 @@ proc vulkanSessionSetTimestamps*(on: bool): bool =
     gDeviceCaps.properties.limits.timestampComputeAndGraphics != 0 and
     gDeviceCaps.properties.limits.timestampPeriod > 0
 
-proc vulkanSessionTimingReset*() =
+proc vulkanSessionTimingReset*()  {.apiHooked.}=
   gVkStatsEnabled = true
   gVkGpuSecondsTotal = 0.0
   gVkEndCommandSeconds = 0.0
@@ -1308,7 +1308,7 @@ proc vulkanSessionTimingReset*() =
   gVkCopies = 0
   gVkDescriptorSets = 0
 
-proc vulkanSessionTimingReport*(steps: int): string =
+proc vulkanSessionTimingReport*(steps: int): string  {.apiHooked.}=
   if not gVkStatsEnabled: return ""
   let n = float(max(1, steps))
   result = "sessions=" & formatFloat(float(gVkSessionEnds) / n, ffDecimal, 1) &
@@ -1492,7 +1492,7 @@ proc stagedRead(src: VulkanBufferHandle; data: pointer; bytes: uint64) =
 var gVkCompileSeconds = 0.0
   ## Wall seconds spent in glslc and pipeline creation (cache misses only).
 
-proc vulkanCompileSeconds*(): float =
+proc vulkanCompileSeconds*(): float  {.apiHooked.}=
   ## Total shader compile time so far, so throughput can be reported without it.
   gVkCompileSeconds
 
@@ -1663,7 +1663,7 @@ var gSessionRecording = false
 var gRecordings: seq[VulkanRecording] = @[]
 var gLastRecording = -1
 
-proc vulkanSessionBegin*(reusable = false): bool =
+proc vulkanSessionBegin*(reusable = false): bool  {.apiHooked.}=
   ensureInit()
   if gSessionActive: return false
   # A failed sessionEnd() can leave submitted command buffers behind.
@@ -1709,7 +1709,7 @@ proc vulkanSessionBegin*(reusable = false): bool =
   gSessionActive = true
   result = true
 
-proc vulkanSessionEnd*(): bool =
+proc vulkanSessionEnd*(): bool  {.apiHooked.}=
   if not gSessionActive: return false
   gSessionActive = false
   let recording = gSessionRecording
@@ -1819,9 +1819,9 @@ proc vulkanSessionEnd*(): bool =
     gVkCleanupSeconds += float((getMonoTime() - cleanupStart).inNanoseconds) / 1e9
   result = waitOk
 
-proc vulkanGetLastError*(): string = gVkLastError
+proc vulkanGetLastError*(): string  {.apiHooked.}= gVkLastError
 
-proc vulkanSessionCommitContinue*(): bool =
+proc vulkanSessionCommitContinue*(): bool  {.apiHooked.}=
   ## Equivalent of metalSessionCommitContinue: submits the commands recorded so far WITHOUT
   ## waiting and keeps encoding the same session into a new command buffer, so the GPU runs
   ## while the host encodes the rest. Every dispatch ends with a pipeline barrier, and a barrier
@@ -1871,7 +1871,7 @@ proc vulkanSessionCommitContinue*(): bool =
     return false
   result = true
 
-proc vulkanRecoverQueue*(): bool =
+proc vulkanRecoverQueue*(): bool  {.apiHooked.}=
   ## Vulkan has no "poisoned queue" like MTLCommandQueue. If a session is stuck
   ## (gSessionActive = true after an error), drop it so the next session can open. Returns true = ready.
   discard releaseInflight()
@@ -1900,7 +1900,7 @@ proc vulkanRecoverQueue*(): bool =
     gSessionStaging.setLen(0)
   result = true
 
-proc vulkanSessionUpload*(data: seq[float32]): VulkanBufferHandle =
+proc vulkanSessionUpload*(data: seq[float32]): VulkanBufferHandle  {.apiHooked.}=
   defer:
     if unlikely(firProbeOn) and data.len > 0:
       probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len*4)
@@ -1916,7 +1916,7 @@ proc vulkanSessionUpload*(data: seq[float32]): VulkanBufferHandle =
     uploadToBuffer(mem, addr dataVar[0], bytes)
   result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: bytes)
 
-proc vulkanSessionAllocScratch*(n: int): VulkanBufferHandle =
+proc vulkanSessionAllocScratch*(n: int): VulkanBufferHandle  {.apiHooked.}=
   ## Caller owns the handle: free with vulkanSessionFree AFTER sessionEnd
   ## (or registerInternalScratch if it is a throwaway dummy for this session).
   ensureInit()
@@ -1928,13 +1928,13 @@ proc vulkanSessionAllocScratch*(n: int): VulkanBufferHandle =
   let (buf, mem) = createHostVisibleBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
   result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: bytes)
 
-proc registerInternalScratch*(h: VulkanBufferHandle) =
+proc registerInternalScratch*(h: VulkanBufferHandle)  {.apiHooked.}=
   ## multiBuf dummy only — destroyed in vulkanSessionEnd. Do not register
   ## buffers the caller still reads after End.
   if gSessionActive:
     gSessionInternalBufs.add(h)
 
-proc vulkanSessionRead*(h: VulkanBufferHandle, n: int): seq[float32] =
+proc vulkanSessionRead*(h: VulkanBufferHandle, n: int): seq[float32]  {.apiHooked.}=
   ## ONLY call AFTER vulkanSessionEnd() has completed (fence waited) - reading
   ## in the middle of an uncommitted session gives garbage/stale data (lesson from Metal).
   result = newSeq[float32](n)
@@ -1942,7 +1942,7 @@ proc vulkanSessionRead*(h: VulkanBufferHandle, n: int): seq[float32] =
     if h.deviceOnly: stagedRead(h, addr result[0], uint64(n * sizeof(float32)))
     else: readFromBuffer(h.mem, addr result[0], uint64(n * sizeof(float32)))
 
-proc vulkanSessionFree*(h: var VulkanBufferHandle) =
+proc vulkanSessionFree*(h: var VulkanBufferHandle)  {.apiHooked.}=
   if gSessionActive and (h.buf != nil or h.mem != nil):
     gSessionDeferredFree.add(h)   # may still be referenced by the command buffer being recorded -> deferred destroy
     h.buf = nil
@@ -1953,7 +1953,7 @@ proc vulkanSessionFree*(h: var VulkanBufferHandle) =
   h.mem = nil
 
 proc vulkanSessionCopyInto*(src: VulkanBufferHandle, dst: var VulkanBufferHandle,
-                             srcOffsetElems, dstOffsetElems, n: int): bool =
+                             srcOffsetElems, dstOffsetElems, n: int): bool  {.apiHooked.}=
   if not gSessionActive: return false
   # Barriers are recorded lazily: a KV append is 4*HKV copies per layer, and
   # a barrier pair around each one stalled the GPU thousands of times a token.
@@ -1961,11 +1961,11 @@ proc vulkanSessionCopyInto*(src: VulkanBufferHandle, dst: var VulkanBufferHandle
     uint64(dstOffsetElems * sizeof(float32)), uint64(n * sizeof(float32)))
   result = true
 
-proc vulkanLastRecording*(): int =
+proc vulkanLastRecording*(): int  {.apiHooked.}=
   ## The recording the last vulkanSessionEnd kept (a session begun reusable), else -1.
   gLastRecording
 
-proc vulkanReplay*(id: int): bool =
+proc vulkanReplay*(id: int): bool  {.apiHooked.}=
   ## Submits a kept recording again and waits for it, outside any session. The buffers it
   ## references keep their handles, so it reads whatever the host wrote into them since.
   if gSessionActive or id < 0 or id >= gRecordings.len or gRecordings[id].cmd == nil:
@@ -1991,7 +1991,7 @@ proc vulkanReplay*(id: int): bool =
   if gVkStatsEnabled and result: inc gVkQueueSubmits
   lib.vkDestroyFence(gDevice, fence, nil)
 
-proc vulkanFreeRecording*(id: int) =
+proc vulkanFreeRecording*(id: int)  {.apiHooked.}=
   if id < 0 or id >= gRecordings.len or gRecordings[id].cmd == nil:
     return
   var cmd = gRecordings[id].cmd
@@ -2000,25 +2000,25 @@ proc vulkanFreeRecording*(id: int) =
     lib.vkDestroyDescriptorPool(gDevice, p, nil)
   gRecordings[id] = VulkanRecording()
 
-proc vulkanHostBuffer*(n: int; readback = false): VulkanBufferHandle =
+proc vulkanHostBuffer*(n: int; readback = false): VulkanBufferHandle  {.apiHooked.}=
   ## A host-visible, persistently mapped buffer of n floats: the host writes or reads it
   ## directly (vulkanHostWrite / vulkanHostRead) and sessions copy into or out of it.
   ensureInit()
   acquirePooled(if readback: pkReadback else: pkUpload, uint64(max(n, 1) * sizeof(float32)))
 
-proc vulkanHostWrite*(h: VulkanBufferHandle; data: openArray[float32]): bool =
+proc vulkanHostWrite*(h: VulkanBufferHandle; data: openArray[float32]): bool  {.apiHooked.}=
   if h.mapped == nil or uint64(data.len * sizeof(float32)) > h.sizeBytes: return false
   if data.len > 0: copyMem(h.mapped, unsafeAddr data[0], data.len * sizeof(float32))
   result = true
 
-proc vulkanHostRead*(h: VulkanBufferHandle; n: int): seq[float32] =
+proc vulkanHostRead*(h: VulkanBufferHandle; n: int): seq[float32]  {.apiHooked.}=
   ## The host view of a vulkanHostBuffer; a session that wrote it must have recorded
   ## vulkanSessionHostReadBarrier after the write and have completed.
   if h.mapped == nil or uint64(n * sizeof(float32)) > h.sizeBytes: return @[]
   result = newSeq[float32](n)
   if n > 0: copyMem(addr result[0], h.mapped, n * sizeof(float32))
 
-proc vulkanSessionHostReadBarrier*(): bool =
+proc vulkanSessionHostReadBarrier*(): bool  {.apiHooked.}=
   ## Makes the transfers recorded so far visible to host reads once the session completes.
   if not gSessionActive: return false
   var b = VkMemoryBarrier(sType: VK_STRUCTURE_TYPE_MEMORY_BARRIER, pNext: nil,
@@ -2058,7 +2058,7 @@ proc uploadResidentData(data: pointer; nBytes: uint64): VulkanBufferHandle =
     vulkanSessionFree(result)
     raise newException(CatchableError, "resident Vulkan upload failed: " & gVkLastError)
 
-proc vulkanImportHostBuffer*(data: pointer; bytes: int): VulkanBufferHandle =
+proc vulkanImportHostBuffer*(data: pointer; bytes: int): VulkanBufferHandle  {.apiHooked.}=
   defer:
     if unlikely(firProbeOn): probeUploaded(cast[pointer](result.buf), data, bytes)
   ## Storage buffer over caller memory (a model mmap) without copying, on an
@@ -2124,7 +2124,7 @@ proc vulkanImportHostBuffer*(data: pointer; bytes: int): VulkanBufferHandle =
       continue
     return VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: uint64(bytes))
 
-proc vulkanImportHostRange*(data: pointer; bytes: int): tuple[h: VulkanBufferHandle, offset: int] =
+proc vulkanImportHostRange*(data: pointer; bytes: int): tuple[h: VulkanBufferHandle, offset: int]  {.apiHooked.}=
   ## vulkanImportHostBuffer for data at any address inside a mapping (a tensor
   ## in an unaligned .nimq): the buffer starts at the enclosing import-aligned
   ## address and `offset` is the byte position of `data` inside it. Kernels
@@ -2137,13 +2137,13 @@ proc vulkanImportHostRange*(data: pointer; bytes: int): tuple[h: VulkanBufferHan
     result.offset + bytes)
   if result.h.buf == nil: result.offset = 0
 
-proc vulkanSessionUploadPrivate*(data: openArray[float32]): VulkanBufferHandle =
+proc vulkanSessionUploadPrivate*(data: openArray[float32]): VulkanBufferHandle  {.apiHooked.}=
   result = uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil),
     uint64(data.len * sizeof(float32)))
   if unlikely(firProbeOn) and data.len > 0:
     probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len*4)
 
-proc vulkanSessionUploadBytesPrivate*(data: openArray[uint8]): VulkanBufferHandle =
+proc vulkanSessionUploadBytesPrivate*(data: openArray[uint8]): VulkanBufferHandle  {.apiHooked.}=
   result = uploadResidentData((if data.len > 0: cast[pointer](unsafeAddr data[0]) else: nil), uint64(data.len))
   if unlikely(firProbeOn) and data.len > 0:
     probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len)
@@ -2190,7 +2190,7 @@ proc dispatchGeneric(shaderName: string, buffers: openArray[VulkanBufferHandle],
   result = true
 
 proc vulkanSessionMicroVmEnc*(code: VulkanBufferHandle, mem: VulkanBufferHandle,
-                               nThreads, tgFloats, tgSize: int): bool =
+                               nThreads, tgFloats, tgSize: int): bool  {.apiHooked.}=
   ## Bytecode interpreter counterpart to Metal's micro_vm_kernel encoder.
   ## The Vulkan shader is specialized to the exact workgroup width because
   ## threadgroup-memory reductions/scans depend on local invocation IDs.
@@ -2210,10 +2210,10 @@ var gJitSpvPaths = initTable[string, tuple[source, path: string]]()
 var gJitPathHits, gJitPathMisses, gJitDummyAllocations: int
 var gJitTempSequence: uint64
 
-proc vulkanJitCacheStats*(): tuple[pathHits, pathMisses, dummyAllocations: int] =
+proc vulkanJitCacheStats*(): tuple[pathHits, pathMisses, dummyAllocations: int]  {.apiHooked.}=
   (gJitPathHits, gJitPathMisses, gJitDummyAllocations)
 
-proc vulkanJitCacheDir*(): string =
+proc vulkanJitCacheDir*(): string  {.apiHooked.}=
   ## BYBY_VULKAN_JIT_DIR points the SPIR-V cache at persistent storage (Colab:
   ## a mounted Drive, CI: a workspace cache). The default lives in the temp
   ## dir, which a fresh container always starts empty - that is what makes the
@@ -2240,7 +2240,7 @@ proc cleanupVulkanJitTemps(paths: tuple[srcPath, spvPath: string]) =
       try: removeFile(path)
       except CatchableError: discard
 
-proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]]) =
+proc vulkanJitPrewarm*(jobs: openArray[tuple[name, source: string]])  {.apiHooked.}=
   ## Compile every shader the next phase needs concurrently. Each glslc call is
   ## a separate process, so N shaders cost about one compile instead of the
   ## sum. On a fresh container (no SPIR-V disk cache) this is the difference
@@ -2366,7 +2366,7 @@ proc compileVulkanJitShader(kernelName, source: string): string =
 
 proc vulkanSessionJitMicroVmEnc*(kernelName, source: string,
                                   mem: VulkanBufferHandle,
-                                  nThreads, tgSize: int; tgFloats = 1024): bool =
+                                  nThreads, tgSize: int; tgFloats = 1024): bool  {.apiHooked.}=
   ## One statically-lowered SPIR-V dispatch per bytecode VM program. All
   ## logical buffers currently alias the caller's unified VM scratch buffer.
   if not gSessionActive or mem.buf == nil or nThreads <= 0 or tgSize <= 0 or tgSize > gDeviceCaps.maxThreads or
@@ -2379,7 +2379,7 @@ proc vulkanSessionJitMicroVmEnc*(kernelName, source: string,
   if not result:
     stderr.writeLine "[vulkan_jit] microVm FAIL kernel=" & kernelName
 
-proc vulkanSessionVecOpEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, op, n: int): bool =
+proc vulkanSessionVecOpEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, op, n: int): bool  {.apiHooked.}=
   var pc = [int32(op), int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("vecop", [a, b, c], addr pc[0], 8, groups, 1, 1)
@@ -2450,20 +2450,20 @@ proc tiledSplitK(M, K, N: int): int =
 var gF32TiledEnabled = false
 var gF32TiledLogged = false
 
-proc vulkanSetF32GemmTiled*(enabled: bool) = gF32TiledEnabled = enabled
+proc vulkanSetF32GemmTiled*(enabled: bool)  {.apiHooked.}= gF32TiledEnabled = enabled
 
-proc vulkanCooperativeGemmEnabled*(): bool =
+proc vulkanCooperativeGemmEnabled*(): bool  {.apiHooked.}=
   ## True when prefill GEMMs will take a cooperative-matrix route, so packed
   ## scalar fallback kernels need not be compiled ahead of time.
   ensureInit()
   gFp8CoopEnabled or (gCoopEnabled and gDeviceCaps.cooperativeMatrix)
 
-proc vulkanComputeUnits*(): int =
+proc vulkanComputeUnits*(): int  {.apiHooked.}=
   ## SM (NVIDIA) or CU (AMD) count of the device, 0 when the driver does not report it.
   ensureInit()
   gDeviceCaps.computeUnits
 
-proc vulkanFixedSubgroupWidth*(): int =
+proc vulkanFixedSubgroupWidth*(): int  {.apiHooked.}=
   ## Subgroup width a generated micro-kernel may rely on (subgroups are contiguous runs of
   ## that many workgroup invocations). Only NVIDIA guarantees it: every compute subgroup is a
   ## 32-wide warp. Elsewhere the driver may pick the width per pipeline (Intel, AMD, MoltenVK),
@@ -2475,7 +2475,7 @@ proc vulkanFixedSubgroupWidth*(): int =
   else:
     0
 
-proc vulkanCoopPrewarmJobs*(): seq[tuple[name, source: string]] =
+proc vulkanCoopPrewarmJobs*(): seq[tuple[name, source: string]]  {.apiHooked.}=
   ## Cooperative GEMM shaders for vulkanJitPrewarm. They are otherwise compiled
   ## serially by glslc on the first prefill dispatch that needs them.
   ensureInit()
@@ -2586,7 +2586,7 @@ proc tryTiledCooperative(a, w, c, lut: VulkanBufferHandle; M, K, N, weightFormat
       uint32((M * N + 255) div 256), 1, 1, 256, reduceSpv)
 
 proc vulkanSessionMatmulNTTiledEnc*(a, w: VulkanBufferHandle;
-                                    c: var VulkanBufferHandle; M, K, N: int): bool =
+                                    c: var VulkanBufferHandle; M, K, N: int): bool  {.apiHooked.}=
   ## FP32 weights [N,K], FP16 MMA with FP32 accumulation (inference only).
   if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
   tryTiledCooperative(a, w, c, w, M, K, N, 0)
@@ -2649,19 +2649,19 @@ proc tryFp4TileGemm(a, w, c, lut: VulkanBufferHandle; M, K, N: int; coop: bool):
   tryTileGemm(a, w, c, lut, M, K, N, coop, TileFormatFp4Km)
 
 proc vulkanSessionFp4GemmEnc*(a, w, lut: VulkanBufferHandle;
-                              c: var VulkanBufferHandle; M, K, N: int): bool =
+                              c: var VulkanBufferHandle; M, K, N: int): bool  {.apiHooked.}=
   ## Tensor Core route of the FP4-KM tile GEMM micro-kernel; false without cooperative matrices.
   if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
   tryFp4TileGemm(a, w, c, lut, M, K, N, true)
 
 proc vulkanSessionFp4GemmTiledEnc*(a, w, lut: VulkanBufferHandle;
-                                   c: var VulkanBufferHandle; M, K, N: int): bool =
+                                   c: var VulkanBufferHandle; M, K, N: int): bool  {.apiHooked.}=
   ## Register-tiled route of the same micro-kernel (any Vulkan device).
   if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
   tryFp4TileGemm(a, w, c, lut, M, K, N, false)
 
 proc vulkanSessionF16GemmEnc*(a, w: VulkanBufferHandle; c: var VulkanBufferHandle;
-                              M, K, N: int; coop: bool): bool =
+                              M, K, N: int; coop: bool): bool  {.apiHooked.}=
   ## FP16-weight GEMM c[M, N] = a[M, K] * W^T (W halves [N, K]) through the tile GEMM
   ## micro-kernel: tensor cores when coop, register tiles otherwise.
   if c.buf == nil: c = vulkanSessionAllocScratch(M * N)
@@ -2678,7 +2678,7 @@ proc halfBitsExact(v: float32): uint16 =
 
 var gTileGemmCheck: seq[tuple[key: string, ok: bool]]
 
-proc vulkanTileGemmReady*(f16, coop: bool): bool =
+proc vulkanTileGemmReady*(f16, coop: bool): bool  {.apiHooked.}=
   ## Parity of the tile GEMM micro-kernel for one weight format and target on this device,
   ## checked once per process outside any session (it opens its own): every row tile on a
   ## shape with partial row and column tiles, on data whose products and sums are exact in FP16
@@ -2762,7 +2762,7 @@ proc vulkanTileGemmReady*(f16, coop: bool): bool =
     (if result: "ok" else: "FAILED") & " (max rel err " & formatFloat(worst, ffScientific, 2) & ")"
 
 proc vulkanSessionMatmulNTAcceleratedEnc*(a, w: VulkanBufferHandle;
-    c: var VulkanBufferHandle; M, K, N: int): bool =
+    c: var VulkanBufferHandle; M, K, N: int): bool  {.apiHooked.}=
   ## Return false when unsupported, so the caller retains exact FP32 GEMM.
   if gF32TiledEnabled and tryTiledCooperative(a, w, c, w, M, K, N, 0):
     if not gF32TiledLogged:
@@ -2771,25 +2771,25 @@ proc vulkanSessionMatmulNTAcceleratedEnc*(a, w: VulkanBufferHandle;
     return true
   tryCooperativeMatmul(a, w, c, w, w, M, K, N, 0)
 
-proc vulkanSessionRopeEnc*(x: var VulkanBufferHandle, cosT, sinT: VulkanBufferHandle, Hn, D, T: int): bool =
+proc vulkanSessionRopeEnc*(x: var VulkanBufferHandle, cosT, sinT: VulkanBufferHandle, Hn, D, T: int): bool  {.apiHooked.}=
   var pc = [int32(Hn), int32(D), int32(T)]
   let halfD = uint32(D div 2)
   dispatchGeneric("rope", [x, cosT, sinT], addr pc[0], 12,
                   (halfD + 63) div 64, uint32(Hn), uint32(T))
 
-proc vulkanSessionSoftmaxEnc*(x: VulkanBufferHandle, y: var VulkanBufferHandle, rows, cols: int): bool =
+proc vulkanSessionSoftmaxEnc*(x: VulkanBufferHandle, y: var VulkanBufferHandle, rows, cols: int): bool  {.apiHooked.}=
   var pc = [int32(cols)]
   dispatchGeneric("softmax", [x, y], addr pc[0], 4, uint32(rows), 1, 1)
 
-proc vulkanSessionRmsnormEnc*(x, gamma: VulkanBufferHandle, y: var VulkanBufferHandle, rows, cols: int, eps: float32): bool =
+proc vulkanSessionRmsnormEnc*(x, gamma: VulkanBufferHandle, y: var VulkanBufferHandle, rows, cols: int, eps: float32): bool  {.apiHooked.}=
   var pc = (cols: int32(cols), eps: eps)
   dispatchGeneric("rmsnorm", [x, gamma, y], addr pc, 8, uint32(rows), 1, 1)
 
-proc vulkanSessionLayernormEnc*(x, gamma, beta: VulkanBufferHandle, y: var VulkanBufferHandle, rows, cols: int, eps: float32): bool =
+proc vulkanSessionLayernormEnc*(x, gamma, beta: VulkanBufferHandle, y: var VulkanBufferHandle, rows, cols: int, eps: float32): bool  {.apiHooked.}=
   var pc = (cols: int32(cols), eps: eps)
   dispatchGeneric("layernorm", [x, gamma, beta, y], addr pc, 8, uint32(rows), 1, 1)
 
-proc vulkanSessionMatmulEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int): bool =
+proc vulkanSessionMatmulEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int): bool  {.apiHooked.}=
   var pc = [int32(M), int32(K), int32(N)]
   # ADDED: m==1 = GEMV - the 16x16 tile below dispatches groupY=ceil(1/16)=1,
   # i.e. only 1/16 of the invocations per workgroup produce a correct result (the same bug fixed
@@ -2803,7 +2803,7 @@ proc vulkanSessionMatmulEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle
                     (uint32(N) + TILE - 1) div TILE, (uint32(M) + TILE - 1) div TILE, 1)
 
 proc vulkanSessionMatmulNTEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHandle, M, K, N: int;
-                               bOffsetElems = 0): bool =
+                               bOffsetElems = 0): bool  {.apiHooked.}=
   ## C(M x N) = A(M x K) @ B(N x K)^T - uses the separate matmul_nt.comp shader
   ## (reads B in its natural [N,K] layout, no CPU transpose first).
   ## bOffsetElems: B starts that many floats into its buffer.
@@ -2819,14 +2819,14 @@ proc vulkanSessionMatmulNTEnc*(a, b: VulkanBufferHandle, c: var VulkanBufferHand
 include q4_autotune
 
 proc vulkanSessionAttentionFusedEnc*(q, k, v: VulkanBufferHandle, o, sMatrix: var VulkanBufferHandle,
-                                      B, H, S, D: int, scale: float32): bool =
+                                      B, H, S, D: int, scale: float32): bool  {.apiHooked.}=
   var pc = (B: int32(B), H: int32(H), S: int32(S), D: int32(D), scale: scale)
   dispatchGeneric("attention_fused", [q, k, v, o, sMatrix], addr pc, 20,
                   (uint32(B * H) + 31) div 32, (uint32(S) + 7) div 8, 1)
 
 proc vulkanSessionAttentionFusedBackwardEnc*(q, k, v, sMatrix, dy: VulkanBufferHandle,
                                               dq, dk, dv: var VulkanBufferHandle,
-                                              B, H, S, D: int, scale: float32): bool =
+                                              B, H, S, D: int, scale: float32): bool  {.apiHooked.}=
   ## Mirror of attention_fused_backward_kernel (Metal) through kernels/
   ## attention_fused_backward.comp - see the .comp file for details. Dispatches
   ## 1 thread/(bh,ti): groupCount=(B*H,S,1) with local_size=(1,1,1) in the
@@ -2836,7 +2836,7 @@ proc vulkanSessionAttentionFusedBackwardEnc*(q, k, v, sMatrix, dy: VulkanBufferH
                   uint32(B * H), uint32(S), 1)
 
 proc vulkanSessionAttentionDecodeGqaEnc*(q, k, v: VulkanBufferHandle, o, scores: var VulkanBufferHandle,
-                                          H, S, D: int, scale: float32): bool =
+                                          H, S, D: int, scale: float32): bool  {.apiHooked.}=
   ## Mirror of attention_decode_gqa_kernel.cu (CUDA)/Metal - 1 workgroup (128
   ## threads)/query head. WARNING: mirrored from the CUDA version that HAD NOT RUN ON
   ## REAL HARDWARE when written - verify with BYBY_VERIFY_ATTN_DECODE=1 (see
@@ -2853,7 +2853,7 @@ var gAttnAllHeadsBroken = false  ## true = no .spv and glslc failed -> the calle
 
 proc vulkanSessionAttentionDecodeAllHeadsEnc*(q, kAll, vAll: VulkanBufferHandle,
                                                o: var VulkanBufferHandle,
-                                               H, HKV, D, S, maxSeqLen: int): bool =
+                                               H, HKV, D, S, maxSeqLen: int): bool  {.apiHooked.}=
   ## FUSED attention decode: ALL H heads in EXACTLY one dispatch (1 workgroup/head).
   ## Mirror of attention_decode_all_heads_kernel (Metal). Returns false (does NOT raise) when it
   ## cannot run -> the caller falls back to the per-head-group loop.
@@ -2970,7 +2970,7 @@ proc flashScalarSupported(D: int): bool =
   D > 0 and D <= FlashScalarMaxD and gDeviceCaps.maxThreads >= 128 and
     gDeviceCaps.maxSharedBytes >= FlashScalarSharedBytes
 
-proc vulkanSessionKvScatterEnc*(src, dst: VulkanBufferHandle; T, HKV, D, pos, maxSeqLen: int): bool =
+proc vulkanSessionKvScatterEnc*(src, dst: VulkanBufferHandle; T, HKV, D, pos, maxSeqLen: int): bool  {.apiHooked.}=
   ## dst[h, pos + t, :] = src[t, h, :] for the T new positions (KV cache append).
   if not gSessionActive or src.buf == nil or dst.buf == nil: return false
   if T <= 0 or pos < 0 or pos + T > maxSeqLen: return false
@@ -2987,7 +2987,7 @@ proc vulkanSessionKvScatterEnc*(src, dst: VulkanBufferHandle; T, HKV, D, pos, ma
     uint32((total + 255) div 256), 1, 1, 256, spv)
 
 proc vulkanSessionKvAppendEnc*(k, v: VulkanBufferHandle;
-    kAll, vAll: var VulkanBufferHandle; HKV, D, maxSeqLen, pos: int): bool =
+    kAll, vAll: var VulkanBufferHandle; HKV, D, maxSeqLen, pos: int): bool  {.apiHooked.}=
   ## Append both FP32 KV tensors into the combined resident caches. This
   ## replaces four per-head vkCmdCopyBuffer operations per KV head (K/V into
   ## both per-head and combined caches) with two contiguous GPU scatters.
@@ -3002,7 +3002,7 @@ proc vulkanSessionKvAppendEnc*(k, v: VulkanBufferHandle;
 
 proc vulkanSessionRopeKvEnc*(q, k, v, cosT, sinT: VulkanBufferHandle;
     kAll, vAll: var VulkanBufferHandle; H, HKV, D, maxSeqLen, pos: int;
-    scale: float32): bool =
+    scale: float32): bool  {.apiHooked.}=
   ## Fuse decode RoPE(Q/K), Q scaling, and K/V append into one dispatch.
   ## This mirrors Metal's rope_kv kernel and avoids host-built per-token
   ## cosine/sine slices plus five intermediate dispatches on the scalar path.
@@ -3126,7 +3126,7 @@ proc flashParity(kind: string; D: int): tuple[ok: bool, err: float] =
     result = (false, Inf)
   vulkanSessionFree(hq); vulkanSessionFree(hk); vulkanSessionFree(hv); vulkanSessionFree(ho)
 
-proc vulkanFlashAttentionPrepare*(D: int): string =
+proc vulkanFlashAttentionPrepare*(D: int): string  {.apiHooked.}=
   ## Picks and checks the prefill flash-attention kernel for head dim D, outside
   ## any session: "coop" (tensor cores), "scalar", or "" (none passed parity;
   ## the caller keeps its old attention path). The order is tensor core, scalar
@@ -3161,7 +3161,7 @@ proc vulkanFlashAttentionPrepare*(D: int): string =
 proc vulkanSessionFlashAttentionPrefillEnc*(q, kAll, vAll: VulkanBufferHandle;
                                             o: var VulkanBufferHandle;
                                             T, H, HKV, D, pos, maxSeqLen: int;
-                                            scale: float32): bool =
+                                            scale: float32): bool  {.apiHooked.}=
   ## o[T, H, D] = causal softmax(q K^T * scale) V over cache positions
   ## 0 .. pos + T - 1. vulkanFlashAttentionPrepare(D) must have picked a kernel.
   if not gSessionActive: return false
@@ -3338,7 +3338,7 @@ proc ssdParity(kind: string; N, D, Q: int): tuple[ok: bool, err: float] =
     result = (false, Inf)
   vulkanSessionFree(hArena)
 
-proc vulkanMamba2SsdPrepare*(N, D, Q: int): string =
+proc vulkanMamba2SsdPrepare*(N, D, Q: int): string  {.apiHooked.}=
   ## Picks and parity-checks the SSD pipelines for (d_state, head dim, chunk)
   ## outside any session: "coop" (tensor cores), "scalar" (FP32 FMA tiles) or
   ## "" (unavailable; the caller keeps its scan path). BYBY_SSD=0 disables it,
@@ -3368,7 +3368,7 @@ proc vulkanMamba2SsdPrepare*(N, D, Q: int): string =
 proc vulkanSessionMamba2SsdPrefillEnc*(arena: VulkanBufferHandle;
     T, H, G, N, D, Q, C, cDim: int;
     offConv, offDt, offCum, offALog, offDSkip,
-    offYPre, offStates, offSloc: int; cont: bool): bool =
+    offYPre, offStates, offSloc: int; cont: bool): bool  {.apiHooked.}=
   ## Encodes the whole chunked SSD pass (five dispatches) into the open
   ## session. vulkanMamba2SsdPrepare(N, D, Q) must have picked a kernel.
   if not gSessionActive or arena.buf == nil: return false
@@ -3383,7 +3383,7 @@ proc vulkanSessionMamba2SsdPrefillEnc*(arena: VulkanBufferHandle;
     stderr.writeLine "[vulkan] mamba2 SSD dispatch failed: " & e.msg.splitLines()[0]
     result = false
 
-proc vulkanAvailable*(): bool =
+proc vulkanAvailable*(): bool  {.apiHooked.}=
   ## Used by detectBackend() in gpubackend.nim - tries load+init and catches errors
   ## safely (does NOT raise) when the machine has no Vulkan/MoltenVK.
   try:
@@ -3392,7 +3392,7 @@ proc vulkanAvailable*(): bool =
   except CatchableError:
     result = false
 
-proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle =
+proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle  {.apiHooked.}=
   defer:
     if unlikely(firProbeOn) and data.len > 0:
       probeUploaded(cast[pointer](result.buf), unsafeAddr data[0], data.len)
@@ -3410,7 +3410,7 @@ proc vulkanSessionUploadBytes*(data: seq[uint8]): VulkanBufferHandle =
     uploadToBuffer(mem, addr dataVar[0], bytes)
   result = VulkanBufferHandle(buf: buf, mem: mem, sizeBytes: bytes)
 
-proc vulkanSessionActivationEnc*(opCode: int, x: VulkanBufferHandle, y: var VulkanBufferHandle, n: int, p: float32 = 0'f32): bool =
+proc vulkanSessionActivationEnc*(opCode: int, x: VulkanBufferHandle, y: var VulkanBufferHandle, n: int, p: float32 = 0'f32): bool  {.apiHooked.}=
   ## The PC layout must match struct PC {int op; int n; float p;} in
   ## activation.comp (12 bytes) - only 8 bytes were pushed before (p missing), so
   ## opcode 7 (pow) on the session path never got the right exponent.
@@ -3423,30 +3423,30 @@ proc vulkanSessionActivationEnc*(opCode: int, x: VulkanBufferHandle, y: var Vulk
 # .comp shader use the GPU through the session encoder; those without their own shader
 # still use the CPU fallback according to the caller's policy.
 
-proc vulkanSessionGatherEnc*(src, idx: VulkanBufferHandle, dst: var VulkanBufferHandle, n: int): bool =
+proc vulkanSessionGatherEnc*(src, idx: VulkanBufferHandle, dst: var VulkanBufferHandle, n: int): bool  {.apiHooked.}=
   var pc = [int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("gather", [src, idx, dst], addr pc[0], 4, groups, 1, 1)
 
 proc vulkanSessionArgmaxIndexEnc*(x: VulkanBufferHandle, outVal, outIdx: var VulkanBufferHandle,
-                                   outer, dimSize, inner: int): bool =
+                                   outer, dimSize, inner: int): bool  {.apiHooked.}=
   let pairs = outer * inner
   var pc = [int32(outer), int32(dimSize), int32(inner)]
   dispatchGeneric("argmax", [x, outVal, outIdx], addr pc[0], 12, uint32(pairs), 1, 1)
 
-proc vulkanSessionCompareEnc*(a, b: VulkanBufferHandle, mask: var VulkanBufferHandle, op, n: int): bool =
+proc vulkanSessionCompareEnc*(a, b: VulkanBufferHandle, mask: var VulkanBufferHandle, op, n: int): bool  {.apiHooked.}=
   var pc = [int32(op), int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("compare", [a, b, mask], addr pc[0], 8, groups, 1, 1)
 
-proc vulkanSessionDropoutMaskEnc*(mask: var VulkanBufferHandle, seed: uint32, p: float32, n: int): bool =
+proc vulkanSessionDropoutMaskEnc*(mask: var VulkanBufferHandle, seed: uint32, p: float32, n: int): bool  {.apiHooked.}=
   let scale = if p < 1'f32: 1'f32 / (1'f32 - p) else: 0'f32
   var pc = (seed: seed, p: p, scale: scale, n: int32(n))
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("dropout_rng", [mask], addr pc, 16, groups, 1, 1)
 
 proc vulkanSessionPermuteEnc*(src: VulkanBufferHandle, dst: var VulkanBufferHandle,
-                               newStrides, oldStrides, dimsMap: seq[int32], n: int): bool =
+                               newStrides, oldStrides, dimsMap: seq[int32], n: int): bool  {.apiHooked.}=
   let ndim = newStrides.len
   doAssert ndim <= 8, "vulkanSessionPermuteEnc: rank > 8 not supported (fixed 8-entry push-constant array)"
   var pc: tuple[newStrides: array[8, int32], oldStrides: array[8, int32],
@@ -3460,34 +3460,34 @@ proc vulkanSessionPermuteEnc*(src: VulkanBufferHandle, dst: var VulkanBufferHand
   dispatchGeneric("permute", [src, dst], addr pc, uint32(sizeof(pc)), groups, 1, 1)
 
 proc vulkanSessionPermuteBufEnc*(src, newStrides, oldStrides, dimsMap: VulkanBufferHandle,
-                                  dst: var VulkanBufferHandle, ndim, n: int): bool =
+                                  dst: var VulkanBufferHandle, ndim, n: int): bool  {.apiHooked.}=
   ## Same as vulkanSessionPermuteEnc but the stride tables are uploaded index buffers.
   var pc = [int32(ndim), int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("permute_buf", [src, newStrides, oldStrides, dimsMap, dst], addr pc[0], 8, groups, 1, 1)
 
 proc vulkanSessionEmbeddingLookupEnc*(table, idx: VulkanBufferHandle, dst: var VulkanBufferHandle,
-                                       dim, numIndices: int): bool =
+                                       dim, numIndices: int): bool  {.apiHooked.}=
   let n = numIndices * dim
   var pc = [int32(dim), int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("embedding", [table, idx, dst], addr pc[0], 8, groups, 1, 1)
 
 proc vulkanSessionApfluEnc*(x: VulkanBufferHandle, y: var VulkanBufferHandle, n: int,
-                             alpha, beta: float32): bool =
+                             alpha, beta: float32): bool  {.apiHooked.}=
   var pc: tuple[alpha, beta: float32, n: int32] = (alpha, beta, int32(n))
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("apflu", [x, y], addr pc, 12, groups, 1, 1)
 
 proc vulkanSessionApfluBackwardEnc*(x, dy: VulkanBufferHandle, dx: var VulkanBufferHandle, n: int,
-                                     alpha, beta: float32): bool =
+                                     alpha, beta: float32): bool  {.apiHooked.}=
   var pc: tuple[alpha, beta: float32, n: int32] = (alpha, beta, int32(n))
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("apflu_bwd", [x, dy, dx], addr pc, 12, groups, 1, 1)
 
 proc vulkanSessionLayernormBackwardEnc*(dy, x, gamma: VulkanBufferHandle,
                                          dx, dgamma, dbeta: var VulkanBufferHandle,
-                                         rows, cols: int, eps: float32): bool =
+                                         rows, cols: int, eps: float32): bool  {.apiHooked.}=
   var stats = vulkanSessionAllocScratch(2 * rows)
   registerInternalScratch(stats)
   var pcs: tuple[rows, cols: int32, eps: float32] = (int32(rows), int32(cols), eps)
@@ -3499,18 +3499,18 @@ proc vulkanSessionLayernormBackwardEnc*(dy, x, gamma: VulkanBufferHandle,
                   uint32((cols + 63) div 64), 1, 1)
 
 proc vulkanSessionSplitSliceEnc*(src: VulkanBufferHandle, dst: var VulkanBufferHandle,
-                                  dimTotal, thisSize, offset, inner, n: int): bool =
+                                  dimTotal, thisSize, offset, inner, n: int): bool  {.apiHooked.}=
   var pc = [int32(dimTotal), int32(thisSize), int32(offset), int32(inner), int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("split_slice", [src, dst], addr pc[0], 20, groups, 1, 1)
 
 proc vulkanSessionConcatEnc*(flatSrc, base, dimSize, dimOffset: VulkanBufferHandle, dst: var VulkanBufferHandle,
-                              numTensors, totalDim, inner, n: int): bool =
+                              numTensors, totalDim, inner, n: int): bool  {.apiHooked.}=
   var pc = [int32(numTensors), int32(totalDim), int32(inner), int32(n)]
   let groups = uint32((n + 255) div 256)
   dispatchGeneric("concat_gather", [flatSrc, base, dimSize, dimOffset, dst], addr pc[0], 16, groups, 1, 1)
 
-proc vulkanVecOp*(op: string, a, b: seq[float32]): seq[float32] =
+proc vulkanVecOp*(op: string, a, b: seq[float32]): seq[float32]  {.apiHooked.}=
   let opCode =
     case op
     of "add": 0
@@ -3532,7 +3532,7 @@ proc vulkanVecOp*(op: string, a, b: seq[float32]): seq[float32] =
   vulkanSessionFree(bufB)
   vulkanSessionFree(bufC)
 
-proc vulkanMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
+proc vulkanMatmul*(a, b: seq[float32], m, k, n: int): seq[float32]  {.apiHooked.}=
   # FIX: Check for empty inputs before GPU allocation
   if a.len == 0 or b.len == 0 or m == 0 or k == 0 or n == 0:
     stderr.writeLine("[vulkanMatmul] WARNING: empty input detected, fallback to CPU, dims=(" & $m & "," & $k & "," & $n & "), a.len=" & $a.len & ", b.len=" & $b.len)
@@ -3551,7 +3551,7 @@ proc vulkanMatmul*(a, b: seq[float32], m, k, n: int): seq[float32] =
   vulkanSessionFree(bufB)
   vulkanSessionFree(bufC)
 
-proc vulkanActivation*(op: string, x: seq[float32], p: float32 = 0'f32): seq[float32] =
+proc vulkanActivation*(op: string, x: seq[float32], p: float32 = 0'f32): seq[float32]  {.apiHooked.}=
   ## REAL GPU for every opcode - activation.comp already has 0=relu,1=sigmoid,
   ## 2=tanh,4=exp,5=log,6=sqrt,7=pow (with its own push-constant p for pow).
   ## NO CPU fallback for any op in this list - if the GPU dispatch
@@ -3577,7 +3577,7 @@ proc vulkanActivation*(op: string, x: seq[float32], p: float32 = 0'f32): seq[flo
   vulkanSessionFree(bufX)
   vulkanSessionFree(bufY)
 
-proc vulkanSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
+proc vulkanSoftmax*(x: seq[float32], rows, cols: int): seq[float32]  {.apiHooked.}=
   let n = rows * cols
   gpuCheck(vulkanSessionBegin(), "vulkanSoftmax: session begin that bai")
   var bufX = vulkanSessionUpload(x)
@@ -3589,7 +3589,7 @@ proc vulkanSoftmax*(x: seq[float32], rows, cols: int): seq[float32] =
   vulkanSessionFree(bufX)
   vulkanSessionFree(bufY)
 
-proc vulkanLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] =
+proc vulkanLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32]  {.apiHooked.}=
   ## CPU fallback - there is no kernels/layernorm.comp yet (only rmsnorm.comp).
   result = newSeq[float32](rows * cols)
   for r in 0 ..< rows:
@@ -3606,7 +3606,7 @@ proc vulkanLayernorm*(x, gamma, beta: seq[float32], rows, cols: int, eps: float3
     for c in 0 ..< cols:
       result[base + c] = gamma[c] * (x[base + c] - mean) * invStd + beta[c]
 
-proc vulkanLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
+proc vulkanLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]]  {.apiHooked.}=
   ## CPU fallback - the standard LayerNorm backward formula, same results
   ## as cudaLayernormBackward/metalLayernormBackward.
   var dx = newSeq[float32](rows * cols)
@@ -3639,7 +3639,7 @@ proc vulkanLayernormBackward*(dy, x, gamma, beta: seq[float32], rows, cols: int,
       dx[base + c] = invStd * (dyg - sumDyG / float32(cols) - xhat[c] * sumDyGXhat / float32(cols))
   result = (dx, dgamma, dbeta)
 
-proc vulkanEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] =
+proc vulkanEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32]  {.apiHooked.}=
   ## CPU fallback - a simple gather, fast enough without the GPU.
   let num = indices.len
   result = newSeq[float32](num * dim)
@@ -3648,7 +3648,7 @@ proc vulkanEmbeddingLookup*(table: seq[float32], indices: seq[int32], vocab, dim
     for d in 0 ..< dim:
       result[i * dim + d] = table[idx * dim + d]
 
-proc vulkanApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
+proc vulkanApflu*(x: seq[float32], alpha, beta: float32): seq[float32]  {.apiHooked.}=
   ## CPU fallback - exactly the vecop_apflu formula in cuda kernels/vecop.ptx:
   ## x>0 -> x*(1+alpha*x); x<=0 -> beta*x*exp(x).
   result = newSeq[float32](x.len)
@@ -3659,7 +3659,7 @@ proc vulkanApflu*(x: seq[float32], alpha, beta: float32): seq[float32] =
     else:
       result[i] = beta * v * exp(v)
 
-proc vulkanApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float32] =
+proc vulkanApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float32]  {.apiHooked.}=
   ## CPU fallback - the APFLU derivative: x>0 -> dy*(1+2*alpha*x);
   ## x<=0 -> dy*beta*exp(x)*(1+x).
   result = newSeq[float32](x.len)
@@ -3670,7 +3670,7 @@ proc vulkanApfluBackward*(x, dy: seq[float32], alpha, beta: float32): seq[float3
     else:
       result[i] = dy[i] * beta * exp(v) * (1.0'f32 + v)
 
-proc vulkanAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
+proc vulkanAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]]  {.apiHooked.}=
   ## Real GPU through kernels/attention_fused.comp (session Enc) - the mask
   ## is NOT used (same as cudaAttentionFused/metalAttentionFused,
   ## the shader applies the causal mask itself).
@@ -3693,7 +3693,7 @@ proc vulkanAttentionFused*(q, k, v, mask: seq[float32], B, H, S, D: int, scale: 
   vulkanSessionFree(bufO)
   vulkanSessionFree(bufS)
 
-proc vulkanAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
+proc vulkanAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]]  {.apiHooked.}=
   ## CHANGED: real GPU through kernels/attention_fused_backward.comp (session
   ## Enc, a 1:1 mirror of metal_attention_fused_backward - see the explanation in the
   ## .comp file), NO longer a pure CPU loop pretending to be GPU.
@@ -3741,7 +3741,7 @@ proc vulkanAttentionFusedBackward*(q, k, v, s_matrix, dy: seq[float32], B, H, S,
 # Begin/Enc/End/Read pattern as vulkanVecOp/vulkanMatmul above.
 # =======================================================================
 
-proc vulkanGather*(src: seq[float32], idx: seq[int32]): seq[float32] =
+proc vulkanGather*(src: seq[float32], idx: seq[int32]): seq[float32]  {.apiHooked.}=
   let n = idx.len
   result = newSeq[float32](n)
   gpuCheck(vulkanSessionBegin(), "vulkanGather: session begin that bai")
@@ -3758,7 +3758,7 @@ proc vulkanGather*(src: seq[float32], idx: seq[int32]): seq[float32] =
   result = vulkanSessionRead(bufDst, n)
   vulkanSessionFree(bufSrc); vulkanSessionFree(bufIdx); vulkanSessionFree(bufDst)
 
-proc vulkanArgmaxIndex*(x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] =
+proc vulkanArgmaxIndex*(x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]]  {.apiHooked.}=
   ## argmax.comp: local_size_x=1024, 1 workgroup / (o,i) pair, requires
   ## dimSize <= 1024.
   let pairs = outer * inner
@@ -3778,7 +3778,7 @@ proc vulkanArgmaxIndex*(x: seq[float32], outer, dimSize, inner: int): tuple[val:
   vulkanSessionFree(bufX); vulkanSessionFree(bufVal); vulkanSessionFree(bufIdx)
   result = (val: outVal, idx: outIdx)
 
-proc vulkanCompare*(a, b: seq[float32], op: int): seq[uint32] =
+proc vulkanCompare*(a, b: seq[float32], op: int): seq[uint32]  {.apiHooked.}=
   let n = a.len
   gpuCheck(vulkanSessionBegin(), "vulkanCompare: session begin that bai")
   var bufA = vulkanSessionUpload(a)
@@ -3795,7 +3795,7 @@ proc vulkanCompare*(a, b: seq[float32], op: int): seq[uint32] =
   if n > 0: copyMem(addr result[0], unsafeAddr maskF[0], n * sizeof(uint32))
   vulkanSessionFree(bufA); vulkanSessionFree(bufB); vulkanSessionFree(bufMask)
 
-proc vulkanDropoutMask*(n: int, p: float32, seed: uint32): seq[float32] =
+proc vulkanDropoutMask*(n: int, p: float32, seed: uint32): seq[float32]  {.apiHooked.}=
   gpuCheck(vulkanSessionBegin(), "vulkanDropoutMask: session begin that bai")
   var bufMask = vulkanSessionAllocScratch(n)
   let scale = if p < 1'f32: 1'f32 / (1'f32 - p) else: 0'f32
@@ -3813,7 +3813,7 @@ proc vulkanDropoutMask*(n: int, p: float32, seed: uint32): seq[float32] =
 # decode the indices on the GPU from a small O(rank)/O(numTensors) table.
 # =======================================================================
 
-proc vulkanPermute*(src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] =
+proc vulkanPermute*(src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32]  {.apiHooked.}=
   let ndim = newStrides.len
   doAssert ndim <= 8, "vulkanPermute: rank > 8 not supported (fixed 8-entry push-constant array)"
   gpuCheck(vulkanSessionBegin(), "vulkanPermute: session begin that bai")
@@ -3833,7 +3833,7 @@ proc vulkanPermute*(src: seq[float32], newStrides, oldStrides, dimsMap: seq[int3
   result = vulkanSessionRead(bufDst, n)
   vulkanSessionFree(bufSrc); vulkanSessionFree(bufDst)
 
-proc vulkanSplitSlice*(src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32] =
+proc vulkanSplitSlice*(src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32]  {.apiHooked.}=
   gpuCheck(vulkanSessionBegin(), "vulkanSplitSlice: session begin that bai")
   var bufSrc = vulkanSessionUpload(src)
   var bufDst = vulkanSessionAllocScratch(n)
@@ -3846,7 +3846,7 @@ proc vulkanSplitSlice*(src: seq[float32], dimTotal, thisSize, offset, inner, n: 
   vulkanSessionFree(bufSrc); vulkanSessionFree(bufDst)
 
 proc vulkanConcat*(flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq[int32],
-                    totalDim, inner, n: int): seq[float32] =
+                    totalDim, inner, n: int): seq[float32]  {.apiHooked.}=
   ## SPIR-V has no array of device pointers -> one FLATTENED source buffer
   ## (flatSrc, the host only concatenates with memcpy - NO per-element index computation) +
   ## a small O(numTensors) table (srcBase/srcDimSize/srcDimOffset).
@@ -3878,7 +3878,7 @@ proc vulkanConcat*(flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq
 # Uses the dispatchGeneric pattern if the "micro_vm" pipeline is registered.
 
 proc vulkanLaunchMicroVm*(code: seq[uint32]; memF32: var seq[float32];
-                          nThreads: int; tgFloats: int = 1): bool =
+                          nThreads: int; tgFloats: int = 1): bool  {.apiHooked.}=
   ## Best-effort: upload code+mem as buffers, dispatch micro_vm pipeline.
   if code.len == 0 or nThreads <= 0: return false
   # Encode code as float bit-pattern buffer is awkward; use byte upload.
@@ -3916,7 +3916,7 @@ var gVkTgBytes: int = 0
 # caches. It is never handed to callers or freed while queued work refers to it.
 var gVkJitDummy: VulkanBufferHandle
 
-proc vulkanJitBegin*(name, glslSrc: string): bool =
+proc vulkanJitBegin*(name, glslSrc: string): bool  {.apiHooked.}=
   ## Register pipeline name + GLSL source. Compile happens lazily at dispatch.
   ## Resets the pending binding list.
   gVkJitPending = (name, glslSrc)
@@ -3924,7 +3924,7 @@ proc vulkanJitBegin*(name, glslSrc: string): bool =
   gVkTgBytes = 0
   result = true
 
-proc vulkanBindBuf*(idx: int; buf: VulkanBufferHandle; offElems = 0): bool =
+proc vulkanBindBuf*(idx: int; buf: VulkanBufferHandle; offElems = 0): bool  {.apiHooked.}=
   ## Stage one descriptor binding: slot `idx` → buffer at element offset.
   ## For float buffers offElems is in float32 elements; for u8 it's in bytes/4
   ## if the caller follows Metal convention (Metal multiplies by 4 for floats).
@@ -3935,14 +3935,14 @@ proc vulkanBindBuf*(idx: int; buf: VulkanBufferHandle; offElems = 0): bool =
   gVkBindings.add((idx, buf, offElems))
   result = true
 
-proc vulkanSetThreadgroupBytes*(index, nBytes: int): bool =
+proc vulkanSetThreadgroupBytes*(index, nBytes: int): bool  {.apiHooked.}=
   ## Record requested threadgroup/shared memory size (informational for now;
   ## GLSL shared float tgF32[1024] is fixed at compile time).
   discard index
   gVkTgBytes = nBytes
   result = true
 
-proc vulkanMaxTgThreads*(): int =
+proc vulkanMaxTgThreads*(): int  {.apiHooked.}=
   ensureInit()
   result = min(gDeviceCaps.maxThreads, 1024)
   let raw = getEnv("BYBY_VULKAN_MAX_TG")
@@ -3953,7 +3953,7 @@ proc vulkanMaxTgThreads*(): int =
 proc vulkanSessionJitMultiBufEnc*(kernelName, source: string;
                                    bindings: seq[VkBinding];
                                    nThreads, tgSize: int;
-                                   tgBytes = 0): bool =
+                                   tgBytes = 0): bool  {.apiHooked.}=
   ## Core multi-buffer JIT dispatch. Builds a dense buffer array ordered by
   ## binding index (0..maxIdx), compiles/caches SPIR-V, then dispatches via
   ## dispatchGeneric. Pattern mirrors vulkanSessionJitMicroVmEnc but each
@@ -4011,7 +4011,7 @@ proc vulkanSessionJitMultiBufEnc*(kernelName, source: string;
     stderr.writeLine "[vulkan_jit] multiBuf FAIL kernel=" & kernelName
   discard tgBytes
 
-proc vulkanKernelDispatch*(nThreads, tgSize: int; tgBytes = 0): bool =
+proc vulkanKernelDispatch*(nThreads, tgSize: int; tgBytes = 0): bool  {.apiHooked.}=
   ## Build descriptor set from gVkBindings, compile/cache SPIR-V, dispatch.
   result = vulkanSessionJitMultiBufEnc(
     gVkJitPending.name, gVkJitPending.src,
@@ -4020,6 +4020,6 @@ proc vulkanKernelDispatch*(nThreads, tgSize: int; tgBytes = 0): bool =
   gVkTgBytes = 0
 
 # Alias used by fp4 / session upload path
-proc vulkanSessionUploadU8*(data: openArray[uint8]): VulkanBufferHandle =
+proc vulkanSessionUploadU8*(data: openArray[uint8]): VulkanBufferHandle  {.apiHooked.}=
   ## Discrete GPUs retain weights in device-local VRAM after one staging copy.
   vulkanSessionUploadBytesPrivate(data)

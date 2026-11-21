@@ -26,8 +26,8 @@ type
     n*: int
   CudaTensor* = CudaResidentTensor
 
-proc cuFree*(t: var CudaResidentTensor) = discard
-proc cuUpload*(data: seq[float32]): CudaResidentTensor =
+proc cuFree*(t: var CudaResidentTensor) {.apiHooked.} = discard
+proc cuUpload*(data: seq[float32]): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
 
 
@@ -37,20 +37,26 @@ when defined(macosx):
   # directly in the ObjC shim (metal_shim.m/.h) and declared here (they MUST come before
   # their use - sessionVecOp/sessionActivation below - because Nim does not allow
   # forward references to top-level procs).
-  proc metalSessionVecOpEnc*(op: cint, a, b, c: MetalBufferHandle, n: int): cint {.
+  proc metalSessionVecOpEncC(op: cint, a, b, c: MetalBufferHandle, n: int): cint {.
     importc: "metal_vecop_enc", header: "metal_shim.h".}
+  proc metalSessionVecOpEnc*(op: cint, a, b, c: MetalBufferHandle, n: int): cint {.apiHooked.} =
+    metalSessionVecOpEncC(op, a, b, c, n)
 
-  proc metalSessionActivationEnc*(op: cint, x, y: MetalBufferHandle, n: int): cint {.
+  proc metalSessionActivationEncC(op: cint, x, y: MetalBufferHandle, n: int): cint {.
     importc: "metal_activation_enc", header: "metal_shim.h".}
+  proc metalSessionActivationEnc*(op: cint, x, y: MetalBufferHandle, n: int): cint {.apiHooked.} =
+    metalSessionActivationEncC(op, x, y, n)
 
-  proc metalSessionRopeEnc*(x, cosT, sinT: MetalBufferHandle, T, Hn, D: cint): cint {.
+  proc metalSessionRopeEncC(x, cosT, sinT: MetalBufferHandle, T, Hn, D: cint): cint {.
     importc: "metal_rope_enc", header: "metal_shim.h".}
+  proc metalSessionRopeEnc*(x, cosT, sinT: MetalBufferHandle, T, Hn, D: cint): cint {.apiHooked.} =
+    metalSessionRopeEncC(x, cosT, sinT, T, Hn, D)
 
 type
   GpuBackend* = enum
     gbAuto, gbCpu, gbCuda, gbMetal, gbVulkan
 
-proc sessionCompileSeconds*(): float =
+proc sessionCompileSeconds*(): float {.apiHooked.} =
   ## Wall seconds spent so far compiling shaders and creating pipeline states on every GPU
   ## backend (cache misses only). Take the difference around a phase to report its
   ## throughput without the one-time JIT cost.
@@ -68,7 +74,7 @@ proc sessionCompileSeconds*(): float =
 # a hard failure instead of silent CPU fallback.
 var gForbidCpuFallback* = false
 
-proc setForbidCpuFallback*(forbid: bool) =
+proc setForbidCpuFallback*(forbid: bool) {.apiHooked.} =
   gForbidCpuFallback = forbid
 
 proc handleGpuFailure(backend: GpuBackend, opName: string, e: ref CatchableError) =
@@ -98,7 +104,7 @@ proc handleGpuFailure(backend: GpuBackend, opName: string, e: ref CatchableError
       "Call setForbidCpuFallback(false) to allow automatic CPU fallback.")
   stderr.writeLine("[GPU] falling back to CPU for this operation. Will retry GPU on next operation.")
 
-proc parseBackend*(s: string): GpuBackend =
+proc parseBackend*(s: string): GpuBackend {.apiHooked.} =
   case s.strip().toLowerAscii()
   of "cuda": gbVulkan  # CUDA was removed - redirected to Vulkan
   of "metal": gbMetal
@@ -107,7 +113,7 @@ proc parseBackend*(s: string): GpuBackend =
   of "auto": gbAuto
   else: raise newException(ValueError, "unknown BybyLang backend: " & s)
 
-proc normalizeBackend*(b: GpuBackend): GpuBackend =
+proc normalizeBackend*(b: GpuBackend): GpuBackend {.apiHooked.} =
   ## CUDA is a legacy spelling only. Vulkan does not implicitly use Tensor
   ## Cores; that requires an enabled cooperative-matrix feature and a matching
   ## shader, queried per physical device.
@@ -122,7 +128,7 @@ proc `$`*(b: GpuBackend): string =
   of gbMetal: "metal"
   of gbVulkan: "vulkan"
 
-proc detectBackend*(): GpuBackend =
+proc detectBackend*(): GpuBackend {.apiHooked.} =
   ## Detects the best GPU backend available on this machine.
   ## CUDA was REMOVED from the framework - every NVIDIA device now runs through
   ## Vulkan (the NVIDIA driver supports Vulkan + tensor cores). Probe order:
@@ -145,7 +151,7 @@ proc cpuSigmoid(x: seq[float32]): seq[float32] =
   for i in 0..<x.len:
     result[i] = 1'f32 / (1'f32 + exp(-x[i]))
 
-proc gpuSqrt*(backend: GpuBackend, x: seq[float32]): seq[float32] =
+proc gpuSqrt*(backend: GpuBackend, x: seq[float32]): seq[float32] {.apiHooked.} =
   ## CPU fallback FORBIDDEN: only real GPUs (CUDA/Metal/Vulkan). If
   ## backend=cpu is chosen explicitly, or a GPU dispatch fails, RAISE
   ## instead of silently computing on the CPU and pretending it ran on the GPU.
@@ -158,7 +164,7 @@ proc gpuSqrt*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   of gbVulkan: return vulkanActivation("sqrt", x)
   of gbCpu, gbAuto: return cpu.sqrt(x)
 
-proc gpuExp*(backend: GpuBackend, x: seq[float32]): seq[float32] =
+proc gpuExp*(backend: GpuBackend, x: seq[float32]): seq[float32] {.apiHooked.} =
   ## CPU fallback BANNED - see gpuSqrt() above.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -169,7 +175,7 @@ proc gpuExp*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   of gbVulkan: return vulkanActivation("exp", x)
   of gbCpu, gbAuto: return cpu.exp(x)
 
-proc gpuLog*(backend: GpuBackend, x: seq[float32]): seq[float32] =
+proc gpuLog*(backend: GpuBackend, x: seq[float32]): seq[float32] {.apiHooked.} =
   ## CPU fallback BANNED - see gpuSqrt() above.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -180,7 +186,7 @@ proc gpuLog*(backend: GpuBackend, x: seq[float32]): seq[float32] =
   of gbVulkan: return vulkanActivation("log", x)
   of gbCpu, gbAuto: return cpu.log(x)
 
-proc gpuPow*(backend: GpuBackend, x: seq[float32], p: float32): seq[float32] =
+proc gpuPow*(backend: GpuBackend, x: seq[float32], p: float32): seq[float32] {.apiHooked.} =
   ## CPU fallback BANNED - see gpuSqrt() above.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -280,7 +286,7 @@ proc cpuAttentionFused(q, k, v, mask: seq[float32], B, H, S, D: int, scale: floa
   return (o, s_matrix)
 
 proc cpuMatmulQ4Ref*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
-                      M, K, N, groupSize, nGroupsPerRow: int): seq[float32] =
+                      M, K, N, groupSize, nGroupsPerRow: int): seq[float32] {.apiHooked.} =
   ## CPU REFERENCE (source of truth) for matmul_q4_kernel - an EXACT
   ## mirror of the matmul_q4_naive algorithm (kernels/vecop_matmul.cl, known
   ## correct, used as the reference). Used to verify GPU kernels (Metal/CUDA/
@@ -304,7 +310,7 @@ proc cpuMatmulQ4Ref*(a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32
         sum += a[m * K + k] * wval
       result[m * N + n] = sum
 
-proc cpuAttentionDecodeGqa*(q, k, v: seq[float32], H, S, D: int, scale: float32): seq[float32] =
+proc cpuAttentionDecodeGqa*(q, k, v: seq[float32], H, S, D: int, scale: float32): seq[float32] {.apiHooked.} =
   ## CPU REFERENCE (source of truth) for attention_decode_gqa_kernel -
   ## the ALGORITHM MUST match the GPU versions (Metal/CUDA) of the same name 1-1.
   ## Used to:
@@ -433,7 +439,7 @@ proc cpuVecOp(op: string, a, b: seq[float32]): seq[float32] =
   else:
     raise newException(ValueError, "Unknown gpu op: " & op)
 
-proc cpuFusedAddAct*(a, b: seq[float32], act: string): seq[float32] =
+proc cpuFusedAddAct*(a, b: seq[float32], act: string): seq[float32] {.apiHooked.} =
   let n = min(a.len, b.len)
   result = newSeq[float32](n)
   case act
@@ -455,7 +461,7 @@ proc cpuFusedAddAct*(a, b: seq[float32], act: string): seq[float32] =
   else:
     raise newException(ValueError, "cpuFusedAddAct: unknown activation: " & act)
 
-proc gpuOp*(op: string, backend: GpuBackend, a, b: seq[float32]): seq[float32] =
+proc gpuOp*(op: string, backend: GpuBackend, a, b: seq[float32]): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -480,7 +486,7 @@ proc gpuOp*(op: string, backend: GpuBackend, a, b: seq[float32]): seq[float32] =
     return cpuVecOp(op, a, b)
 
 # --- Unified GPU entrance points for custom layers/activations ---
-proc gpuRelu*(backend: GpuBackend, x: seq[float32]): seq[float32] =
+proc gpuRelu*(backend: GpuBackend, x: seq[float32]): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -494,7 +500,7 @@ proc gpuRelu*(backend: GpuBackend, x: seq[float32]): seq[float32] =
     handleGpuFailure(chosen, "relu", e)
     return cpuRelu(x)
 
-proc gpuSigmoid*(backend: GpuBackend, x: seq[float32]): seq[float32] =
+proc gpuSigmoid*(backend: GpuBackend, x: seq[float32]): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -508,7 +514,7 @@ proc gpuSigmoid*(backend: GpuBackend, x: seq[float32]): seq[float32] =
     handleGpuFailure(chosen, "sigmoid", e)
     return cpuSigmoid(x)
 
-proc gpuTanh*(backend: GpuBackend, x: seq[float32]): seq[float32] =
+proc gpuTanh*(backend: GpuBackend, x: seq[float32]): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -525,7 +531,7 @@ proc gpuTanh*(backend: GpuBackend, x: seq[float32]): seq[float32] =
 # ============================================================
 # SỬA: GPU APFLU - CUDA GỌI KERNEL THẬT
 # ============================================================
-proc gpuApflu*(backend: GpuBackend, x: seq[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] =
+proc gpuApflu*(backend: GpuBackend, x: seq[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -546,7 +552,7 @@ proc gpuApflu*(backend: GpuBackend, x: seq[float32], alpha: float32 = 0.1'f32, b
 # ============================================================
 # SỬA: GPU APFLU BACKWARD - CUDA GỌI KERNEL THẬT
 # ============================================================
-proc gpuApfluBackward*(backend: GpuBackend, x, dy: seq[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] =
+proc gpuApfluBackward*(backend: GpuBackend, x, dy: seq[float32], alpha: float32 = 0.1'f32, beta: float32 = 0.1'f32): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -567,7 +573,7 @@ proc gpuApfluBackward*(backend: GpuBackend, x, dy: seq[float32], alpha: float32 
 # ============================================================
 # SỬA: GPU LAYERNORM BACKWARD - CUDA GỌI KERNEL THẬT
 # ============================================================
-proc gpuLayernormBackward*(backend: GpuBackend, dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] =
+proc gpuLayernormBackward*(backend: GpuBackend, dy, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): tuple[dx, dgamma, dbeta: seq[float32]] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -588,7 +594,7 @@ proc gpuLayernormBackward*(backend: GpuBackend, dy, x, gamma, beta: seq[float32]
 # ============================================================
 # SỬA: GPU ATTENTION FUSED - CUDA GỌI KERNEL THẬT
 # ============================================================
-proc gpuAttentionFused*(backend: GpuBackend, q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] =
+proc gpuAttentionFused*(backend: GpuBackend, q, k, v, mask: seq[float32], B, H, S, D: int, scale: float32): tuple[o, s_matrix: seq[float32]] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -610,7 +616,7 @@ proc gpuAttentionFused*(backend: GpuBackend, q, k, v, mask: seq[float32], B, H, 
 # ============================================================
 # SỬA: GPU ATTENTION FUSED BACKWARD - CUDA GỌI KERNEL THẬT
 # ============================================================
-proc gpuAttentionFusedBackward*(backend: GpuBackend, q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] =
+proc gpuAttentionFusedBackward*(backend: GpuBackend, q, k, v, s_matrix, dy: seq[float32], B, H, S, D: int, scale: float32): tuple[dq, dk, dv: seq[float32]] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -628,7 +634,7 @@ proc gpuAttentionFusedBackward*(backend: GpuBackend, q, k, v, s_matrix, dy: seq[
     handleGpuFailure(chosen, "attention_fused_backward", e)
     return cpuAttentionFusedBackward(q, k, v, s_matrix, dy, B, H, S, D, scale)
 
-proc gpuSoftmax*(backend: GpuBackend, x: seq[float32], rows, cols: int): seq[float32] =
+proc gpuSoftmax*(backend: GpuBackend, x: seq[float32], rows, cols: int): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -642,7 +648,7 @@ proc gpuSoftmax*(backend: GpuBackend, x: seq[float32], rows, cols: int): seq[flo
     handleGpuFailure(chosen, "softmax", e)
     return cpuSoftmax(x, rows, cols)
 
-proc gpuLayernorm*(backend: GpuBackend, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] =
+proc gpuLayernorm*(backend: GpuBackend, x, gamma, beta: seq[float32], rows, cols: int, eps: float32): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -656,7 +662,7 @@ proc gpuLayernorm*(backend: GpuBackend, x, gamma, beta: seq[float32], rows, cols
     handleGpuFailure(chosen, "layernorm", e)
     return cpuLayernorm(x, gamma, beta, rows, cols, eps)
 
-proc gpuEmbeddingLookup*(backend: GpuBackend, table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] =
+proc gpuEmbeddingLookup*(backend: GpuBackend, table: seq[float32], indices: seq[int32], vocab, dim: int): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -705,7 +711,7 @@ proc cpuMatmul(a, b: seq[float32], m, k, n: int): seq[float32] =
       kk += blockSize
     ii += blockSize
 
-proc gpuMatmul*(backend: GpuBackend, a, b: seq[float32], m, k, n: int): seq[float32] =
+proc gpuMatmul*(backend: GpuBackend, a, b: seq[float32], m, k, n: int): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -748,7 +754,7 @@ proc gpuMatmul*(backend: GpuBackend, a, b: seq[float32], m, k, n: int): seq[floa
 proc gpuMatmul2*(backend: GpuBackend,
                   a1, b1: seq[float32], m1, k1, n1: int,
                   a2, b2: seq[float32], m2, k2, n2: int):
-                  tuple[c1, c2: seq[float32]] =
+                  tuple[c1, c2: seq[float32]] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto:
     chosen = detectBackend()
@@ -798,7 +804,7 @@ proc cpuDequantMatmulQ4Fallback(a: seq[float32], wq: seq[uint8], scales, zeros: 
   return cpuMatmul(a, wT, m, k, n)
 
 proc gpuMatmulQ4*(backend: GpuBackend, a: seq[float32], wq: seq[uint8], scales, zeros: seq[float32],
-                   m, k, n, groupSize, nGroupsPerRow: int): seq[float32] =
+                   m, k, n, groupSize, nGroupsPerRow: int): seq[float32] {.apiHooked.} =
   ## CHANGED (item 3 - quantization): avoids dequantizeTensorTransposed() to full fp32
   ## on the CPU + uploading that whole fp32 array on every Linear.forward()
   ## call. All 3 backends (Metal/CUDA/Vulkan) have a real int4 kernel
@@ -847,42 +853,42 @@ var gpuBackendSelected*: GpuBackend = gbAuto
 
 # CudaResidentTensor / cuFree / cuUpload already defined near top of file.
 
-proc cuUploadIndices*(data: seq[int32]): CudaResidentTensor =
+proc cuUploadIndices*(data: seq[int32]): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan session API")
-proc cuDownload*(t: CudaResidentTensor): seq[float32] =
+proc cuDownload*(t: CudaResidentTensor): seq[float32] {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan session API")
-proc cuMatmulR*(a, b: CudaResidentTensor, m, k, n: int): CudaResidentTensor =
+proc cuMatmulR*(a, b: CudaResidentTensor, m, k, n: int): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuAddR*(a, b: CudaResidentTensor): CudaResidentTensor =
+proc cuAddR*(a, b: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuSubR*(a, b: CudaResidentTensor): CudaResidentTensor =
+proc cuSubR*(a, b: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuMulR*(a, b: CudaResidentTensor): CudaResidentTensor =
+proc cuMulR*(a, b: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuDivR*(a, b: CudaResidentTensor): CudaResidentTensor =
+proc cuDivR*(a, b: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuReluR*(x: CudaResidentTensor): CudaResidentTensor =
+proc cuReluR*(x: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuSigmoidR*(x: CudaResidentTensor): CudaResidentTensor =
+proc cuSigmoidR*(x: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuTanhR*(x: CudaResidentTensor): CudaResidentTensor =
+proc cuTanhR*(x: CudaResidentTensor): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuSoftmaxR*(x: CudaResidentTensor, rows, cols: int): CudaResidentTensor =
+proc cuSoftmaxR*(x: CudaResidentTensor, rows, cols: int): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuLayernormR*(x, gamma, beta: CudaResidentTensor, rows, cols: int, eps: float32): CudaResidentTensor =
+proc cuLayernormR*(x, gamma, beta: CudaResidentTensor, rows, cols: int, eps: float32): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuAttentionFusedR*(q, k, v: CudaResidentTensor, B, H, S, D: int, scale: float32): tuple[o, s_matrix: CudaResidentTensor] =
+proc cuAttentionFusedR*(q, k, v: CudaResidentTensor, B, H, S, D: int, scale: float32): tuple[o, s_matrix: CudaResidentTensor] {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuAttentionDecodeGqaR*(q, k, v: CudaResidentTensor, H, S, D: int, scale: float32): tuple[o, scores: CudaResidentTensor] =
+proc cuAttentionDecodeGqaR*(q, k, v: CudaResidentTensor, H, S, D: int, scale: float32): tuple[o, scores: CudaResidentTensor] {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuCopyIntoR*(src, dst: CudaResidentTensor, srcOffsetElems, dstOffsetElems, n: int) =
+proc cuCopyIntoR*(src, dst: CudaResidentTensor, srcOffsetElems, dstOffsetElems, n: int) {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuRopeR*(x, cosT, sinT: CudaResidentTensor, T, Hn, D: int) =
+proc cuRopeR*(x, cosT, sinT: CudaResidentTensor, T, Hn, D: int) {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
-proc cuEmbeddingLookupR*(table, indices: CudaResidentTensor, numIdx, vocab, dim: int): CudaResidentTensor =
+proc cuEmbeddingLookupR*(table, indices: CudaResidentTensor, numIdx, vocab, dim: int): CudaResidentTensor {.apiHooked.} =
   raise newException(CatchableError, "CUDA removed - use Vulkan")
 
-proc noop_marker_end_of_cuda_resident_section*() = discard
+proc noop_marker_end_of_cuda_resident_section*()  {.apiHooked.}= discard
 
 
 type
@@ -917,6 +923,11 @@ proc probeBufferRef*(h: SessionHandle): string =
 
 proc probeValue*(h: SessionHandle): string =
   probeBufferRef(h) & "@0:" & $probeByteSize(h)
+
+proc bybyHookValue*(h: SessionHandle): string =
+  ## Keep hook metadata independent from FIR recorder state: callbacks run
+  ## even when recording is disabled and must not allocate probe identities.
+  "SessionHandle(backend=" & $h.kind & ",bytes=" & $probeByteSize(h) & ")"
 
 proc probeValue*(be: GpuBackend): string =
   ## `$GpuBackend` already yields the canonical lowercase name.
@@ -1011,7 +1022,7 @@ proc cpuTakeIndices(h: SessionHandle; n: int): seq[int32] =
 # SHARED SESSION API - one interface for every backend
 # ─────────────────────────────────────────────────────────────
 
-proc ensureGpuInit*(backend: GpuBackend): bool =
+proc ensureGpuInit*(backend: GpuBackend): bool {.apiHooked.} =
   ## Initialises the backend's device/queue/library IF NOT YET (Metal: ensureMetalInit, dispatch_once).
   ## REQUIRED before metal_jit_compile: metal_available() (used to PROBE the GPU, prints "found N GPUs")
   ## only picks a local device and does NOT set gDevice -> metal_jit_compile sees gDevice == nil if
@@ -1090,16 +1101,16 @@ proc sessionCooperativeGemmEnabled*(backend: GpuBackend): bool {.probed.} =
   ## True when FP4/FP32 prefill GEMMs will try a tensor-core route first.
   normalizeBackend(backend) == gbVulkan and vulkanCooperativeGemmEnabled()
 
-proc sessionSimdgroupMatrixEnabled*(backend: GpuBackend): bool =
+proc sessionSimdgroupMatrixEnabled*(backend: GpuBackend): bool {.apiHooked.} =
   ## True when the Metal GPU runs the Tensor Core micro-kernels lowered to MSL simdgroup_matrix
   ## (Apple GPU family 7+; never on Intel/AMD Macs).
   normalizeBackend(backend) == gbMetal and metalSimdgroupMatrixSupported()
 
-proc gpuComputeUnits*(backend: GpuBackend): int =
+proc gpuComputeUnits*(backend: GpuBackend): int {.apiHooked.} =
   ## SM/CU count of a Vulkan device (0: unknown or another backend).
   if normalizeBackend(backend) == gbVulkan: vulkanComputeUnits() else: 0
 
-proc gpuFixedSubgroupWidth*(backend: GpuBackend): int =
+proc gpuFixedSubgroupWidth*(backend: GpuBackend): int {.apiHooked.} =
   ## Vulkan subgroup width that micro-kernels using subgroup reductions may assume, or 0 when
   ## the device does not guarantee one (see vulkanFixedSubgroupWidth).
   if normalizeBackend(backend) == gbVulkan: vulkanFixedSubgroupWidth() else: 0
@@ -1211,7 +1222,7 @@ proc sessionUploadIndices*(backend: GpuBackend, data: seq[int32]): SessionHandle
   if chosen == gbCpu:
     result.cpuIndices = data
 
-proc cuAllocScratch*(n: int): CudaResidentTensor =
+proc cuAllocScratch*(n: int): CudaResidentTensor {.apiHooked.} =
   ## CUDA removed — stub.
   raise newException(CatchableError, "CUDA removed - use Vulkan sessionAllocScratch")
 
@@ -1342,7 +1353,7 @@ proc sessionMatmul*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHand
     return false
 
 proc sessionMatmulMps*(backend: GpuBackend, a, b: SessionHandle, c: var SessionHandle, M, K, N: int;
-                       transposeB = false; aOffsetElems = 0; cOffsetElems = 0): bool =
+                       transposeB = false; aOffsetElems = 0; cOffsetElems = 0): bool {.apiHooked.} =
   ## Metal only: C(M x N) = A(M x K) @ B with MPSMatrixMultiplication in the open session. A and C
   ## start aOffsetElems / cOffsetElems floats into their buffers (so ports of one arena need no copies).
   ## B is [K,N] (transposeB = false) or [N,K] (transposeB = true). One row (M = 1) goes to MPS only on
@@ -2481,14 +2492,14 @@ proc sessionMetalTarget(backend: GpuBackend): bool =
   else:
     false
 
-proc sessionMetalJitCompile*(name, source: string): bool =
+proc sessionMetalJitCompile*(name, source: string): bool {.apiHooked.} =
   ## Compiles an MSL kernel `name` once for the Metal encode API (sessionEncPipeline(false, name)).
   when defined(macosx):
     metal_jit_compile_c(source.cstring, name.cstring) != 0
   else:
     false
 
-proc sessionCanRecord*(backend: GpuBackend): bool =
+proc sessionCanRecord*(backend: GpuBackend): bool {.apiHooked.} =
   ## True when the backend can keep a finished session and submit it again
   ## (sessionBeginRecording / sessionReplay): Vulkan and Metal.
   if sessionVulkanTarget(backend): return true
@@ -2496,7 +2507,7 @@ proc sessionCanRecord*(backend: GpuBackend): bool =
     if sessionMetalTarget(backend): return metal_session_can_record() != 0
   false
 
-proc sessionBeginRecording*(backend: GpuBackend): bool =
+proc sessionBeginRecording*(backend: GpuBackend): bool {.apiHooked.} =
   ## Like sessionBegin, but the session's commands are kept by sessionEnd when it is
   ## self-contained (no staging, deferred frees or internal buffers); see
   ## sessionLastRecording. Mid-session commits are skipped while recording.
@@ -2512,14 +2523,14 @@ proc sessionBeginRecording*(backend: GpuBackend): bool =
       return true
   false
 
-proc sessionLastRecording*(backend: GpuBackend): int =
+proc sessionLastRecording*(backend: GpuBackend): int {.apiHooked.} =
   ## The id the last sessionEnd kept, or -1 when the session could not be kept.
   if sessionVulkanTarget(backend): return vulkanLastRecording()
   when defined(macosx):
     if sessionMetalTarget(backend): return int(metal_session_last_recording())
   -1
 
-proc sessionRecordingNote*(backend: GpuBackend, id: int): string =
+proc sessionRecordingNote*(backend: GpuBackend, id: int): string {.apiHooked.} =
   ## Metal: why the last recording was not kept (id < 0), or how a kept one replays.
   when defined(macosx):
     if sessionMetalTarget(backend):
@@ -2527,19 +2538,19 @@ proc sessionRecordingNote*(backend: GpuBackend, id: int): string =
       return (if metal_session_recording_uses_icb(id.cint) != 0: "indirect command buffer" else: "plain encoder")
   ""
 
-proc sessionReplay*(backend: GpuBackend, id: int): bool =
+proc sessionReplay*(backend: GpuBackend, id: int): bool {.apiHooked.} =
   ## Submits a kept recording again and waits for it (outside any session).
   if sessionVulkanTarget(backend): return vulkanReplay(id)
   when defined(macosx):
     if sessionMetalTarget(backend): return metal_session_replay(id.cint) != 0
   false
 
-proc sessionFreeRecording*(backend: GpuBackend, id: int) =
+proc sessionFreeRecording*(backend: GpuBackend, id: int) {.apiHooked.} =
   if sessionVulkanTarget(backend): vulkanFreeRecording(id)
   when defined(macosx):
     if sessionMetalTarget(backend): metal_session_free_recording(id.cint)
 
-proc sessionHostBuffer*(backend: GpuBackend, n: int, readback = false): SessionHandle =
+proc sessionHostBuffer*(backend: GpuBackend, n: int, readback = false): SessionHandle {.apiHooked.} =
   ## A persistently mapped host-visible buffer of n floats that sessions can copy into
   ## or out of; the host writes it with sessionHostWrite and reads it with sessionHostRead.
   ## Free it with sessionFree. Metal: a Shared buffer.
@@ -2552,7 +2563,7 @@ proc sessionHostBuffer*(backend: GpuBackend, n: int, readback = false): SessionH
       result.kind = gbMetal
       result.metalHandle = metal_host_buffer(n.cint)
 
-proc sessionHostWrite*(backend: GpuBackend, h: SessionHandle, data: openArray[float32]): bool =
+proc sessionHostWrite*(backend: GpuBackend, h: SessionHandle, data: openArray[float32]): bool {.apiHooked.} =
   if sessionVulkanTarget(backend): return vulkanHostWrite(h.vulkanHandle, data)
   when defined(macosx):
     if sessionMetalTarget(backend):
@@ -2561,7 +2572,7 @@ proc sessionHostWrite*(backend: GpuBackend, h: SessionHandle, data: openArray[fl
       return metal_host_write(h.metalHandle, unsafeAddr data[0], data.len.cint) != 0
   false
 
-proc sessionHostRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] =
+proc sessionHostRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float32] {.apiHooked.} =
   if sessionVulkanTarget(backend): return vulkanHostRead(h.vulkanHandle, n)
   when defined(macosx):
     if sessionMetalTarget(backend):
@@ -2571,7 +2582,7 @@ proc sessionHostRead*(backend: GpuBackend, h: SessionHandle, n: int): seq[float3
       return
   @[]
 
-proc sessionHostReadBarrier*(backend: GpuBackend): bool =
+proc sessionHostReadBarrier*(backend: GpuBackend): bool {.apiHooked.} =
   ## Records a barrier making earlier copies into host buffers visible to the host.
   ## Metal: Shared buffers are coherent once the command buffer completes; nothing to record.
   if sessionVulkanTarget(backend): return vulkanSessionHostReadBarrier()
@@ -2603,7 +2614,7 @@ proc sessionRecoverQueue*(backend: GpuBackend): bool {.probed.} =
   else:
     return false
 
-proc sessionGpuSeconds*(backend: GpuBackend): float =
+proc sessionGpuSeconds*(backend: GpuBackend): float {.apiHooked.} =
   ## Summed GPU execution time of the session command buffers so far. Vulkan
   ## reports it only when BYBY_VULKAN_TIMESTAMPS=1.
   var chosen = backend
@@ -2612,7 +2623,7 @@ proc sessionGpuSeconds*(backend: GpuBackend): float =
   if chosen == gbVulkan: return vulkanSessionGpuSeconds()
   0.0
 
-proc sessionSetGpuTiming*(backend: GpuBackend; on: bool): bool =
+proc sessionSetGpuTiming*(backend: GpuBackend; on: bool): bool {.apiHooked.} =
   ## Autotuners turn this on around their timed sessions so sessionGpuSeconds reports device
   ## time on Vulkan too (Metal always reports it). Returns whether GPU time is available.
   var chosen = backend
@@ -2620,14 +2631,14 @@ proc sessionSetGpuTiming*(backend: GpuBackend; on: bool): bool =
   if chosen == gbVulkan: return vulkanSessionSetTimestamps(on)
   chosen == gbMetal
 
-proc sessionTimingReset*(backend: GpuBackend) =
+proc sessionTimingReset*(backend: GpuBackend) {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
   if chosen == gbVulkan and getEnv("BYBY_VULKAN_PROFILE", "0") == "1":
     vulkanSessionTimingReset()
 
-proc sessionTimingReport*(backend: GpuBackend, steps: int): string =
+proc sessionTimingReport*(backend: GpuBackend, steps: int): string {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -2709,7 +2720,7 @@ proc sessionFree*(backend: GpuBackend, h: var SessionHandle) {.probed.} =
   h.metalHandle = nil
   h.cudaHandle = CudaResidentTensor(dptr: 0, n: 0)
 
-proc gpuFusedAddAct*(backend: GpuBackend, a, b: seq[float32], act: string): seq[float32] =
+proc gpuFusedAddAct*(backend: GpuBackend, a, b: seq[float32], act: string): seq[float32] {.apiHooked.} =
   ## BUILT FROM THE SESSION API: fusedAddAct = sessionVecOp("add") + sessionActivation(act).
   ## NO separate new .cu/.metal/.comp kernel for fusedAddAct (none tested
   ## on real hardware) - instead it combines 2 EXISTING kernels that RUN
@@ -2832,6 +2843,9 @@ proc probeQ4Buffers(w: ResidentWeightHandle): array[3, string] =
 proc probeValue*(w: ResidentWeightHandle): string =
   let b = probeQ4Buffers(w)
   b[0] & "@" & $w.wqOffset & ":" & $(w.n*((w.k+1) div 2))
+
+proc bybyHookValue*(w: ResidentWeightHandle): string =
+  "ResidentWeight(k=" & $w.k & ",n=" & $w.n & ",group=" & $w.groupSize & ")"
 
 proc probeWeightRef*(w: ResidentWeightHandle): string = probeValue(w)
 
@@ -3088,7 +3102,7 @@ proc sessionRopeKvEnc*(backend: GpuBackend, q, k, v, cosT, sinT: SessionHandle,
   else:
     return false
 
-proc sessionGraphBegin*(backend: GpuBackend, maxSeqLen: int): bool =
+proc sessionGraphBegin*(backend: GpuBackend, maxSeqLen: int): bool {.apiHooked.} =
   ## Starts recording the encode calls that follow (in the open session) into a replayable
   ## graph instead of the command buffer. Metal only.
   when defined(macosx):
@@ -3096,38 +3110,38 @@ proc sessionGraphBegin*(backend: GpuBackend, maxSeqLen: int): bool =
       return metalGraphBegin(maxSeqLen)
   false
 
-proc sessionGraphEnd*(backend: GpuBackend): bool =
+proc sessionGraphEnd*(backend: GpuBackend): bool {.apiHooked.} =
   ## Ends the recording; false when it cannot be replayed (nothing is kept).
   when defined(macosx):
     if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
       return metalGraphEnd()
   false
 
-proc sessionGraphReady*(backend: GpuBackend): bool =
+proc sessionGraphReady*(backend: GpuBackend): bool {.apiHooked.} =
   when defined(macosx):
     if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
       return metalGraphReady()
   false
 
-proc sessionSetKvFp16*(backend: GpuBackend, on: bool) =
+proc sessionSetKvFp16*(backend: GpuBackend, on: bool) {.apiHooked.} =
   ## Metal: the KV caches handed to the KV/attention kernels hold fp16 (set before the first use).
   when defined(macosx):
     if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
       metalSetKvFp16(on)
 
-proc sessionGraphReset*(backend: GpuBackend) =
+proc sessionGraphReset*(backend: GpuBackend) {.apiHooked.} =
   when defined(macosx):
     if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
       metalGraphReset()
 
-proc sessionGraphRun*(backend: GpuBackend, pos, seq, slotIn, slotOut: int): bool =
+proc sessionGraphRun*(backend: GpuBackend, pos, seq, slotIn, slotOut: int): bool {.apiHooked.} =
   ## Replays the recorded graph in the open session for the token at `pos`.
   when defined(macosx):
     if backend == gbMetal or (backend == gbAuto and detectBackend() == gbMetal):
       return metalGraphRun(pos, seq, slotIn, slotOut)
   false
 
-proc sessionEndAsync*(backend: GpuBackend): bool =
+proc sessionEndAsync*(backend: GpuBackend): bool {.apiHooked.} =
   ## Commits the open session without waiting (Metal only). Pair with sessionWaitOldest.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -3135,7 +3149,7 @@ proc sessionEndAsync*(backend: GpuBackend): bool =
   when defined(macosx): return metalSessionEndAsync()
   else: return false
 
-proc sessionWaitOldest*(backend: GpuBackend): bool =
+proc sessionWaitOldest*(backend: GpuBackend): bool {.apiHooked.} =
   ## Waits for the oldest session committed by sessionEndAsync; false if it failed.
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -3143,15 +3157,15 @@ proc sessionWaitOldest*(backend: GpuBackend): bool =
   when defined(macosx): return metalSessionWaitOldest()
   else: return false
 
-proc sessionTokenRingGet*(backend: GpuBackend, ring: SessionHandle, slot: int): int =
+proc sessionTokenRingGet*(backend: GpuBackend, ring: SessionHandle, slot: int): int {.apiHooked.} =
   when defined(macosx): metalTokenRingGet(ring.metalHandle, slot)
   else: 0
 
-proc sessionTokenRingSet*(backend: GpuBackend, ring: SessionHandle, slot, value: int) =
+proc sessionTokenRingSet*(backend: GpuBackend, ring: SessionHandle, slot, value: int) {.apiHooked.} =
   when defined(macosx): metalTokenRingSet(ring.metalHandle, slot, value)
 
 proc sessionEmbedTokenEnc*(backend: GpuBackend, table, ring: SessionHandle,
-                            o: SessionHandle, dim, slot: int): bool =
+                            o: SessionHandle, dim, slot: int): bool {.apiHooked.} =
   ## Encodes o[0..<dim] = table row of the token id in ring[slot] (Metal only).
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -3160,7 +3174,7 @@ proc sessionEmbedTokenEnc*(backend: GpuBackend, table, ring: SessionHandle,
   else: return false
 
 proc sessionArgmaxTokenEnc*(backend: GpuBackend, logits, ring: SessionHandle,
-                             n, slot: int): bool =
+                             n, slot: int): bool {.apiHooked.} =
   ## Encodes ring[slot] = greedy token of logits[0..<n] (Metal only).
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
@@ -3172,7 +3186,7 @@ proc sessionMatmulQ4Fused*(backend: GpuBackend, mode: int, a: SessionHandle,
                             ws: openArray[ResidentWeightHandle],
                             outs: openArray[SessionHandle],
                             res: SessionHandle, hasRes: bool,
-                            gamma = SessionHandle(), eps = 0'f32, hasNorm = false): bool =
+                            gamma = SessionHandle(), eps = 0'f32, hasNorm = false): bool {.apiHooked.} =
   ## Fused decode GEMV (M=1). mode 0: ws.len (1..3) matrices share `a` and each
   ## writes its own outs[i]; mode 1: ws = [gate, up], outs[0] = silu(gate)*up.
   ## `res` is added to the result when hasRes. With hasNorm, `a` is the raw vector and
@@ -3239,7 +3253,7 @@ proc residentFreeQ4*(w: var ResidentWeightHandle) {.probed.} =
     w.cpuZeros = @[]
 
 proc linearPlusAttentionSession*(backend: GpuBackend, q, k, v: seq[float32],
-                                  B, H, T, D: int, scale: float32): seq[float32] =
+                                  B, H, T, D: int, scale: float32): seq[float32] {.apiHooked.} =
   ## Linear++ attention through the shared session API - runs on Metal/CUDA
   let qkvLen = B * H * T * D
   result = newSeq[float32](qkvLen)
@@ -3276,7 +3290,7 @@ proc linearPlusAttentionSession*(backend: GpuBackend, q, k, v: seq[float32],
 # Wired into gpubackend.nim with the same try/case/handleGpuFailure pattern as
 # the gpuSqrt/gpuExp above in that file.
 
-proc gpuGather*(backend: GpuBackend, src: seq[float32], idx: seq[int32]): seq[float32] =
+proc gpuGather*(backend: GpuBackend, src: seq[float32], idx: seq[int32]): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -3295,7 +3309,7 @@ proc gpuGather*(backend: GpuBackend, src: seq[float32], idx: seq[int32]): seq[fl
     result = newSeq[float32](idx.len)
     for i in 0 ..< idx.len: result[i] = src[idx[i]]
 
-proc gpuArgmaxIndex*(backend: GpuBackend, x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] =
+proc gpuArgmaxIndex*(backend: GpuBackend, x: seq[float32], outer, dimSize, inner: int): tuple[val: seq[float32], idx: seq[int32]] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -3322,7 +3336,7 @@ proc gpuArgmaxIndex*(backend: GpuBackend, x: seq[float32], outer, dimSize, inner
       outIdx[o * inner + i] = int32(bestIdx)
   result = (val: outVal, idx: outIdx)
 
-proc gpuCompare*(backend: GpuBackend, a, b: seq[float32], op: int): seq[bool] =
+proc gpuCompare*(backend: GpuBackend, a, b: seq[float32], op: int): seq[bool] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -3353,7 +3367,7 @@ proc gpuCompare*(backend: GpuBackend, a, b: seq[float32], op: int): seq[bool] =
     result = newSeq[bool](mask.len)
     for i in 0 ..< mask.len: result[i] = mask[i] != 0
 
-proc gpuDropoutMask*(backend: GpuBackend, n: int, p: float32, seed: uint32): seq[float32] =
+proc gpuDropoutMask*(backend: GpuBackend, n: int, p: float32, seed: uint32): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -3384,7 +3398,7 @@ proc gpuDropoutMask*(backend: GpuBackend, n: int, p: float32, seed: uint32): seq
 # the matching kernel on one of the 3 backends.
 # ─────────────────────────────────────────────────────────────
 
-proc gpuPermute*(backend: GpuBackend, src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] =
+proc gpuPermute*(backend: GpuBackend, src: seq[float32], newStrides, oldStrides, dimsMap: seq[int32], n: int): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -3410,7 +3424,7 @@ proc gpuPermute*(backend: GpuBackend, src: seq[float32], newStrides, oldStrides,
       oldLinear += idxI * int(oldStrides[dimsMap[i]])
     result[linear] = src[oldLinear]
 
-proc gpuSplitSlice*(backend: GpuBackend, src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32] =
+proc gpuSplitSlice*(backend: GpuBackend, src: seq[float32], dimTotal, thisSize, offset, inner, n: int): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan
@@ -3433,7 +3447,7 @@ proc gpuSplitSlice*(backend: GpuBackend, src: seq[float32], dimTotal, thisSize, 
     result[linear] = src[(o * dimTotal + offset + d) * inner + i]
 
 proc gpuConcat*(backend: GpuBackend, flatSrc: seq[float32], srcBase, srcDimSize, srcDimOffset: seq[int32],
-                totalDim, inner, n: int): seq[float32] =
+                totalDim, inner, n: int): seq[float32] {.apiHooked.} =
   var chosen = backend
   if chosen == gbAuto: chosen = detectBackend()
   if chosen == gbCuda: chosen = gbVulkan

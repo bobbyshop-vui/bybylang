@@ -16,6 +16,7 @@
 ## Output goes to stderr. Colors are used only on a terminal and are off when `NO_COLOR` is set.
 
 import std/[os, strutils, terminal]
+from ./probe import apiHooked
 
 type
   DiagSeverity* = enum
@@ -43,7 +44,7 @@ proc severityColor(s: DiagSeverity): string =
   of dsWarning: "1;35"
   of dsError: "1;31"
 
-proc escapeLiteral*(s: string): string =
+proc escapeLiteral*(s: string): string  {.apiHooked.}=
   ## `s` as a Nim string literal (used by the compiler when it writes file names into generated code).
   result = "\""
   for c in s:
@@ -55,7 +56,7 @@ proc escapeLiteral*(s: string): string =
   result.add '"'
 
 proc renderDiag*(severity: DiagSeverity; file: string; line, col: int; msg: string;
-                 source = ""; caretLen = 1; notes: seq[string] = @[]): string =
+                 source = ""; caretLen = 1; notes: seq[string] = @[]): string  {.apiHooked.}=
   ## Format one diagnostic the way clang does:
   ##
   ##   file.bybylang:3:7: error: message
@@ -78,7 +79,7 @@ proc renderDiag*(severity: DiagSeverity; file: string; line, col: int; msg: stri
     result &= "\n" & paint("note:", severityColor(dsNote)) & " " & n
 
 proc diagEmit*(severity: DiagSeverity; file: string; line, col: int; msg: string;
-               source = ""; caretLen = 1; notes: seq[string] = @[]) =
+               source = ""; caretLen = 1; notes: seq[string] = @[])  {.apiHooked.}=
   var sev = severity
   if sev == dsWarning and gDiagWarningsAsErrors: sev = dsError
   case sev
@@ -92,16 +93,16 @@ proc diagEmit*(severity: DiagSeverity; file: string; line, col: int; msg: string
 # warn / error / traceback
 # --------------------------
 
-proc diagWarn*(msg: string; file = ""; line = 0) =
+proc diagWarn*(msg: string; file = ""; line = 0)  {.apiHooked.}=
   ## Report a warning at `file:line`. The program keeps running.
   diagEmit(dsWarning, file, line, 0, msg)
 
-proc diagError*(msg: string; file = ""; line = 0) {.noreturn.} =
+proc diagError*(msg: string; file = ""; line = 0) {.noreturn, apiHooked.} =
   ## Report an error at `file:line` and raise `BybyError`.
   diagEmit(dsError, file, line, 0, msg)
   raise newException(BybyError, msg)
 
-proc diagTraceback*(msg = ""; file = ""; line = 0) =
+proc diagTraceback*(msg = ""; file = ""; line = 0)  {.apiHooked.}=
   ## Print the call stack (oldest call first, like Python). The program keeps running.
   ## `msg` is an optional note; `file:line` is where `traceback` was written.
   var text = "traceback (most recent call last):"
